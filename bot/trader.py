@@ -6,6 +6,7 @@ from bot.broker import AlpacaBroker
 from bot.strategy import check_crossover
 from bot.journal import TradeJournal
 from bot.errors import BrokerError
+from bot.notify import send_notification
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 def run_trading_cycle():
@@ -68,10 +69,18 @@ def run_trading_cycle():
             
             # Place order
             print(f"[{datetime.now()}] Placing {action} order for {symbol}: qty={qty:.6f}, price={price:.2f}")
-            order = broker.place_order(symbol, qty, action.upper())
-            
-            # Log trade
             reasoning = f"{signal} cross: SMA{config.sma_fast} {prev_fast:.2f} {'above' if signal == 'golden' else 'below'} SMA{config.sma_slow} {prev_slow:.2f} -> now {curr_fast:.2f} vs {curr_slow:.2f}"
+            try:
+                send_notification(
+                    f"🔔 **Trade signal — {symbol}**\n"
+                    f"**{action}** {qty:.6f} @ ~${price:,.2f} (notional ${config.notional})\n"
+                    f"Reason: {reasoning}\n"
+                    f"Submitting order to Alpaca paper...",
+                    config
+                )
+            except Exception as notify_err:
+                print(f"[{datetime.now()}] Pre-trade Discord alert failed (continuing trade): {notify_err}")
+            order = broker.place_order(symbol, qty, action.upper())
             journal.log_trade(
                 timestamp=datetime.now().isoformat(),
                 symbol=symbol,
@@ -81,6 +90,16 @@ def run_trading_cycle():
                 reasoning=reasoning
             )
             print(f"[{datetime.now()}] Trade logged for {symbol}: {action} {qty:.6f} @ {price:.2f}")
+            try:
+                send_notification(
+                    f"✅ **Trade executed — {symbol}**\n"
+                    f"**{action}** {qty:.6f} @ ~${price:,.2f}\n"
+                    f"Order ID: {getattr(order, 'id', 'unknown')}\n"
+                    f"Reason: {reasoning}",
+                    config
+                )
+            except Exception as notify_err:
+                print(f"[{datetime.now()}] Post-trade Discord alert failed: {notify_err}")
             
         except BrokerError as e:
             print(f"[{datetime.now()}] Broker error for {symbol}: {e}")
