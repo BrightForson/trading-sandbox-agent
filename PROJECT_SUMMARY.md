@@ -1,110 +1,128 @@
-# Sandbox Paper Trading Bot – Project Summary
+# Trading Sandbox Agent — Project Summary
+
+*Last updated: 2026-09-04 — reflects the fully deployed, live system.*
 
 ## Overview
-A Python 3.12 application that trades cryptocurrency (BTC/USD, ETH/USD, SOL/USD) on Alpaca’s paper trading platform using a deterministic SMA‑crossover strategy (20‑period / 50‑period). Trade decisions involve **no LLMs**; LLMs are used only for generating a short narrative in the daily report.
+
+A deterministic crypto paper-trading bot on **Alpaca PAPER trading** (live trading is impossible — `paper=True` is hardcoded). Trades BTC/USD, ETH/USD, SOL/USD using an SMA20/50 crossover strategy on 15-minute closed bars. **Zero LLM involvement in trade decisions** — an LLM is used only to write the narrative in the daily report; all P&L/win-rate math is pure Python.
+
+- **Repo (live):** https://github.com/BrightForson/trading-sandbox-agent (public)
+- **Hosting:** GitHub Actions free tier (unlimited minutes on public repos) — no laptop, no server, $0/month
+- **Paper account:** $100 equity, notional $100 per trade
 
 ## File Structure
+
 ```
 trading-sandbox-agent/
-├── .env / .env.example
-├── config.yaml
-├── requirements.txt
-├── run_bot.py
-├── run_report.py
+├── .env / .env.example        # keys: Alpaca paper x2, NVIDIA_API_KEY, DISCORD_WEBHOOK_URL
+├── config.yaml                 # symbols, SMA periods, notional, timeframe, lookback
+├── requirements.txt            # requests, python-dotenv, alpaca-py, openai, schedule, pyyaml
+├── run_bot.py                  # entry: default = continuous loop; --once = single cycle (serverless)
+├── run_report.py               # generates + sends daily report
+├── PROJECT_SUMMARY.md          # this file
+├── .github/workflows/trading-bot.yml   # cron hosting (see below)
 ├── bot/
-│   ├── __init__.py
-│   ├── config.py          # Loads config & environment variables
-│   ├── broker.py          # Alpaca paper‑trading client (paper=True guard)
-│   ├── strategy.py        # Deterministic SMA crossover logic
-│   ├── trader.py          # Main loop (15‑min polling, per‑symbol error isolation)
-│   ├── models.py          # LLM client for reporting only (NVIDIA primary, DeepSeek fallback)
-│   ├── journal.py         # SQLite trade journal
-│   ├── report.py          # P&L/win‑rate calculation + LLM narrative generation
-│   ├── notify.py          # Notification via openclaw or file fallback
-│   └── errors.py          # Custom exception classes
+│   ├── config.py               # loads config.yaml + .env (singleton)
+│   ├── broker.py               # Alpaca PAPER client (paper=True guard), crypto bars, orders, positions
+│   ├── strategy.py             # deterministic SMA crossover (golden/death cross)
+│   ├── trader.py               # trading loop, per-symbol error isolation, heartbeat
+│   ├── models.py               # LLM client for REPORTING ONLY (primary → fallback)
+│   ├── journal.py              # SQLite trade log + meta table (heartbeat state)
+│   ├── report.py               # P&L/win-rate in pure Python + account snapshot + LLM narrative
+│   ├── notify.py               # Discord webhook POST, auto-chunking >2000 chars, file fallback
+│   └── errors.py               # BrokerError, ModelError, NotificationError, JournalError
 └── data/
-    ├── trades.db          # SQLite trade log (created on first run)
-    └── reports/           # Directory for text reports (gitignored)
+    ├── trades.db               # SQLite journal — COMMITTED to repo for state persistence
+    └── reports/                # file-fallback reports (gitignored)
 ```
 
-## Configuration
-### config.yaml
+## Current Configuration (config.yaml)
+
 ```yaml
-symbols:
-  - BTC/USD
-  - ETH/USD
-  - SOL/USD
+symbols: [BTC/USD, ETH/USD, SOL/USD]
 sma_fast: 20
 sma_slow: 50
-notional: 100               # $ per trade (adjusted from 10000 for $100 paper balance)
-report_channel: null        # Discord channel ID; null → file fallback
+notional: 100          # $ per trade (matches $100 paper balance)
 timeframe: 15Min
 lookback_bars: 120
-```
-### .env (replace placeholders with real keys)
-```env
-ALPACA_API_KEY_ID=your_alpaca_paper_key_id
-ALPACA_API_SECRET_KEY=your_alpaca_paper_secret_key
-NVIDIA_API_KEY=your_nvidia_api_key_from_build_nvidia
-# OPENROUTER_API_KEY is unused by the bot
+report_channel: null   # legacy; Discord URL now in .env
 ```
 
-## How It Works
-### Trader (`run_bot.py`)
-- Runs immediately, then every 15 minutes.
-- For each symbol:
-  - Fetches the last 120 (15‑minute) bars from Alpaca (paper endpoint).
-  - Computes SMA20 and SMA50 on closing prices.
-  - Detects crossovers:
-    - **Golden cross**: prev SMA20 ≤ SMA50 and now SMA20 > SMA50 → BUY (if flat)
-    - **Death cross**: prev SMA20 ≥ SMA50 and now SMA20 < SMA50 → SELL (if holding)
-  - Quantity = `notional / latest close price`.
-  - Places a market order via Alpaca paper‑trading API.
-  - Logs the trade to SQLite (`data/trades.db`) with:
-    `timestamp, symbol, action, qty, price, reasoning`
-    (e.g., `"golden cross: SMA20 182.30 crossed above SMA50 181.95"`).
+## Strategy (deterministic, no LLM)
 
-### Reporter (`run_report.py`)
-- Reads all trades from `data/trades.db`.
-- Computes total P&L, win‑rate, number of trades, etc., **using pure Python** (no LLM).
-- Builds a prompt that includes these statistics.
-- Calls the LLM (NVIDIA API with DeepSeek fallback) to produce a short narrative summary.
-- Outputs a full report (stats + narrative) and:
-  - Tries to send via Discord using `openclaw message send` (if `report_channel` set).
-  - Falls back to writing a timestamped text file in `data/reports/` if Discord is not configured or fails.
+1. Every 15 minutes, fetch ~120 15-min bars per symbol; **drop the still-forming last bar** (signals use closed bars only)
+2. Compute SMA20 and SMA50 on closes
+3. **Golden cross** (prev SMA20 ≤ SMA50, now SMA20 > SMA50) → BUY if flat; qty = notional / price
+4. **Death cross** (prev SMA20 ≥ SMA50, now SMA20 < SMA50) → SELL entire position if holding
+5. Log to SQLite with reasoning string, e.g. `"golden cross: SMA20 79688.12 crossed above SMA50 79900.44"` — generated by code, never by a model
 
-## Safety & Error Handling
-- **Paper‑trading guarantee**: `TradingClient(..., paper=True)` hard‑codes the endpoint to `https://paper-api.alpaca.markets`. Live trading is impossible.
-- **Per‑symbol isolation**: Errors in one symbol’s data fetch, order placement, etc., are caught and logged; the bot continues with the next symbol.
-- **Notification fallback**: If Discord is not configured or `openclaw` fails, the report is written to `data/reports/`.
-- **LLM usage restricted**: The LLM is invoked **only** for the narrative section of the daily report; all trading logic and P&L calculations are deterministic and LLM‑free.
+## LLM Reporting Layer (bot/models.py)
 
-## Setup & Execution
-1. **Create & activate a virtual environment**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. **Configure `.env`** with your actual Alpaca paper API keys and NVIDIA API key.
-4. **Ensure your Alpaca paper account has at least the notional amount** (e.g., $100) available buying power.
-5. **Start the bot**
-   ```bash
-   python run_bot.py   # runs continuously; press Ctrl+C to stop
-   ```
-6. **Generate a manual report** (after some trading activity)
-   ```bash
-   python run_report.py
-   ```
+NVIDIA build.nvidia.com, OpenAI-compatible endpoint (`https://integrate.api.nvidia.com/v1`), key from `NVIDIA_API_KEY` in `.env`.
 
-## Next Steps for Your Claude Project
-- Upload the entire `trading-sandbox-agent` folder as the codebase for your Claude project.
-- The bot is ready to run in paper mode; you can observe its behavior, inspect `data/trades.db`, and view generated reports in `data/reports/`.
-- Feel free to extend or modify the bot (e.g., add more symbols, adjust SMA periods, enhance reporting) by editing the relevant files in the `bot/` directory.
+- **Primary:** `nvidia/nemotron-3-super-120b-a12b` — ✅ tested working
+- **Fallback:** `minimaxai/minimax-m3` — ✅ tested working, auto-engages on failure/timeout (30s timeout)
+- EOL history (why these aren't used): `deepseek-ai/deepseek-v4-pro` (410 Gone, EOL 2026-08-07), `z-ai/glm-5.2` (410 Gone), `moonshotai/kimi-k2.6` (404 for this account)
 
----
+**Scope guard:** the LLM only writes a short narrative for the daily report. All numbers (P&L, win-rate, round-trips) are computed in pure Python in `report.py`.
 
-**Your sandbox paper trading bot is now fully built, validated, and ready to run.**
+## Discord Delivery (bot/notify.py)
+
+**Direct webhook POST** (via `requests`) using `DISCORD_WEBHOOK_URL` in `.env` — NOT openclaw (openclaw's Discord channel requires a bot token, which we don't have; the webhook is a different credential). Messages auto-chunk at 1900 chars (Discord limit 2000). On webhook failure or missing URL → graceful fallback to `data/reports/report_YYYY-MM-DD_HH-MM-SS.txt`.
+
+The webhook is **one-way**: the bot cannot receive replies. Messaging the bot would require a real Discord bot + token (future option).
+
+## Hosting: GitHub Actions (free, no card)
+
+`.github/workflows/trading-bot.yml`:
+
+- **Cron `*/15 * * * *`** → `trade` job: checkout → Python 3.12 → pip install → `python run_bot.py --once` → commit `data/trades.db` back (state persistence across stateless runs)
+- **Cron `0 18 * * *`** → `report` job: `python run_report.py` (daily report to Discord)
+- `workflow_dispatch` enabled (manual trigger from GitHub UI)
+- Repo secrets (encrypted): `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, `NVIDIA_API_KEY`, `DISCORD_WEBHOOK_URL`
+- `concurrency: group trading-bot` prevents overlapping runs
+
+## Discord Notification Schedule
+
+| Ping | When | Content |
+|---|---|---|
+| 🫀 Heartbeat | Once per UTC clock hour | equity, cash, positions + unrealized P&L, SMA20−SMA50 gap per symbol |
+| 🔔 Trade signal | Instant, before order submission | symbol, action, qty, est. price, reasoning |
+| ✅ Trade executed | Instant, after fill | same + real Alpaca order ID |
+| 📊 Daily report | 18:00 UTC | account snapshot, P&L, win-rate, LLM narrative |
+
+## Bug-Fix Log (this session)
+
+1. `requirements.txt` — `schedule` was glued to a comment line (missing on runner)
+2. `.gitignore` — `data/` rule blocked `!data/trades.db` negation → `data/*`
+3. `.gitignore` — `alpaca_install.log` glued onto the negation line
+4. `broker.py` — wrong param `symbol_symbol` → `symbol_or_symbols`
+5. Dead models — deepseek-v4-pro and glm-5.2 both EOL (410); replaced with tested-live minimax-m3
+6. `models.py` — missing `load_dotenv()` meant env vars weren't loaded when imported first
+7. **Partial-bar bug** — signals were computed on the still-forming bar; now drops it (closed bars only)
+8. **18:00 skip bug** — workflow condition excluded the trade job at 18:00 UTC daily
+9. Heartbeat drift — "60 min since last" drifted under GitHub cron lag → clock-hour dedupe via journal `meta` table
+
+## Ops Commands
+
+```bash
+gh run list -R BrightForson/trading-sandbox-agent              # run history
+gh run watch -R BrightForson/trading-sandbox-agent             # watch live run
+gh workflow run trading-bot -R BrightForson/trading-sandbox-agent  # manual trigger
+# local: source venv/bin/activate && python run_bot.py --once
+# manual report: python run_report.py
+```
+
+## Known Limitations
+
+- **GitHub free cron lag:** scheduled runs can be delayed by minutes or occasionally dropped at high-load times (documented GitHub behavior). Heartbeats may arrive a few minutes past the hour; if a run is dropped, the next one resumes state correctly.
+- **One-way Discord:** no replies to the bot.
+- **Crypto data feed:** free tier returns ~86 recent bars per request (sufficient for SMA50+1).
+- **Strategy is signal-rare by design:** crossovers may take hours or days; silence between heartbeats is normal.
+
+## Current Live Status (as of last update)
+
+- Latest run: ✅ green; workflow active; journal state persisted (`last_heartbeat_hour`)
+- Account: $100 equity, flat, no open positions, 0 trades logged
+- Market at last check: all SMA20s below SMA50, gaps narrowing (BTC ≈ −0.38%, ETH ≈ −0.78%, SOL ≈ −0.58%) — first golden cross on BTC looked nearest
+- Everything is autonomous; no action needed unless you want strategy/config changes
