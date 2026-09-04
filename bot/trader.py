@@ -13,10 +13,11 @@ import time as _time
 HEARTBEAT_INTERVAL_SECONDS = 3600
 
 def send_heartbeat(broker, journal):
-    """Send an hourly status message to Discord if an hour has passed since the last one."""
+    """Send a status message to Discord once per UTC clock hour."""
     now = _time.time()
-    last = journal.get_meta("last_heartbeat")
-    if last is not None and (now - float(last)) < HEARTBEAT_INTERVAL_SECONDS:
+    current_hour = datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H")
+    last = journal.get_meta("last_heartbeat_hour")
+    if last is not None and last == current_hour:
         return
     try:
         acct = broker.trading_client.get_account()
@@ -44,8 +45,8 @@ def send_heartbeat(broker, journal):
             f"Signal gaps (SMA20−SMA50):\n" + "\n".join(gap_lines)
         )
         send_notification(msg, config)
-        journal.set_meta("last_heartbeat", str(now))
-        print(f"[{datetime.now()}] Heartbeat sent")
+        journal.set_meta("last_heartbeat_hour", current_hour)
+        print(f"[{datetime.now()}] Heartbeat sent (hour {current_hour})")
     except Exception as e:
         print(f"[{datetime.now()}] Heartbeat failed (will retry next cycle): {e}")
 
@@ -72,6 +73,12 @@ def run_trading_cycle():
             df = broker.get_crypto_bars(symbol, timeframe, config.lookback_bars)
             if df is None or df.empty:
                 print(f"[{datetime.now()}] No data for {symbol}")
+                continue
+
+            # Drop the still-forming (unclosed) bar: signals must use closed bars only
+            df = df.iloc[:-1]
+            if len(df) < config.sma_slow + 1:
+                print(f"[{datetime.now()}] Not enough closed bars for {symbol} ({len(df)})")
                 continue
             
             # Check for crossover

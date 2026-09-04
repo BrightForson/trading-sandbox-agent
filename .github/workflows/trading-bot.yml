@@ -19,7 +19,6 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event_name != 'schedule' || github.event.schedule != '0 18 * * *'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
