@@ -1,0 +1,25 @@
+# Trading sandbox agent configuration
+# All parameters for the bot
+
+# Alpaca paper trading credentials (loaded from .env)
+# API keys are read from environment variables: ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY
+
+# Trading symbols (editable)
+symbols:
+  - BTC/USD
+  - ETH/USD
+  - SOL/USD
+
+# Strategy parameters
+sma_fast: 20
+sma_slow: 50
+
+# Position sizing (paper notional per trade in USD)
+notional: 100
+
+# Report delivery
+report_channel: null  # Discord channel ID for openclaw message send; if null, fallback to file
+
+# Other
+timeframe: 15Min  # Alpaca timeframe for bars
+lookback_bars: 120  # Number of bars to fetch for SMA calculation
