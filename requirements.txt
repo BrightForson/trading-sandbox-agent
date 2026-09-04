@@ -1,5 +1,6 @@
 requests
 python-dotenv
 alpaca-py
-openai  # for OpenAI-compatible API (used with NVIDIA endpoint)schedule
+openai
+schedule
 pyyaml
