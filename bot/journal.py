@@ -26,6 +26,12 @@ class TradeJournal:
                         reasoning TEXT
                     )
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS meta (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
                 conn.commit()
         except Exception as e:
             raise JournalError(f"Failed to initialize database: {e}")
@@ -82,3 +88,27 @@ class TradeJournal:
                 return cursor.fetchall()
         except Exception as e:
             raise JournalError(f"Failed to retrieve trades: {e}")
+
+    def get_meta(self, key):
+        """Get a meta value by key, or None if not set."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM meta WHERE key=?", (key,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            raise JournalError(f"Failed to get meta '{key}': {e}")
+
+    def set_meta(self, key, value):
+        """Set a meta value by key (upsert)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (key, value)
+                )
+                conn.commit()
+        except Exception as e:
+            raise JournalError(f"Failed to set meta '{key}': {e}")
