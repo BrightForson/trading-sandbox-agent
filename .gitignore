@@ -69,4 +69,5 @@ mysql.sock
 # Data and logs (keep journal for state persistence; ignore reports)
 data/*
 !data/.gitkeep
-!data/trades.dbalpaca_install.log
+!data/trades.db
+alpaca_install.log
