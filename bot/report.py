@@ -110,6 +110,35 @@ Please write a short, professional summary of the trading performance based on t
 Note: The narrative generation failed due to: {e}
 """
 
+def account_snapshot():
+    """
+    Fetch account equity and open positions from Alpaca paper (pure Python, no LLM).
+    Returns a formatted string section for the daily report.
+    """
+    try:
+        from bot.config import config
+        from bot.broker import AlpacaBroker
+        broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
+        acct = broker.trading_client.get_account()
+        lines = [
+            "Account Snapshot (Alpaca paper):",
+            f"- Equity: ${float(acct.equity):,.2f}",
+            f"- Cash: ${float(acct.cash):,.2f}",
+        ]
+        positions = list(broker.trading_client.get_all_positions())
+        if positions:
+            lines.append(f"- Open positions: {len(positions)}")
+            for p in positions:
+                lines.append(
+                    f"  * {p.symbol}: {float(p.qty):.6f} @ ${float(p.avg_entry_price):,.2f} "
+                    f"(unrealized P&L: ${float(p.unrealized_pl):,.2f})"
+                )
+        else:
+            lines.append("- Open positions: none (flat)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Account snapshot unavailable: {e}"
+
 def create_daily_report():
     """
     Create a daily report by reading trades from journal, computing stats,
@@ -119,7 +148,22 @@ def create_daily_report():
     # Get all trades (or maybe only today's trades? For simplicity, get all)
     trades = journal.get_trades()
     if not trades:
-        return "No trades found for the period."
+        return f"""=== Trading Bot Daily Report ===
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{account_snapshot()}
+
+Statistics:
+- Total P&L: $0.00
+- Win Rate: 0.00%
+- Number of round-trip trades: 0
+- Winning trades: 0
+- Losing trades: 0
+
+Narrative:
+No trades have been executed yet. The bot is monitoring BTC/USD, ETH/USD, and SOL/USD
+for SMA20/SMA50 crossovers and will act on the first signal.
+"""
     
     stats = compute_pnl_and_winrate(trades)
     
@@ -132,6 +176,8 @@ def create_daily_report():
     report = f"""
 === Trading Bot Daily Report ===
 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{account_snapshot()}
 
 Statistics:
 - Total P&L: ${stats['total_pnl']:.2f}
