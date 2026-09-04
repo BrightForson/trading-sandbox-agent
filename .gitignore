@@ -66,7 +66,7 @@ mysql.sock
 # macOS
 .DS_Store
 
-# Data and logs (as per spec)
-data/
+# Data and logs (keep journal for state persistence; ignore reports)
+data/*
 !data/.gitkeep
 !data/trades.dbalpaca_install.log
