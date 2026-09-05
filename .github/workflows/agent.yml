@@ -1,0 +1,43 @@
+name: agent
+
+on:
+  schedule:
+    # Tier 2 AI agent (babysitter + scout + shadow account): hourly,
+    # at :11 to dodge the scheduler's busiest minutes
+    - cron: '11 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-job
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run agent cycle (shadow mode)
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+        run: python run_agent.py --once
+
+      - name: Commit journal (lossless merge on conflict)
+        run: bash tools/safe_commit.sh "journal update (agent) $(date -u +'%Y-%m-%d %H:%M')"

@@ -139,6 +139,22 @@ def account_snapshot():
     except Exception as e:
         return f"Account snapshot unavailable: {e}"
 
+def shadow_snapshot():
+    """Shadow account section for the daily report (virtual $20 ledger)."""
+    try:
+        from bot.config import config
+        from bot.broker import AlpacaBroker
+        from bot.shadow import ShadowAccount
+        broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
+        shadow = ShadowAccount(config, broker)
+        lines = [f"AI Shadow Account (virtual ${shadow.start_cash:.0f}):",
+                 f"- {shadow.status_line()}",
+                 f"- Realized P&L from closed AI trades: ${shadow.realized_pnl():.2f}"]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Shadow account snapshot unavailable: {e}"
+
+
 def create_daily_report():
     """
     Create a daily report by reading trades from journal, computing stats,
@@ -152,6 +168,8 @@ def create_daily_report():
 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 {account_snapshot()}
+
+{shadow_snapshot()}
 
 Statistics:
 - Total P&L: $0.00
@@ -178,6 +196,8 @@ for SMA20/SMA50 crossovers and will act on the first signal.
 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 {account_snapshot()}
+
+{shadow_snapshot()}
 
 Statistics:
 - Total P&L: ${stats['total_pnl']:.2f}
