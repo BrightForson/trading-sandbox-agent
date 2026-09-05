@@ -9,8 +9,10 @@ def compute_pnl_and_winrate(trades):
     Compute P&L and win-rate from a list of trades.
     Assumes trades are sorted by timestamp and we only have long positions.
     Matches each BUY with the next SELL for the same symbol.
-    :param trades: list of tuples (id, timestamp, symbol, action, qty, price, reasoning)
-    :return: dict with total_pnl, win_rate, num_trades, num_winning, num_losing
+    Non-filled order records (status != 'filled', e.g. journaled cancels/
+    expires) are skipped so they never distort FIFO matching.
+    :param trades: list of tuples (id, timestamp, symbol, action, qty, price, reasoning[, ...])
+    :return: dict with total_pnl, win_rate, num_trades, num_losing, num_winning
     """
     # Group trades by symbol
     trades_by_symbol = {}
@@ -27,36 +29,41 @@ def compute_pnl_and_winrate(trades):
         # Sort by timestamp
         symbol_trades.sort(key=lambda x: x[1])
         # We'll use a queue for buys
-        buy_queue = []  # each element: (qty, price)
+        buy_queue = []  # each element: (qty, price, fee)
         for trade in symbol_trades:
-            _, timestamp, symbol, action, qty, price, _ = trade
+            _, timestamp, symbol, action, qty, price, *_ = trade
+            status = str(trade[9]) if len(trade) > 9 and trade[9] is not None else "filled"
+            if status != "filled":
+                continue
+            fee = float(trade[7] or 0.0) if len(trade) > 7 else 0.0
             if action == "BUY":
-                buy_queue.append((qty, price))
+                buy_queue.append((qty, price, fee))
             elif action == "SELL":
                 # Match this sell with previous buys (FIFO)
                 remaining_qty = qty
                 while remaining_qty > 0 and buy_queue:
-                    buy_qty, buy_price = buy_queue[0]
+                    buy_qty, buy_price, buy_fee = buy_queue[0]
+                    matched_qty = min(buy_qty, remaining_qty)
+                    buy_fee_part = buy_fee * (matched_qty / buy_qty) if buy_qty else 0.0
+                    sell_fee_part = fee * (matched_qty / qty) if qty else 0.0
+                    pnl = (price - buy_price) * matched_qty - buy_fee_part - sell_fee_part
                     if buy_qty <= remaining_qty:
-                        # This buy is fully consumed
-                        pnl = (price - buy_price) * buy_qty
                         total_pnl += pnl
                         if pnl > 0:
                             winning_trades += 1
                         else:
                             losing_trades += 1
-                        remaining_qty -= buy_qty
+                        remaining_qty -= matched_qty
                         buy_queue.pop(0)
                         round_trips += 1
                     else:
                         # Partially consume this buy
-                        pnl = (price - buy_price) * remaining_qty
                         total_pnl += pnl
                         if pnl > 0:
                             winning_trades += 1
                         else:
                             losing_trades += 1
-                        buy_queue[0] = (buy_qty - remaining_qty, buy_price)
+                        buy_queue[0] = (buy_qty - matched_qty, buy_price, buy_fee - buy_fee_part)
                         remaining_qty = 0
                         round_trips += 1
                 # If there is remaining qty (should not happen if we don't sell more than we bought)
@@ -155,6 +162,24 @@ def shadow_snapshot():
         return f"Shadow account snapshot unavailable: {e}"
 
 
+def experiment_scorecards():
+    """Deterministic evaluation of AI proposals and paper prediction bets."""
+    try:
+        journal = TradeJournal()
+        proposals = journal.proposal_scorecard()
+        bets = journal.bet_scorecard()
+        return (
+            "Experiment Scorecards:\n"
+            f"- AI proposals evaluated: {proposals['evaluated']} | net simulated P&L: ${proposals['net_pnl']:.2f} "
+            f"| win rate: {proposals['win_rate_pct']:.1f}% | avg BTC benchmark return: "
+            f"{proposals['avg_benchmark_return_pct']:+.2f}%\n"
+            f"- Prediction bets settled: {bets['settled']} | net P&L after recorded costs: ${bets['net_pnl']:.2f} "
+            f"| win rate: {bets['win_rate_pct']:.1f}% | open exposure: ${bets['open_exposure']:.2f}"
+        )
+    except Exception as e:
+        return f"Experiment scorecards unavailable: {e}"
+
+
 def create_daily_report():
     """
     Create a daily report by reading trades from journal, computing stats,
@@ -170,6 +195,8 @@ def create_daily_report():
 {account_snapshot()}
 
 {shadow_snapshot()}
+
+{experiment_scorecards()}
 
 Statistics:
 - Total P&L: $0.00
@@ -198,6 +225,8 @@ for SMA20/SMA50 crossovers and will act on the first signal.
 {account_snapshot()}
 
 {shadow_snapshot()}
+
+{experiment_scorecards()}
 
 Statistics:
 - Total P&L: ${stats['total_pnl']:.2f}

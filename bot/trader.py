@@ -1,5 +1,6 @@
 import time
 import schedule
+import pandas as pd
 from datetime import datetime
 from bot.config import config
 from bot.broker import AlpacaBroker
@@ -91,9 +92,52 @@ def run_trading_cycle():
         except Exception as e:
             print(f"[{datetime.now()}] Unexpected fetch error for {symbol}: {e}")
 
+    if risk_engine.daily_loss_hit():
+        print(f"[{datetime.now()}] Daily loss limit hit")
+        if (getattr(config, "risk", None) or {}).get("flatten_on_daily_loss", False):
+            try:
+                held_symbols = {p.symbol for p in broker.trading_client.get_all_positions()}
+            except Exception as e:
+                print(f"[{datetime.now()}] Could not enumerate positions for flatten: {e}")
+                held_symbols = set(bars_by_symbol)
+            # map broker symbols (ETHUSD) back to our format (ETH/USD)
+            slash_map = {s.replace("/", ""): s for s in config.symbols}
+            for sym in held_symbols:
+                symbol = slash_map.get(sym, sym)
+                df = bars_by_symbol.get(symbol)
+                if df is None:
+                    df = pd.DataFrame({"close": [0.0]})
+                _execute_signal(broker, journal, risk_engine, symbol, df, {
+                    "action": "SELL",
+                    "reasoning": "account-level daily loss limit: flattening paper exposure",
+                })
+        send_heartbeat(broker, journal)
+        return
+
     for symbol, df in bars_by_symbol.items():
         try:
             print(f"[{datetime.now()}] Processing {symbol}...")
+
+            position = broker.get_position(symbol)
+            if position:
+                # check the entry-fixed stop against the latest closed bar
+                # (live broker mark as fallback if bars are stale/unusable)
+                mark = float(df["close"].iloc[-1])
+                if mark <= 0:
+                    mark = float(getattr(position, "current_price", 0) or 0)
+                triggered, reason = risk_engine.stop_triggered(symbol, mark)
+                if not triggered and mark <= 0:
+                    # recorded stop exists but no usable mark: fall back to the
+                    # legacy current-ATR check rather than skipping entirely
+                    atr = _atr(df, int((getattr(config, "risk", None) or {}).get("atr_period", 14)))
+                    triggered, reason = risk_engine.atr_stop_triggered(
+                        float(position.avg_entry_price), mark, atr
+                    )
+                if triggered:
+                    _execute_signal(broker, journal, risk_engine, symbol, df, {
+                        "action": "SELL", "reasoning": reason,
+                    })
+                    continue
 
             for strat_name, strat_fn in strategies:
                 try:
@@ -110,6 +154,26 @@ def run_trading_cycle():
             print(f"[{datetime.now()}] Unexpected error for {symbol}: {e}")
             continue
 
+    # stops protect positions even when their bar feed failed this cycle
+    try:
+        slash_map = {s.replace("/", ""): s for s in config.symbols}
+        held_symbols = {slash_map.get(p.symbol, p.symbol)
+                        for p in broker.trading_client.get_all_positions()}
+        for symbol in held_symbols - set(bars_by_symbol):
+            position = broker.get_position(symbol)
+            if not position:
+                continue
+            mark = float(getattr(position, "current_price", 0) or 0)
+            if mark <= 0:
+                continue
+            triggered, reason = risk_engine.stop_triggered(symbol, mark)
+            if triggered:
+                _execute_signal(broker, journal, risk_engine, symbol, None, {
+                    "action": "SELL", "reasoning": reason,
+                })
+    except Exception as e:
+        print(f"[{datetime.now()}] Stop sweep for barless positions failed: {e}")
+
     # Hourly status heartbeat (no-op if less than an hour since last one)
     send_heartbeat(broker, journal)
 
@@ -119,10 +183,19 @@ def run_trading_cycle():
 def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
     """Validate a signal through risk and execute it with full Discord trail."""
     action = sig["action"]
-    price = df['close'].iloc[-1]
+    try:
+        price = float(df['close'].iloc[-1])
+    except Exception:
+        price = 0.0
 
     position = broker.get_position(symbol)
     current_qty = float(position.qty) if position else 0.0
+    if position and price <= 0:
+        # no usable bar data (e.g. flatten without bars): fall back to broker marks
+        try:
+            price = float(getattr(position, "current_price", 0) or 0)
+        except Exception:
+            price = 0.0
 
     qty = 0.0
     if action == "BUY" and current_qty == 0:
@@ -131,9 +204,8 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             available = float(acct.cash)
         except Exception:
             available = config.notional
-        # size to the smaller of configured notional or ~98% of available cash
-        notional = min(config.notional, available * 0.98)
-        qty = notional / price
+        atr = _atr(df, int((getattr(config, "risk", None) or {}).get("atr_period", 14)))
+        qty = risk_engine.size_for_atr(price, atr, available, config.notional)
     elif action == "SELL" and current_qty > 0:
         qty = current_qty
     else:
@@ -142,10 +214,17 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
 
     if qty > 0 and action == "BUY":
         try:
-            open_count = len(list(broker.trading_client.get_all_positions()))
+            positions = list(broker.trading_client.get_all_positions())
+            open_count = len(positions)
+            crypto_notional = sum(abs(float(getattr(p, "market_value", 0) or 0)) for p in positions)
+            account_equity = float(broker.trading_client.get_account().equity)
         except Exception:
             open_count = 0
-        allowed, reason = risk_engine.check(symbol, action, qty, price, open_count)
+            crypto_notional = 0.0
+            account_equity = None
+        allowed, reason = risk_engine.check(symbol, action, qty, price, open_count,
+                                            current_crypto_notional=crypto_notional,
+                                            account_equity=account_equity)
         if not allowed:
             print(f"[{datetime.now()}] RISK BLOCKED {action} {symbol}: {reason}")
             try:
@@ -169,26 +248,76 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
         )
     except Exception as notify_err:
         print(f"[{datetime.now()}] Pre-trade Discord alert failed (continuing trade): {notify_err}")
-    order = broker.place_order(symbol, qty, action.upper())
-    journal.log_trade(
-        timestamp=datetime.now().isoformat(),
-        symbol=symbol,
-        action=action,
-        qty=qty,
-        price=price,
-        reasoning=reasoning
-    )
-    print(f"[{datetime.now()}] Trade logged for {symbol}: {action} {qty:.6f} @ {price:.2f}")
     try:
-        send_notification(
-            f"✅ **Trade executed — {symbol}**\n"
-            f"**{action}** {qty:.6f} @ ~${price:,.2f}\n"
-            f"Order ID: {getattr(order, 'id', 'unknown')}\n"
-            f"Reason: {reasoning}",
-            config
+        order = broker.place_order(symbol, qty, action.upper())
+        confirmed = broker.await_terminal_order(order.id)
+    except BrokerError as e:
+        print(f"[{datetime.now()}] Order submission/confirmation failed for {symbol}: {e}")
+        return
+    raw_status = getattr(confirmed, "status", "")
+    status = str(getattr(raw_status, "value", raw_status)).lower()
+    if status == "filled":
+        fill_qty = float(getattr(confirmed, "filled_qty", None) or qty)
+        fill_price = float(getattr(confirmed, "filled_avg_price", None) or price)
+        fee_pct = float((getattr(config, "execution", None) or {}).get("taker_fee_pct", 0)) / 100.0
+        estimated_fee = fill_qty * fill_price * fee_pct
+        journal.log_trade(
+            timestamp=datetime.now().isoformat(), symbol=symbol, action=action,
+            qty=fill_qty, price=fill_price, reasoning=reasoning, fee=estimated_fee,
+            order_id=str(getattr(order, "id", "")), status="filled"
         )
-    except Exception as notify_err:
-        print(f"[{datetime.now()}] Post-trade Discord alert failed: {notify_err}")
+        if action == "BUY":
+            # fix the stop at entry: level decided now, never moved afterwards
+            entry_atr = _atr(df, int((getattr(config, "risk", None) or {}).get("atr_period", 14))) if df is not None else None
+            stop_price = risk_engine.entry_fixed_stop(symbol, fill_price, entry_atr)
+            risk_engine.record_stop(symbol, fill_price, stop_price)
+            print(f"[{datetime.now()}] Stop recorded for {symbol}: ${stop_price:.2f} (entry ${fill_price:.2f})")
+        elif action == "SELL":
+            # keep the stop if a partial fill leaves a residual position
+            try:
+                remaining = broker.get_position(symbol)
+            except Exception:
+                remaining = None
+            if remaining is None or float(getattr(remaining, "qty", 0) or 0) <= 0:
+                risk_engine.clear_stop(symbol)
+        print(f"[{datetime.now()}] Confirmed paper fill for {symbol}: {action} {fill_qty:.6f} @ {fill_price:.2f}")
+        try:
+            send_notification(
+                f"✅ **Trade executed — {symbol}**\n"
+                f"**{action}** {fill_qty:.6f} @ ${fill_price:,.2f}\n"
+                f"Order ID: {getattr(order, 'id', 'unknown')}\n"
+                f"Reason: {reasoning}",
+                config
+            )
+        except Exception as notify_err:
+            print(f"[{datetime.now()}] Post-trade Discord alert failed: {notify_err}")
+    else:
+        # journal non-fills so the audit trail matches the broker's order history
+        filled_qty = float(getattr(confirmed, "filled_qty", None) or 0)
+        journal.log_trade(
+            timestamp=datetime.now().isoformat(), symbol=symbol, action=action,
+            qty=filled_qty, price=float(getattr(confirmed, "filled_avg_price", None) or 0.0),
+            reasoning=f"{reasoning} [order ended as {status or 'pending'}; no fill]",
+            fee=0.0, order_id=str(getattr(order, "id", "")),
+            status=status or "pending",
+        )
+        print(f"[{datetime.now()}] Order {getattr(order, 'id', 'unknown')} ended as {status or 'pending'}; journaled as non-fill")
+
+
+def _atr(df, period):
+    """Compute ATR from closed bars; return None when the data is insufficient."""
+    if df is None or period <= 0 or len(df) < period + 1:
+        return None
+    close = df["close"]
+    high = df["high"] if "high" in df else close
+    low = df["low"] if "low" in df else close
+    ranges = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    value = ranges.rolling(period).mean().iloc[-1]
+    return float(value) if value == value and value > 0 else None
 
 
 def run_agent_cycle():

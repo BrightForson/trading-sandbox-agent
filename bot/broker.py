@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -77,6 +78,26 @@ class AlpacaBroker:
             return order
         except Exception as e:
             raise BrokerError(f"Failed to place order for {symbol}: {e}")
+
+    def await_terminal_order(self, order_id, timeout_seconds=15):
+        """Poll a paper order briefly and return its broker-confirmed terminal state."""
+        terminal = {"filled", "canceled", "cancelled", "expired", "rejected", "done_for_day"}
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                last = self.trading_client.get_order_by_id(order_id)
+            except Exception as e:
+                # transient read errors: keep polling until the deadline
+                print(f"[broker] transient error reading order {order_id}: {e}")
+                time.sleep(1)
+                continue
+            raw_status = getattr(last, "status", "")
+            status = str(getattr(raw_status, "value", raw_status)).lower()
+            if status in terminal:
+                return last
+            time.sleep(1)
+        return last
 
     def get_position(self, symbol):
         """

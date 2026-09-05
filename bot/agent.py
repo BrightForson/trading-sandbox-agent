@@ -17,7 +17,7 @@ Guardrails:
   - all proposals journaled with simulated outcome tracking
 """
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from bot.journal import TradeJournal
 from bot.models import ModelManager
@@ -108,6 +108,8 @@ class TradingAgent:
         except (TypeError, ValueError):
             conf = 0.0
             errors.append("confidence not numeric")
+        if not 0.0 <= conf <= 1.0:
+            errors.append("confidence must be between 0 and 1")
         try:
             notional = float(proposal.get("notional", 0))
         except (TypeError, ValueError):
@@ -115,6 +117,12 @@ class TradingAgent:
             errors.append("notional not numeric")
         if action == "BUY" and notional > float(self.agent_cfg.get("max_proposed_notional", 50)):
             errors.append(f"notional {notional} above agent cap")
+        if action == "BUY" and notional <= 0:
+            errors.append("BUY notional must be positive")
+        if kind == "scout" and action == "SELL":
+            errors.append("scout may not propose short sales in this long-only experiment")
+        if kind == "babysitter" and action == "BUY":
+            errors.append("babysitter may only HOLD or SELL")
         if errors:
             return None, errors
         return {
@@ -138,7 +146,26 @@ class TradingAgent:
         return raw
 
     def _log_and_alert(self, proposal, extra=""):
-        ts = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc)
+        ts = now.isoformat()
+        price_ctx = self._price_context(proposal.get("symbol")) if proposal.get("symbol") else None
+        btc_ctx = self._price_context("BTC/USD")
+        entry_price = price_ctx.get("last_close") if price_ctx else None
+        btc_entry_price = btc_ctx.get("last_close") if btc_ctx else None
+        evaluate = proposal["kind"] == "scout" and proposal["action"] == "BUY" and entry_price
+        expiry = (now + timedelta(hours=int(self.agent_cfg.get("evaluation_horizon_hours", 24)))).isoformat()
+        context = {
+            "price": price_ctx,
+            "btc_entry_price": btc_entry_price,
+            "evaluation_horizon_hours": int(self.agent_cfg.get("evaluation_horizon_hours", 24)),
+        }
+        context_json = json.dumps(context, separators=(",", ":"))
+        if len(context_json) > 4000:
+            # drop the bulky bar history rather than storing truncated (invalid) JSON
+            trimmed = {k: v for k, v in context.items() if k != "price"}
+            if price_ctx:
+                trimmed["price"] = {k: v for k, v in price_ctx.items() if k != "recent_24_bars"}
+            context_json = json.dumps(trimmed, separators=(",", ":"))[:4000]
         self.journal.log_proposal(
             timestamp=ts,
             source="ai_agent",
@@ -148,6 +175,11 @@ class TradingAgent:
             notional=proposal.get("notional"),
             confidence=proposal.get("confidence"),
             rationale=proposal.get("rationale"),
+            exec_status="open" if evaluate else "shadow",
+            context_json=context_json,
+            entry_price=entry_price,
+            btc_entry_price=btc_entry_price,
+            expiry_timestamp=expiry if evaluate else None,
         )
         emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(proposal["action"], "⚪")
         mode = "SHADOW (no execution)" if self.agent_cfg.get("shadow", True) else "LIVE"
@@ -183,6 +215,37 @@ class TradingAgent:
             )
         except Exception as e:
             print(f"[agent] proposal alert failed: {e}")
+
+    def evaluate_due_proposals(self):
+        """Score scout BUY ideas at a fixed horizon against BTC, never retroactively."""
+        now = datetime.now(timezone.utc)
+        evaluated = 0
+        for row in self.journal.get_open_proposals():
+            proposal_id, _, symbol, action, notional, _, _, entry_price, btc_entry_price, expiry = row
+            if action != "BUY" or not entry_price or not expiry:
+                continue
+            try:
+                due = datetime.fromisoformat(expiry)
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if due > now:
+                continue
+            price_ctx = self._price_context(symbol)
+            btc_ctx = self._price_context("BTC/USD")
+            if not price_ctx or not btc_ctx or not btc_entry_price:
+                continue
+            close_price = float(price_ctx["last_close"])
+            asset_return = close_price / float(entry_price) - 1
+            benchmark_return = float(btc_ctx["last_close"]) / float(btc_entry_price) - 1
+            simulated_pnl = float(notional or 0) * asset_return
+            self.journal.update_proposal_exec(
+                proposal_id, "evaluated", now.isoformat(), float(entry_price), simulated_pnl,
+                closed_price=close_price, benchmark_return=benchmark_return,
+            )
+            evaluated += 1
+        return evaluated
 
     # ---------------- babysitter ----------------
 
@@ -254,7 +317,7 @@ TASK: pick AT MOST one trade among {self.symbols} ONLY if evidence is strong
 No rationale text outside the JSON.
 
 OUTPUT: a single JSON object, nothing else, rationale under 40 words:
-{{"action": "BUY"|"SELL"|"HOLD", "symbol": one of {self.symbols}, "notional": number <= {self.agent_cfg.get('max_proposed_notional', 50)}, "confidence": 0.0-1.0, "rationale": "1-3 sentences citing the evidence"}}"""
+{{"action": "BUY"|"HOLD", "symbol": one of {self.symbols}, "notional": number <= {self.agent_cfg.get('max_proposed_notional', 50)}, "confidence": 0.0-1.0, "rationale": "1-3 sentences citing the evidence"}}"""
         try:
             proposal = self.model.generate_json(prompt, max_tokens=700)
         except Exception as e:
@@ -278,6 +341,7 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
         """One agent cycle: health check, babysit open positions, scout for new trades."""
         print(f"[{datetime.now()}] Agent cycle starting (shadow={self.agent_cfg.get('shadow', True)})")
         self.model.daily_health_check()
+        evaluated = self.evaluate_due_proposals()
         proposals = []
         if self.agent_cfg.get("babysitter_enabled", True):
             try:
@@ -289,7 +353,7 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
                 proposals += self.scout()
             except Exception as e:
                 print(f"[agent] scout error: {e}")
-        print(f"[{datetime.now()}] Agent cycle done: {len(proposals)} actionable proposals")
+        print(f"[{datetime.now()}] Agent cycle done: {len(proposals)} actionable proposals, {evaluated} evaluated")
         # per-cycle shadow account status to Discord
         try:
             send_notification(f"💵 {self.shadow.status_line()}", self.cfg)

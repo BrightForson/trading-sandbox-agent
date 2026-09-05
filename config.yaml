@@ -17,6 +17,12 @@ sma_slow: 50
 # Position sizing (paper notional per trade in USD)
 notional: 100
 
+# Conservative assumptions used only for research/backtests. Paper execution is
+# still measured from the broker's reported fills.
+execution:
+  taker_fee_pct: 0.25
+  slippage_bps: 8
+
 # Report delivery
 report_channel: null  # legacy; Discord delivery uses DISCORD_WEBHOOK_URL
 
@@ -33,6 +39,13 @@ risk:
   max_notional_per_trade: 100
   max_open_positions: 3
   daily_loss_limit_pct: 5.0
+  flatten_on_daily_loss: true
+  target_risk_pct_per_trade: 0.5
+  max_crypto_allocation_pct: 15.0
+  atr_period: 14
+  catastrophic_atr_multiple: 3.0
+  # Stop used only when entry-ATR is unavailable; ATR stop takes precedence
+  fallback_stop_pct: 5.0
 
 # AI agent (Tier 2) — shadow mode: proposals are logged/alerted, never executed
 # on the real account. They ARE simulated on a virtual $20 shadow account.
@@ -46,6 +59,7 @@ agent:
   scout_enabled: true
   shadow_start_cash: 20
   shadow_max_per_position: 10
+  evaluation_horizon_hours: 24
 
 # Research tools for the agent (all free tiers)
 research:
@@ -63,3 +77,6 @@ scanner:
   mispricing_threshold: 0.08
   max_llm_markets: 5
   friction_pct: 1.0
+  min_expected_value_pct: 2.0
+  max_total_open_exposure: 100
+  near_resolution_watchlist_only: true  # false = allow paper bets on near-resolution favorites (>= 12h to close)

@@ -150,7 +150,7 @@ class ShadowAccount:
         trades = [t for t in self.journal.get_trades() if "[shadow-account]" in (t[6] or "")]
         by_symbol = {}
         for t in sorted(trades, key=lambda x: x[1]):
-            _, ts, symbol, action, qty, price, _ = t
+            _, ts, symbol, action, qty, price, *_ = t
             by_symbol.setdefault(symbol, []).append((action, qty, price))
         total = 0.0
         for symbol, legs in by_symbol.items():

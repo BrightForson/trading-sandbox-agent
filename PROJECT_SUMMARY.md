@@ -2,9 +2,9 @@
 
 Three-tier paper-trading system (NO real money anywhere):
 
-1. **Tier 1 — SMA crossover bot (low risk)**: deterministic SMA20/50 golden/death cross on BTC/USD, ETH/USD, SOL/USD, 15-min closed bars, Alpaca paper.
-2. **Tier 2 — AI agent (medium risk, SHADOW MODE)**: babysits open positions (proposes early exits when thesis breaks) + scouts for high-conviction entries using news/whale/trend research. Proposes only — never executes. Every proposal logged with rationale + confidence and pushed to Discord.
-3. **Tier 3 — Polymarket scanner (high risk, paper bets)**: scans public Gamma API for near-resolution favorites (≥97¢, ending ≤3 days, EV net of price) and LLM-flagged mispricings (model's true-probability estimate vs market price, gap ≥8%). Bets are paper-logged and settled automatically when markets resolve.
+1. **Tier 1 — SMA crossover bot (paper only)**: deterministic SMA20/50 golden/death cross on BTC/USD, ETH/USD, SOL/USD, 15-min closed bars, with ATR-based catastrophic exits and account-level paper-risk controls.
+2. **Tier 2 — AI agent (SHADOW MODE)**: babysits open positions (proposes early exits when thesis breaks) + scouts for high-conviction entries using news/whale/trend research. It never executes. Scout BUY ideas receive a fixed-horizon, BTC-benchmarked scorecard.
+3. **Tier 3 — Polymarket scanner (paper only)**: near-resolution favorites are a watchlist, not automatic bets. LLM candidates must clear an expected-value-after-friction threshold, duplicate and total-exposure checks, then are paper-logged and settled automatically.
 
 All trade/bet/proposal events, heartbeats (hourly, with equity + SMA gaps), model switches, and a daily 18:00 UTC report go to Discord. Two-way Discord chat (Bright Bot) answers questions with live account data — read-only, can never trigger trades.
 
@@ -43,10 +43,11 @@ data/trades.db        # committed to repo: cross-run state for GitHub Actions
 
 - `symbols`, `sma_fast/slow`, `notional` — Tier 1
 - `active_strategies` — which registry entries the loop runs
-- `risk:` — max_notional_per_trade (100), max_open_positions (3), daily_loss_limit_pct (5) + kill switch (meta key `kill_switch=on`)
-- `agent:` — shadow (true), min_confidence (0.7), max_proposed_notional (50), babysitter/scout toggles, cycle interval
+- `execution:` — conservative taker-fee and slippage assumptions for backtests
+- `risk:` — max_notional_per_trade (100), max_open_positions (3), daily-loss flattening, volatility-based sizing, entry-fixed stops (entry − 3×ATR, or 5% fallback; level locked at entry, mirrored in the backtester), allocation cap + kill switch (meta key `kill_switch=on`)
+- `agent:` — shadow (true), min_confidence (0.7), max_proposed_notional (50), fixed evaluation horizon, babysitter/scout toggles, cycle interval
 - `research:` — headlines per symbol, Tavily daily (30) / monthly (1000) caps
-- `scanner:` — stake (20), near_resolution_days (3), near_resolution_min_price (0.97), min_market_volume, mispricing_threshold (0.08)
+- `scanner:` — stake (20), near-resolution watchlist, min_market_volume, mispricing threshold, minimum expected value, and total-open-exposure cap
 
 ## Hosting (GitHub Actions, free)
 
@@ -71,9 +72,17 @@ All jobs commit `data/trades.db` back to the repo (state persistence). Secrets: 
 - Tavily: general web + whale-activity searches, hard-guarded to 30/day and 1000/month (free tier 1500/mo), counters persisted in journal meta; whale queries cached once/day/symbol
 - On budget exhaustion: automatic fallback to RSS/DuckDuckGo — never billed
 
-## Backtest (Tier 1 baseline, 2026-09-05, 30d of 15m bars)
+## Backtest
 
-BTC +16.7% (33 trips, 36% win), ETH +12.0% (36 trips, 31% win), SOL +26.8% (31 trips, 29% win) on $100 notional each — combined +$55. Low win rate + positive P&L = classic trend-following (many small losses, few big wins). Baseline saved in journal meta `tier1_backtest_30d`.
+The backtester generates signals on closed candles and fills them on the next bar,
+with configurable adverse slippage and fees. Sizing and stops mirror the live loop:
+each BUY is capped at `risk.max_notional_per_trade` and never deploys more than
+the configured per-trade notional (no all-in compounding by default), and every
+entry records a stop fixed at entry (entry − 3×ATR, 5% fallback) that only ever
+exits on the next bar's open. It reports return, drawdown, exposure, turnover,
+costs, stop exits, and a buy-and-hold comparison. Historical results
+remain hypotheses until evaluated across long, untouched periods and then
+confirmed by paper execution.
 
 ## Graduation gates (experiment phase → any real money)
 

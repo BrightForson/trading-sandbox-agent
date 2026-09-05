@@ -11,6 +11,8 @@ from bot.strategies import get_strategies, sma_cross
 from bot.risk import RiskEngine
 from bot.journal import TradeJournal
 from bot.models import ModelManager
+from bot.polymarket import _expected_value
+from backtest import simulate
 
 
 # ---------------- strategy ----------------
@@ -125,6 +127,16 @@ def test_risk_allows_normal_buy(tmp_path):
     assert ok, reason
 
 
+def test_risk_blocks_crypto_allocation_cap(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    cfg = type("C", (), {"risk": {"max_notional_per_trade": 100,
+                                   "max_crypto_allocation_pct": 15}})()
+    eng = RiskEngine(cfg, _FakeBrokerAcct(), journal=j)
+    ok, reason = eng.check("BTC/USD", "BUY", 0.1, 100, 0,
+                           current_crypto_notional=10, account_equity=100)
+    assert not ok and "allocation" in reason
+
+
 # ---------------- journal ----------------
 
 def test_journal_proposals_and_bets(tmp_path):
@@ -143,6 +155,14 @@ def test_journal_proposals_and_bets(tmp_path):
     assert len(bets) == 1
     j.update_bet(bets[0][0], "won", 20.62)
     assert j.get_open_bets() == []
+
+
+def test_prediction_expected_value_includes_friction():
+    ev = _expected_value(stake=20, price=0.50, probability=0.55, friction_pct=1.0)
+    assert ev is not None
+    assert ev["fee"] == 0.2
+    assert ev["expected_value"] == pytest.approx(1.8)
+    assert _expected_value(20, 1.0, 0.6, 1.0) is None
 
 
 # ---------------- shadow account ----------------
@@ -259,3 +279,328 @@ def test_agent_proposal_validation(tmp_path):
     ok, errs = a._validate({"action": "BUY", "symbol": "BTC/USD", "notional": 500,
                             "confidence": 0.8, "rationale": "r"}, "scout")
     assert ok is None and any("cap" in e for e in errs)
+
+
+def test_agent_validation_role_restrictions(tmp_path):
+    from bot.agent import TradingAgent
+
+    class _Cfg:
+        symbols = ["BTC/USD", "ETH/USD"]
+        agent = {"max_proposed_notional": 50, "min_confidence": 0.7}
+        research = {}
+
+    a = TradingAgent.__new__(TradingAgent)
+    a.cfg = _Cfg
+    a.agent_cfg = _Cfg.agent
+    a.symbols = _Cfg.symbols
+
+    # scout may not propose SELL
+    ok, errs = a._validate({"action": "SELL", "symbol": "BTC/USD", "notional": 0,
+                            "confidence": 0.8, "rationale": "r"}, "scout")
+    assert ok is None and any("scout" in e for e in errs)
+
+    # babysitter may not propose BUY
+    ok, errs = a._validate({"action": "BUY", "symbol": "BTC/USD", "notional": 30,
+                            "confidence": 0.8, "rationale": "r"}, "babysitter")
+    assert ok is None and any("babysitter" in e for e in errs)
+
+    # confidence bounds enforced
+    ok, errs = a._validate({"action": "BUY", "symbol": "BTC/USD", "notional": 30,
+                            "confidence": 1.5, "rationale": "r"}, "scout")
+    assert ok is None and any("confidence" in e for e in errs)
+
+
+# ---------------- backtest simulate ----------------
+
+def _backtest_df(closes):
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="15min", tz="UTC")
+    return pd.DataFrame({"open": [c * 1.0 for c in closes], "close": closes}, index=idx)
+
+
+def test_backtest_no_all_in_sizing():
+    # $10k capital, notional 100, cap 100: a BUY must deploy ~$100, not the account
+    closes = [10.0] * 49 + [10.0, 20.0, 20.0, 20.0, 20.0]
+    df = _backtest_df(closes)
+    stats = simulate(df, 3, 5, notional=10_000, taker_fee_pct=0.25,
+                     slippage_bps=8, max_notional_per_trade=100)
+    buys = [t for t in stats["trades"] if t["action"] == "BUY"]
+    assert buys, "expected at least one BUY"
+    for b in buys:
+        assert b["qty"] * b["price"] == pytest.approx(100.0 / (1 + 0.0025), rel=0.01)
+
+
+def test_backtest_fixed_notional_does_not_compound():
+    # repeated round trips at rising prices must not grow the per-trade budget
+    base = [10.0] * 5
+    # sawtooth: up-cross then down-cross, thrice
+    closes = base + [10.0, 12.0, 12.0, 11.0, 11.0, 12.0, 12.0, 11.0, 11.0, 12.0]
+    df = _backtest_df(closes)
+    stats = simulate(df, 3, 5, notional=100, max_notional_per_trade=100)
+    buys = [t for t in stats["trades"] if t["action"] == "BUY"]
+    assert len(buys) >= 2
+    notionals = [b["qty"] * b["price"] for b in buys]
+    for n in notionals[1:]:
+        assert n == pytest.approx(notionals[0], rel=0.001)
+
+
+def test_backtest_next_bar_fill_no_lookahead():
+    # signal on bar i, fill at bar i+1's open: with a gap up, entry price is the
+    # next open (plus slippage), never the signal bar's close
+    closes = [10.0] * 6 + [20.0, 20.0]
+    opens = [10.0] * 7 + [30.0]
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="15min", tz="UTC")
+    df = pd.DataFrame({"open": opens, "close": closes}, index=idx)
+    stats = simulate(df, 3, 5, notional=100)
+    buys = [t for t in stats["trades"] if t["action"] == "BUY"]
+    assert buys, "expected a BUY"
+    assert buys[0]["price"] == pytest.approx(30.0)
+
+
+def test_backtest_fees_slippage_applied():
+    closes = [10.0] * 5 + [10.0, 20.0, 20.0]
+    opens = [10.0] * 5 + [10.0, 10.0, 20.0]
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="15min", tz="UTC")
+    df = pd.DataFrame({"open": opens, "close": closes}, index=idx)
+    stats = simulate(df, 3, 5, notional=100, taker_fee_pct=1.0, slippage_bps=100)
+    assert stats["fees"] > 0
+    buys = [t for t in stats["trades"] if t["action"] == "BUY"]
+    # entry slippage pushes the fill above the 10.0 open
+    assert buys[0]["price"] > 10.0
+
+
+def test_backtest_insufficient_data_returns_zero():
+    stats = simulate(_backtest_df([10.0] * 3), 3, 5, notional=100)
+    assert stats["round_trips"] == 0 and stats["pnl"] == 0.0
+
+
+# ---------------- ATR sizing and stops ----------------
+
+def test_size_for_atr_risk_capped(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    cfg = type("C", (), {"risk": {"max_notional_per_trade": 100,
+                                   "target_risk_pct_per_trade": 0.5,
+                                   "catastrophic_atr_multiple": 3.0}})()
+    eng = RiskEngine(cfg, _FakeBrokerAcct(), journal=j)
+    # equity 100 -> risk budget $0.50; stop distance 3*ATR(0.5)=$1.5 at price 100
+    # -> target notional 0.5/1.5*100 = $33.33 < fallback 100 and cap 100
+    qty = eng.size_for_atr(price=100.0, atr=0.5, cash=100.0, fallback_notional=100.0)
+    assert qty * 100.0 == pytest.approx(0.5 / 1.5 * 100.0, rel=0.001)
+
+
+def test_size_for_atr_cash_bound(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    cfg = type("C", (), {"risk": {"max_notional_per_trade": 100}})()
+    eng = RiskEngine(cfg, _FakeBrokerAcct(), journal=j)
+    qty = eng.size_for_atr(price=100.0, atr=None, cash=10.0, fallback_notional=100.0)
+    # no ATR -> fallback notional, but never more than 98% of cash
+    assert qty * 100.0 == pytest.approx(9.8)
+
+
+def test_size_for_atr_zero_price(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    eng = RiskEngine(type("C", (), {"risk": {}})(), _FakeBrokerAcct(), journal=j)
+    assert eng.size_for_atr(0.0, 1.0, 100.0, 100.0) == 0.0
+
+
+def test_atr_stop_triggered_threshold(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    cfg = type("C", (), {"risk": {"catastrophic_atr_multiple": 3.0}})()
+    eng = RiskEngine(cfg, _FakeBrokerAcct(), journal=j)
+    # stop = 100 - 3*1 = 97
+    hit, msg = eng.atr_stop_triggered(100.0, 96.9, 1.0)
+    assert hit and "stop" in msg.lower()
+    hit, _ = eng.atr_stop_triggered(100.0, 97.1, 1.0)
+    assert not hit
+    # missing ATR -> never triggers
+    hit, msg = eng.atr_stop_triggered(100.0, 10.0, None)
+    assert not hit and "unavailable" in msg.lower()
+
+
+# ---------------- allocation cap fail-closed ----------------
+
+def test_risk_allocation_cap_fails_closed_without_equity(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    cfg = type("C", (), {"risk": {"max_notional_per_trade": 100,
+                                   "max_crypto_allocation_pct": 15}})()
+
+    class _BrokenBroker:
+        trading_client = None
+
+        def __init__(self):
+            class TC:
+                def get_account(self):
+                    raise RuntimeError("api down")
+            self.trading_client = TC()
+
+    eng = RiskEngine(cfg, _BrokenBroker(), journal=j)
+    ok, reason = eng.check("BTC/USD", "BUY", 0.001, 100, 0, account_equity=None)
+    assert not ok and "unreadable" in reason
+
+
+def test_risk_allocation_cap_explicit_equity(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    cfg = type("C", (), {"risk": {"max_notional_per_trade": 100,
+                                   "max_crypto_allocation_pct": 15}})()
+    eng = RiskEngine(cfg, _FakeBrokerAcct(), journal=j)
+    # 10 + 5 = 15% of 100: at the cap, not over it
+    ok, _ = eng.check("BTC/USD", "BUY", 0.05, 100, 0,
+                      current_crypto_notional=10, account_equity=100)
+    assert ok
+    # 10 + 6 = 16% > cap
+    ok, _ = eng.check("BTC/USD", "BUY", 0.06, 100, 0,
+                      current_crypto_notional=10, account_equity=100)
+    assert not ok
+
+
+# ---------------- journal non-fill status and P&L ----------------
+
+def test_journal_nonfill_rows_excluded_from_pnl():
+    from bot.report import compute_pnl_and_winrate
+    # filled BUY then a journaled canceled BUY must not create phantom exposure
+    trades = [
+        (1, "2026-09-05T10:00", "BTC/USD", "BUY", 0.01, 100.0, "r", 0.02, "o1", "filled"),
+        (2, "2026-09-05T10:05", "BTC/USD", "BUY", 0.02, 101.0, "canceled buy", 0.0, "o2", "canceled"),
+        (3, "2026-09-05T11:00", "BTC/USD", "SELL", 0.01, 110.0, "r", 0.02, "o3", "filled"),
+    ]
+    stats = compute_pnl_and_winrate(trades)
+    assert stats["round_trips"] == 1
+    # (110-100)*0.01 - 0.02 - 0.02 = 0.06
+    assert stats["total_pnl"] == pytest.approx(0.06)
+
+
+def test_journal_records_status(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    j.log_trade("2026-09-05T10:00", "BTC/USD", "BUY", 0.01, 100.0, "r",
+                fee=0.02, order_id="o9", status="canceled")
+    trades = j.get_trades()
+    assert trades[0][9] == "canceled" and trades[0][8] == "o9"
+
+
+# ---------------- entry-fixed stop ledger ----------------
+
+def _stop_engine(tmp_path, risk=None):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    cfg = type("C", (), {"risk": risk or {"catastrophic_atr_multiple": 3.0,
+                                          "fallback_stop_pct": 5.0}})()
+    return RiskEngine(cfg, _FakeBrokerAcct(), journal=j), j
+
+
+def test_stop_recorded_fixed_and_persistent(tmp_path):
+    eng, _ = _stop_engine(tmp_path)
+    stop = eng.entry_fixed_stop("BTC/USD", 100.0, atr=2.0)
+    assert stop == pytest.approx(94.0)  # 100 - 3*2
+    eng.record_stop("BTC/USD", 100.0, stop)
+    # level survives a reload (journal meta persistence)
+    entry, level = eng.get_stop("BTC/USD")
+    assert entry == 100.0 and level == pytest.approx(94.0)
+    # the level never drifts with later volatility: check at 93.9 triggers
+    hit, msg = eng.stop_triggered("BTC/USD", 93.9)
+    assert hit and "stop" in msg.lower()
+    # and a bounce off the SAME current-ATR does not move the stop
+    entry, level_after = eng.get_stop("BTC/USD")
+    assert level_after == pytest.approx(94.0)
+
+
+def test_stop_fallback_without_atr(tmp_path):
+    eng, _ = _stop_engine(tmp_path)
+    stop = eng.entry_fixed_stop("ETH/USD", 200.0, atr=None)
+    assert stop == pytest.approx(190.0)  # 5% below entry
+    eng.record_stop("ETH/USD", 200.0, stop)
+    hit, _ = eng.stop_triggered("ETH/USD", 189.9)
+    assert hit
+    hit, _ = eng.stop_triggered("ETH/USD", 190.1)
+    assert not hit
+
+
+def test_stop_cleared_on_exit(tmp_path):
+    eng, _ = _stop_engine(tmp_path)
+    eng.record_stop("SOL/USD", 50.0, 45.0)
+    eng.clear_stop("SOL/USD")
+    entry, level = eng.get_stop("SOL/USD")
+    assert entry is None and level is None
+    hit, msg = eng.stop_triggered("SOL/USD", 10.0)  # crash after exit: no stale stop
+    assert not hit and "no stop" in msg
+
+
+def test_stop_never_triggers_on_suspect_mark(tmp_path):
+    eng, _ = _stop_engine(tmp_path)
+    eng.record_stop("BTC/USD", 100.0, 94.0)
+    # a 50x-above-entry broker mark is bad data, not a crash: never act on it
+    hit, msg = eng.stop_triggered("BTC/USD", 6000.0)
+    assert not hit and "suspect" in msg.lower()
+
+
+def test_stops_isolated_per_symbol(tmp_path):
+    eng, _ = _stop_engine(tmp_path)
+    eng.record_stop("BTC/USD", 100.0, 94.0)
+    eng.record_stop("ETH/USD", 200.0, 185.0)
+    eng.clear_stop("BTC/USD")
+    entry, level = eng.get_stop("ETH/USD")
+    assert entry == 200.0 and level == 185.0  # ETH stop untouched
+
+
+# ---------------- backtest stop simulation ----------------
+
+def test_backtest_stop_exit_fills_next_bar_open():
+    # downtrend then uptrend -> golden cross at bar 5 -> BUY fills bar 6 open (10.0).
+    # the crash bar's close (6.0) triggers the entry-fixed stop and the exit
+    # must fill at the NEXT bar's open (7.0), never the crash close
+    closes = [9.0] * 5 + [10.0] * 3 + [6.0] * 3
+    opens = [9.0] * 5 + [10.0] * 3 + [7.0] * 3
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="15min", tz="UTC")
+    df = pd.DataFrame({"open": opens, "close": closes,
+                       "high": closes, "low": closes}, index=idx)
+    stats = simulate(df, 3, 5, notional=100, atr_period=3,
+                     catastrophic_atr_multiple=3.0)
+    stop_sells = [t for t in stats["trades"] if t["action"] == "SELL(stop)"]
+    assert stop_sells, "expected a stop exit"
+    assert stats["stop_exits"] == 1
+    buys = [t for t in stats["trades"] if t["action"] == "BUY"]
+    assert buys[0]["price"] == pytest.approx(10.0)
+    # stop exit fills at the next bar's open (7.0), never the crash close (6.0)
+    assert stop_sells[0]["price"] == pytest.approx(7.0)
+
+
+def test_backtest_stop_level_fixed_at_entry():
+    # entry-fixed stop = 10 - 3*0.333 = 9.0 (small pre-entry ranges).
+    # AFTER entry the true range explodes (lows crash to 1.0): a stop that
+    # floated with current ATR would drop far below 9.0 and never trigger.
+    # The entry-fixed stop must stay at 9.0 and exit when close breaches it.
+    closes = [9.0] * 5 + [10.0] * 3 + [8.9] * 3
+    opens = [9.0] * 5 + [10.0] * 3 + [8.9] * 3
+    lows = [9.0] * 5 + [10.0] * 3 + [1.0] * 3  # volatility spike after entry only
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="15min", tz="UTC")
+    df = pd.DataFrame({"open": opens, "close": closes,
+                       "high": closes, "low": lows}, index=idx)
+    stats = simulate(df, 3, 5, notional=100, atr_period=3,
+                     catastrophic_atr_multiple=3.0)
+    stop_sells = [t for t in stats["trades"] if t["action"] == "SELL(stop)"]
+    assert stop_sells, "8.9 must breach the entry-fixed stop despite later spikes"
+    # exit fills at the next bar's open after the breach
+    assert stop_sells[0]["price"] == pytest.approx(8.9)
+    # with no stop modelled, the same series must NOT exit via stop
+    stats_nostop = simulate(df, 3, 5, notional=100)
+    assert stats_nostop["stop_exits"] == 0
+
+
+# ---------------- polymarket exposure caps ----------------
+
+def test_polymarket_journal_caps(tmp_path):
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    # duplicate (market, side) detection
+    assert not j.has_open_bet("will-x", "Yes")
+    j.log_bet("2026-09-05T10:00", "will-x", "q", "Yes", 0.5, 20,
+              fee=0.2, estimated_probability=0.55, expected_value=1.8)
+    assert j.has_open_bet("will-x", "Yes")
+    assert not j.has_open_bet("will-x", "No")
+    # exposure sums stake + fee for open bets only
+    assert j.open_bet_exposure() == pytest.approx(20.2)
+    j.log_bet("2026-09-05T10:05", "will-y", "q2", "Yes", 0.4, 10, fee=0.1)
+    assert j.open_bet_exposure() == pytest.approx(30.3)
+    bets = j.get_open_bets()
+    j.update_bet(bets[0][0], "won", 40.0)
+    assert j.open_bet_exposure() == pytest.approx(10.1)
+    # settled bets feed the scorecard
+    card = j.bet_scorecard()
+    assert card["settled"] == 1 and card["win_rate_pct"] == 100.0
+    assert card["net_pnl"] == pytest.approx(40.0 - 20.0 - 0.2)
