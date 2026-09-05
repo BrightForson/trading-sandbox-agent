@@ -35,6 +35,7 @@ risk:
   daily_loss_limit_pct: 5.0
 
 # AI agent (Tier 2) — shadow mode: proposals are logged/alerted, never executed
+# on the real account. They ARE simulated on a virtual $20 shadow account.
 agent:
   enabled: true
   shadow: true
@@ -43,6 +44,8 @@ agent:
   max_proposed_notional: 50
   babysitter_enabled: true
   scout_enabled: true
+  shadow_start_cash: 20
+  shadow_max_per_position: 10
 
 # Research tools for the agent (all free tiers)
 research:

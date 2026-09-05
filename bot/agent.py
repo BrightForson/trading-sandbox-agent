@@ -34,6 +34,8 @@ class TradingAgent:
         self.agent_cfg = getattr(cfg, "agent", None) or {}
         self.research_cfg = getattr(cfg, "research", None) or {}
         self.symbols = list(cfg.symbols)
+        from bot.shadow import ShadowAccount
+        self.shadow = ShadowAccount(cfg, broker, journal=self.journal)
 
     # ---------------- context building ----------------
 
@@ -93,10 +95,12 @@ class TradingAgent:
         errors = []
         if not isinstance(proposal, dict):
             return None, ["not a dict"]
-        action = str(proposal.get("action", "")).upper()
+        action = str(proposal.get("action", "")).upper().strip()
         if action not in ("BUY", "SELL", "HOLD"):
             errors.append(f"bad action {action}")
         symbol = proposal.get("symbol")
+        if symbol is not None:
+            symbol = self._normalize_symbol(str(symbol))
         if symbol and symbol not in self.symbols:
             errors.append(f"symbol {symbol} not in whitelist")
         try:
@@ -122,6 +126,17 @@ class TradingAgent:
             "rationale": str(proposal.get("rationale", ""))[:500],
         }, []
 
+    def _normalize_symbol(self, raw):
+        """Fuzzy-fix model symbol output: 'sol', 'SOL/', 'solusd' -> 'SOL/USD'."""
+        s = raw.strip().upper().replace(" ", "")
+        if s in self.symbols:
+            return s
+        base = s.replace("/USD", "").rstrip("/").replace("USD", "")
+        for sym in self.symbols:
+            if sym.split("/")[0] == base:
+                return sym
+        return raw
+
     def _log_and_alert(self, proposal, extra=""):
         ts = datetime.utcnow().isoformat()
         self.journal.log_proposal(
@@ -136,13 +151,34 @@ class TradingAgent:
         )
         emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(proposal["action"], "⚪")
         mode = "SHADOW (no execution)" if self.agent_cfg.get("shadow", True) else "LIVE"
+        # simulate on the virtual shadow account ($20) when in shadow mode
+        shadow_note = ""
+        if self.agent_cfg.get("shadow", True) and proposal["action"] in ("BUY", "SELL"):
+            try:
+                if proposal["action"] == "BUY":
+                    ok, note = self.shadow.take_buy(
+                        proposal.get("symbol"),
+                        proposal.get("notional") or self.agent_cfg.get("shadow_max_per_position", 10),
+                        rationale=proposal.get("rationale", ""),
+                    )
+                else:
+                    ok, note = self.shadow.take_sell(
+                        proposal.get("symbol"),
+                        rationale=proposal.get("rationale", ""),
+                    )
+                if ok:
+                    shadow_note = f"\n💵 {note}"
+                else:
+                    shadow_note = f"\n💵 (shadow acct: {note})"
+            except Exception as e:
+                print(f"[agent] shadow account execution failed: {e}")
         try:
             send_notification(
                 f"{emoji} **Agent proposal — {proposal['kind']}** [{mode}]\n"
                 f"**{proposal['action']}** {proposal.get('symbol') or 'market'}"
                 + (f" | ${proposal.get('notional'):.0f}" if proposal.get("notional") else "")
                 + f" | confidence {proposal.get('confidence', 0):.2f}\n"
-                f"Rationale: {proposal.get('rationale', '')}\n{extra}",
+                f"Rationale: {proposal.get('rationale', '')}\n{extra}{shadow_note}",
                 self.cfg,
             )
         except Exception as e:
@@ -254,4 +290,9 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
             except Exception as e:
                 print(f"[agent] scout error: {e}")
         print(f"[{datetime.now()}] Agent cycle done: {len(proposals)} actionable proposals")
+        # per-cycle shadow account status to Discord
+        try:
+            send_notification(f"💵 {self.shadow.status_line()}", self.cfg)
+        except Exception as e:
+            print(f"[agent] shadow status alert failed: {e}")
         return proposals

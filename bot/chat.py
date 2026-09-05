@@ -146,8 +146,21 @@ def _system_context(broker, cfg, journal):
         f"Account: {acct_block}\nPositions: {pos_block}\n"
         f"Recent trades: {trade_block}\nRecent AI proposals: {prop_block}\n"
         f"Strategy: SMA{cfg.sma_fast}/{cfg.sma_slow} crossover on {', '.join(cfg.symbols)}, "
-        f"shadow mode = AI proposes, never executes."
+        f"shadow mode = AI proposes, never executes on the real account."
     )
+    try:
+        from bot.shadow import ShadowAccount
+        shadow = ShadowAccount(cfg, broker, journal=journal)
+        acct_line = shadow.status_line()
+        pos = shadow._positions()
+        if pos:
+            lines = []
+            for sym, p in pos.items():
+                lines.append(f"{sym} qty {p['qty']:.6f} entry ${p['entry']:,.2f}")
+            acct_line += " | open: " + "; ".join(lines)
+        return context + f"\nAI shadow account (virtual $20): {acct_line}"
+    except Exception as e:
+        return context + f"\nAI shadow account: unavailable ({e})"
 
 
 def run_chat_cycle(cfg, broker, journal=None, model=None):

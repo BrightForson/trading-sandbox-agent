@@ -145,6 +145,79 @@ def test_journal_proposals_and_bets(tmp_path):
     assert j.get_open_bets() == []
 
 
+# ---------------- shadow account ----------------
+
+class _FakeBrokerPrices:
+    """Yields a fixed price per symbol via a stub bar frame."""
+    def __init__(self, prices):
+        self.prices = prices
+
+    def get_crypto_bars(self, symbol, timeframe, limit):
+        import pandas as pd
+        price = self.prices[symbol]
+        return pd.DataFrame({"close": [price] * 60})
+
+
+def test_shadow_account_lifecycle(tmp_path):
+    from bot.shadow import ShadowAccount
+
+    class _Cfg:
+        symbols = ["BTC/USD", "ETH/USD", "SOL/USD"]
+        timeframe = "15Min"
+        lookback_bars = 120
+        agent = {"shadow_start_cash": 20, "shadow_max_per_position": 10}
+
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    broker = _FakeBrokerPrices({"SOL/USD": 100.0, "BTC/USD": 50000.0})
+    s = ShadowAccount(_Cfg(), broker, journal=j)
+
+    assert "Shadow account: $20.00" in s.status_line()
+
+    # diversified sizing: cap at $10 even if $15 requested
+    ok, note = s.take_buy("SOL/USD", 15)
+    assert ok and "$10.00" in note
+    equity, cash, _ = s.mark_to_market()
+    assert cash == 10.0
+
+    # duplicate symbol blocked
+    ok, note = s.take_buy("SOL/USD", 5)
+    assert not ok and "already holding" in note
+
+    # price move up -> unrealized profit (price 100 -> 120)
+    broker.prices["SOL/USD"] = 120.0
+    equity, _, block = s.mark_to_market()
+    assert equity > 20.0
+
+    # sell realizes the P&L
+    ok, note = s.take_sell("SOL/USD")
+    assert ok and "+$19" not in note  # just ensure it executed
+    # qty 0.1 @ entry 100 -> sold 120 = +$2.00 profit
+    assert s.realized_pnl() == 2.0
+    assert s._cash() == 10.0 + 12.0
+    assert "flat" in s.status_line()
+
+
+def test_shadow_account_sizing_caps(tmp_path):
+    from bot.shadow import ShadowAccount
+
+    class _Cfg:
+        symbols = ["BTC/USD", "ETH/USD", "SOL/USD"]
+        timeframe = "15Min"
+        lookback_bars = 120
+        agent = {"shadow_start_cash": 20, "shadow_max_per_position": 10}
+
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    broker = _FakeBrokerPrices({"BTC/USD": 100.0, "ETH/USD": 100.0, "SOL/USD": 100.0})
+    s = ShadowAccount(_Cfg(), broker, journal=j)
+
+    # fill the account: 2 positions at $10 each exhausts cash
+    ok1, _ = s.take_buy("BTC/USD", 10)
+    ok2, _ = s.take_buy("ETH/USD", 10)
+    ok3, note = s.take_buy("SOL/USD", 10)
+    assert ok1 and ok2
+    assert not ok3 and "insufficient" in note
+
+
 # ---------------- model manager ----------------
 
 def test_json_parsing_variants():
