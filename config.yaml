@@ -18,8 +18,45 @@ sma_slow: 50
 notional: 100
 
 # Report delivery
-report_channel: null  # Discord channel ID for openclaw message send; if null, fallback to file
+report_channel: null  # legacy; Discord delivery uses DISCORD_WEBHOOK_URL
 
 # Other
 timeframe: 15Min  # Alpaca timeframe for bars
 lookback_bars: 120  # Number of bars to fetch for SMA calculation
+
+# Strategies registered for the trading loop (names map to bot/strategies/)
+active_strategies:
+  - sma_cross
+
+# Risk controls (checked before every order; SELLs always allowed)
+risk:
+  max_notional_per_trade: 100
+  max_open_positions: 3
+  daily_loss_limit_pct: 5.0
+
+# AI agent (Tier 2) — shadow mode: proposals are logged/alerted, never executed
+agent:
+  enabled: true
+  shadow: true
+  cycle_interval_minutes: 60
+  min_confidence: 0.7
+  max_proposed_notional: 50
+  babysitter_enabled: true
+  scout_enabled: true
+
+# Research tools for the agent (all free tiers)
+research:
+  headlines_per_symbol: 5
+  tavily_daily_limit: 30
+  tavily_monthly_limit: 1000
+
+# Polymarket scanner (Tier 3) — read-only API, paper bets only
+scanner:
+  enabled: true
+  stake: 20
+  near_resolution_days: 3
+  near_resolution_min_price: 0.97
+  min_market_volume: 50000
+  mispricing_threshold: 0.08
+  max_llm_markets: 5
+  friction_pct: 1.0

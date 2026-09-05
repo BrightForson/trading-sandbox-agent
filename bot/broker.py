@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -22,15 +23,39 @@ class AlpacaBroker:
         :return: pandas DataFrame of bars
         """
         try:
+            # Explicit start/end window: a bare limit request returns far fewer
+            # bars than requested (free-tier paging quirk), which silently
+            # starves the SMA calculations.
+            minutes = self._timeframe_minutes(timeframe)
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(minutes=minutes * (limit + 10))
             request_params = CryptoBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=timeframe,
-                limit=limit
+                start=start,
+                end=end,
+                limit=1000
             )
             bars = self.data_client.get_crypto_bars(request_params)
             return bars.df
         except Exception as e:
             raise BrokerError(f"Failed to fetch bars for {symbol}: {e}")
+
+    @staticmethod
+    def _timeframe_minutes(timeframe):
+        unit = getattr(timeframe, "timeframe_unit", None) or getattr(timeframe, "unit_value", None)
+        val = getattr(timeframe, "value_count", None)
+        try:
+            from alpaca.data.enums import TimeFrameUnit as TFU
+            if timeframe.timeframe_unit == TFU.Minute:
+                return int(timeframe.value_count)
+            if timeframe.timeframe_unit == TFU.Hour:
+                return int(timeframe.value_count) * 60
+            if timeframe.timeframe_unit == TFU.Day:
+                return int(timeframe.value_count) * 1440
+        except Exception:
+            pass
+        return 15  # conservative default: assume 15-minute bars
 
     def place_order(self, symbol, qty, side):
         """
@@ -41,10 +66,11 @@ class AlpacaBroker:
         :return: order object
         """
         try:
+            order_side = OrderSide.BUY if str(side).upper() == "BUY" else OrderSide.SELL
             market_order_data = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
-                side=side,
+                side=order_side,
                 time_in_force=TimeInForce.GTC
             )
             order = self.trading_client.submit_order(order_data=market_order_data)
@@ -55,14 +81,16 @@ class AlpacaBroker:
     def get_position(self, symbol):
         """
         Get current position for a symbol.
+        Crypto positions are stored without the slash (ETH/USD -> ETHUSD),
+        so both formats are tried.
         :return: position object or None if no position
         """
-        try:
-            position = self.trading_client.get_open_position(symbol)
-            return position
-        except Exception as e:
-            # If the position does not exist, Alpaca throws an error. We return None.
-            if "position does not exist" in str(e):
-                return None
-            else:
+        for candidate in (symbol, symbol.replace("/", "")):
+            try:
+                return self.trading_client.get_open_position(candidate)
+            except Exception as e:
+                msg = str(e).lower()
+                if "position does not exist" in msg or "not found" in msg or "404" in msg:
+                    continue
                 raise BrokerError(f"Failed to get position for {symbol}: {e}")
+        return None

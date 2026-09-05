@@ -1,128 +1,103 @@
-# Trading Sandbox Agent — Project Summary
+# Trading Sandbox Agent
 
-*Last updated: 2026-09-04 — reflects the fully deployed, live system.*
+Three-tier paper-trading system (NO real money anywhere):
 
-## Overview
+1. **Tier 1 — SMA crossover bot (low risk)**: deterministic SMA20/50 golden/death cross on BTC/USD, ETH/USD, SOL/USD, 15-min closed bars, Alpaca paper.
+2. **Tier 2 — AI agent (medium risk, SHADOW MODE)**: babysits open positions (proposes early exits when thesis breaks) + scouts for high-conviction entries using news/whale/trend research. Proposes only — never executes. Every proposal logged with rationale + confidence and pushed to Discord.
+3. **Tier 3 — Polymarket scanner (high risk, paper bets)**: scans public Gamma API for near-resolution favorites (≥97¢, ending ≤3 days, EV net of price) and LLM-flagged mispricings (model's true-probability estimate vs market price, gap ≥8%). Bets are paper-logged and settled automatically when markets resolve.
 
-A deterministic crypto paper-trading bot on **Alpaca PAPER trading** (live trading is impossible — `paper=True` is hardcoded). Trades BTC/USD, ETH/USD, SOL/USD using an SMA20/50 crossover strategy on 15-minute closed bars. **Zero LLM involvement in trade decisions** — an LLM is used only to write the narrative in the daily report; all P&L/win-rate math is pure Python.
+All trade/bet/proposal events, heartbeats (hourly, with equity + SMA gaps), model switches, and a daily 18:00 UTC report go to Discord. Two-way Discord chat (Bright Bot) answers questions with live account data — read-only, can never trigger trades.
 
-- **Repo (live):** https://github.com/BrightForson/trading-sandbox-agent (public)
-- **Hosting:** GitHub Actions free tier (unlimited minutes on public repos) — no laptop, no server, $0/month
-- **Paper account:** $100 equity, notional $100 per trade
-
-## File Structure
+## Layout
 
 ```
-trading-sandbox-agent/
-├── .env / .env.example        # keys: Alpaca paper x2, NVIDIA_API_KEY, DISCORD_WEBHOOK_URL
-├── config.yaml                 # symbols, SMA periods, notional, timeframe, lookback
-├── requirements.txt            # requests, python-dotenv, alpaca-py, openai, schedule, pyyaml
-├── run_bot.py                  # entry: default = continuous loop; --once = single cycle (serverless)
-├── run_report.py               # generates + sends daily report
-├── PROJECT_SUMMARY.md          # this file
-├── .github/workflows/trading-bot.yml   # cron hosting (see below)
-├── bot/
-│   ├── config.py               # loads config.yaml + .env (singleton)
-│   ├── broker.py               # Alpaca PAPER client (paper=True guard), crypto bars, orders, positions
-│   ├── strategy.py             # deterministic SMA crossover (golden/death cross)
-│   ├── trader.py               # trading loop, per-symbol error isolation, heartbeat
-│   ├── models.py               # LLM client for REPORTING ONLY (primary → fallback)
-│   ├── journal.py              # SQLite trade log + meta table (heartbeat state)
-│   ├── report.py               # P&L/win-rate in pure Python + account snapshot + LLM narrative
-│   ├── notify.py               # Discord webhook POST, auto-chunking >2000 chars, file fallback
-│   └── errors.py               # BrokerError, ModelError, NotificationError, JournalError
-└── data/
-    ├── trades.db               # SQLite journal — COMMITTED to repo for state persistence
-    └── reports/                # file-fallback reports (gitignored)
+run_bot.py            # Tier 1: trading cycle (--once for serverless)
+run_agent.py          # Tier 2: agent cycle (shadow mode)
+run_scanner.py        # Tier 3: Polymarket scanner (paper bets)
+run_chat.py           # two-way Discord chat cycle
+run_report.py         # daily report
+backtest.py           # SMA strategy backtest (--days N, --timeframe 1Day)
+validation.py         # end-to-end stack sanity check (no orders placed)
+tests/                # pytest suite (14 tests)
+config.yaml           # symbols, strategy params, risk caps, agent/scanner settings
+bot/
+  config.py           # yaml + env config (lazy credential checks)
+  broker.py           # Alpaca paper broker (bars/orders/positions)
+  strategy.py         # compute_sma + check_crossover (pure)
+  strategies.py       # strategy registry (pluggable, active list in config)
+  risk.py             # RiskEngine: notional/exposure caps, daily loss limit, kill switch
+  trader.py           # trading loop (strategy-agnostic), agent/scanner entry fns
+  agent.py            # TradingAgent: babysitter + scout (shadow mode)
+  models.py           # ModelManager: health probe, auto-failover chain, JSON repair
+  research.py         # free research tools: RSS, CoinGecko, Tavily (budget-guarded)
+  polymarket.py       # Gamma API scanner + paper bet settlement
+  chat.py             # two-way Discord chat (bot reads channel, agent replies)
+  journal.py          # SQLite: trades, proposals, bets, meta (state)
+  report.py           # P&L/win-rate + LLM narrative
+  notify.py           # Discord webhook (chunked) with file fallback
+  errors.py           # custom exceptions
+data/trades.db        # committed to repo: cross-run state for GitHub Actions
 ```
 
-## Current Configuration (config.yaml)
+## Config (config.yaml)
 
-```yaml
-symbols: [BTC/USD, ETH/USD, SOL/USD]
-sma_fast: 20
-sma_slow: 50
-notional: 100          # $ per trade (matches $100 paper balance)
-timeframe: 15Min
-lookback_bars: 120
-report_channel: null   # legacy; Discord URL now in .env
-```
+- `symbols`, `sma_fast/slow`, `notional` — Tier 1
+- `active_strategies` — which registry entries the loop runs
+- `risk:` — max_notional_per_trade (100), max_open_positions (3), daily_loss_limit_pct (5) + kill switch (meta key `kill_switch=on`)
+- `agent:` — shadow (true), min_confidence (0.7), max_proposed_notional (50), babysitter/scout toggles, cycle interval
+- `research:` — headlines per symbol, Tavily daily (30) / monthly (1000) caps
+- `scanner:` — stake (20), near_resolution_days (3), near_resolution_min_price (0.97), min_market_volume, mispricing_threshold (0.08)
 
-## Strategy (deterministic, no LLM)
+## Hosting (GitHub Actions, free)
 
-1. Every 15 minutes, fetch ~120 15-min bars per symbol; **drop the still-forming last bar** (signals use closed bars only)
-2. Compute SMA20 and SMA50 on closes
-3. **Golden cross** (prev SMA20 ≤ SMA50, now SMA20 > SMA50) → BUY if flat; qty = notional / price
-4. **Death cross** (prev SMA20 ≥ SMA50, now SMA20 < SMA50) → SELL entire position if holding
-5. Log to SQLite with reasoning string, e.g. `"golden cross: SMA20 79688.12 crossed above SMA50 79900.44"` — generated by code, never by a model
+Workflow `.github/workflows/trading-bot.yml`:
 
-## LLM Reporting Layer (bot/models.py)
+- `*/15 * * * *` — trading cycle (Tier 1)
+- `5 * * * *` — agent cycle (Tier 2, hourly; whale Tavily searches cached 1/day/symbol)
+- `2-59/15 * * * *` — Discord chat reader (offset so it never collides with trading)
+- `15 */6 * * *` — Polymarket scanner + bet settlement
+- `0 18 * * *` — daily report
 
-NVIDIA build.nvidia.com, OpenAI-compatible endpoint (`https://integrate.api.nvidia.com/v1`), key from `NVIDIA_API_KEY` in `.env`.
+All jobs commit `data/trades.db` back to the repo (state persistence). Secrets: ALPACA keys, NVIDIA_API_KEY, DISCORD_WEBHOOK_URL, DISCORD_BOT_TOKEN, TAVILY_API_KEY.
 
-- **Primary:** `nvidia/nemotron-3-super-120b-a12b` — ✅ tested working
-- **Fallback:** `minimaxai/minimax-m3` — ✅ tested working, auto-engages on failure/timeout (30s timeout)
-- EOL history (why these aren't used): `deepseek-ai/deepseek-v4-pro` (410 Gone, EOL 2026-08-07), `z-ai/glm-5.2` (410 Gone), `moonshotai/kimi-k2.6` (404 for this account)
+## Model chain (auto-maintained)
 
-**Scope guard:** the LLM only writes a short narrative for the daily report. All numbers (P&L, win-rate, round-trips) are computed in pure Python in `report.py`.
+`ModelManager` probes the active model with a 1-token call (daily, cached 20h). On failure (404/410 deprecation etc.) it walks a ranked chain — nemotron-3-super-120b → kimi-k3 → deepseek-v4-flash → minimax-m3 → nemotron-3-ultra-550b → … — adopts the first working one, persists it in journal meta, and alerts Discord. Chatty models are handled by a JSON repair-retry + truncation-salvaging parser + regex last resort.
 
-## Discord Delivery (bot/notify.py)
+## Research tools (all free)
 
-**Direct webhook POST** (via `requests`) using `DISCORD_WEBHOOK_URL` in `.env` — NOT openclaw (openclaw's Discord channel requires a bot token, which we don't have; the webhook is a different credential). Messages auto-chunk at 1900 chars (Discord limit 2000). On webhook failure or missing URL → graceful fallback to `data/reports/report_YYYY-MM-DD_HH-MM-SS.txt`.
+- RSS: Cointelegraph + CoinDesk headlines (replaces CryptoPanic)
+- CoinGecko keyless: prices, 24h change, trending
+- Tavily: general web + whale-activity searches, hard-guarded to 30/day and 1000/month (free tier 1500/mo), counters persisted in journal meta; whale queries cached once/day/symbol
+- On budget exhaustion: automatic fallback to RSS/DuckDuckGo — never billed
 
-The webhook is **one-way**: the bot cannot receive replies. Messaging the bot would require a real Discord bot + token (future option).
+## Backtest (Tier 1 baseline, 2026-09-05, 30d of 15m bars)
 
-## Hosting: GitHub Actions (free, no card)
+BTC +16.7% (33 trips, 36% win), ETH +12.0% (36 trips, 31% win), SOL +26.8% (31 trips, 29% win) on $100 notional each — combined +$55. Low win rate + positive P&L = classic trend-following (many small losses, few big wins). Baseline saved in journal meta `tier1_backtest_30d`.
 
-`.github/workflows/trading-bot.yml`:
+## Graduation gates (experiment phase → any real money)
 
-- **Cron `*/15 * * * *`** → `trade` job: checkout → Python 3.12 → pip install → `python run_bot.py --once` → commit `data/trades.db` back (state persistence across stateless runs)
-- **Cron `0 18 * * *`** → `report` job: `python run_report.py` (daily report to Discord)
-- `workflow_dispatch` enabled (manual trigger from GitHub UI)
-- Repo secrets (encrypted): `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, `NVIDIA_API_KEY`, `DISCORD_WEBHOOK_URL`
-- `concurrency: group trading-bot` prevents overlapping runs
+1. Tier 1: live paper performance consistent with backtest
+2. Tier 2: ≥4 weeks of shadow proposals with positive hypothetical P&L after fees → then semi-auto (high-confidence only, tight caps) → separate gate before wider autonomy
+3. Tier 3: multi-week paper-bet record positive after settlement
+4. Chat is permanently read-only for trading decisions during experiment phase
 
-## Discord Notification Schedule
-
-| Ping | When | Content |
-|---|---|---|
-| 🫀 Heartbeat | Once per UTC clock hour | equity, cash, positions + unrealized P&L, SMA20−SMA50 gap per symbol |
-| 🔔 Trade signal | Instant, before order submission | symbol, action, qty, est. price, reasoning |
-| ✅ Trade executed | Instant, after fill | same + real Alpaca order ID |
-| 📊 Daily report | 18:00 UTC | account snapshot, P&L, win-rate, LLM narrative |
-
-## Bug-Fix Log (this session)
-
-1. `requirements.txt` — `schedule` was glued to a comment line (missing on runner)
-2. `.gitignore` — `data/` rule blocked `!data/trades.db` negation → `data/*`
-3. `.gitignore` — `alpaca_install.log` glued onto the negation line
-4. `broker.py` — wrong param `symbol_symbol` → `symbol_or_symbols`
-5. Dead models — deepseek-v4-pro and glm-5.2 both EOL (410); replaced with tested-live minimax-m3
-6. `models.py` — missing `load_dotenv()` meant env vars weren't loaded when imported first
-7. **Partial-bar bug** — signals were computed on the still-forming bar; now drops it (closed bars only)
-8. **18:00 skip bug** — workflow condition excluded the trade job at 18:00 UTC daily
-9. Heartbeat drift — "60 min since last" drifted under GitHub cron lag → clock-hour dedupe via journal `meta` table
-
-## Ops Commands
+## Ops commands
 
 ```bash
-gh run list -R BrightForson/trading-sandbox-agent              # run history
-gh run watch -R BrightForson/trading-sandbox-agent             # watch live run
-gh workflow run trading-bot -R BrightForson/trading-sandbox-agent  # manual trigger
-# local: source venv/bin/activate && python run_bot.py --once
-# manual report: python run_report.py
+./venv/bin/python -m pytest tests/ -q      # tests
+./venv/bin/python validation.py            # full-stack sanity (no orders)
+./venv/bin/python backtest.py --days 30    # Tier 1 backtest
+./venv/bin/python run_agent.py --once      # agent cycle
+./venv/bin/python run_scanner.py           # scanner cycle
 ```
 
-## Known Limitations
+Kill switch: `sqlite3 data/trades.db "INSERT OR REPLACE INTO meta VALUES ('kill_switch','on');"` (blocks all BUYs; SELLs still allowed; set to 'off' to resume).
 
-- **GitHub free cron lag:** scheduled runs can be delayed by minutes or occasionally dropped at high-load times (documented GitHub behavior). Heartbeats may arrive a few minutes past the hour; if a run is dropped, the next one resumes state correctly.
-- **One-way Discord:** no replies to the bot.
-- **Crypto data feed:** free tier returns ~86 recent bars per request (sufficient for SMA50+1).
-- **Strategy is signal-rare by design:** crossovers may take hours or days; silence between heartbeats is normal.
+## Bug log (fixed 2026-09-05)
 
-## Current Live Status (as of last update)
-
-- Latest run: ✅ green; workflow active; journal state persisted (`last_heartbeat_hour`)
-- Account: $100 equity, flat, no open positions, 0 trades logged
-- Market at last check: all SMA20s below SMA50, gaps narrowing (BTC ≈ −0.38%, ETH ≈ −0.78%, SOL ≈ −0.58%) — first golden cross on BTC looked nearest
-- Everything is autonomous; no action needed unless you want strategy/config changes
+- Bars fetch without explicit start/end returned only ~37 bars → SMA50 starved → agent price context None (broker.py now sends explicit window)
+- `get_position` crashed on "Not Found" (string match too narrow) and ETH/USD vs ETHUSD symbol mismatch (death-cross SELL would never have fired)
+- `place_order` passed "BUY" string instead of OrderSide enum — orders always failed
+- Sizing by close price could exceed cash (now min(notional, 98% cash))
+- LLM JSON outputs: repair-retry + truncation salvage + regex extraction (reasoning models think out loud)

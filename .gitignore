@@ -1,73 +1,18 @@
-# Byte-compiled / optimized / DLL files
+# Python
+venv/
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
+*.pyc
 .pytest_cache/
 
-# Environments
+# Environment / secrets
 .env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# MySQL
-mysql/
-mysql.sock
-# macOS
-.DS_Store
-
-# Data and logs (keep journal for state persistence; ignore reports)
-data/*
-!data/.gitkeep
-!data/trades.db
 alpaca_install.log
+
+# Local runtime artifacts
+data/reports/
+
+# Keep the trade journal (committed for cross-run state on GitHub Actions)
+!data/trades.db
+
+# OS
+.DS_Store

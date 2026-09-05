@@ -4,3 +4,4 @@ alpaca-py
 openai
 schedule
 pyyaml
+pandas

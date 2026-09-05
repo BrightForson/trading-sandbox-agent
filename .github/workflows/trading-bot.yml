@@ -2,10 +2,16 @@ name: trading-bot
 
 on:
   schedule:
-    # Every 15 minutes (aligned with 15-min bar cadence)
+    # Every 15 minutes: SMA trading cycle (aligned with 15-min bar cadence)
     - cron: '*/15 * * * *'
     # Daily report at 18:00 UTC
     - cron: '0 18 * * *'
+    # Hourly: AI agent cycle (babysitter + scout, shadow mode)
+    - cron: '5 * * * *'
+    # Every 15 min offset: Discord chat reader (never collides with trading cron)
+    - cron: '2-59/15 * * * *'
+    # Every 6 hours: Polymarket scanner (read-only, paper bets)
+    - cron: '15 */6 * * *'
   workflow_dispatch:  # allow manual trigger from GitHub UI
 
 permissions:
@@ -19,6 +25,7 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/15 * * * *'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,6 +52,104 @@ jobs:
           git config user.email "trading-bot@users.noreply.github.com"
           git add data/trades.db
           git diff --cached --quiet || git commit -m "journal update $(date -u +'%Y-%m-%d %H:%M')"
+          git push
+
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'schedule' && github.event.schedule == '5 * * * *'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run agent cycle (shadow mode)
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+        run: python run_agent.py --once
+
+      - name: Commit journal (proposals + model state)
+        run: |
+          git config user.name "trading-bot"
+          git config user.email "trading-bot@users.noreply.github.com"
+          git add data/trades.db
+          git diff --cached --quiet || git commit -m "agent journal update $(date -u +'%Y-%m-%d %H:%M')"
+          git push
+
+  chat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'schedule' && github.event.schedule == '2-59/15 * * * *'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Discord chat cycle
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: python run_chat.py
+
+      - name: Commit journal (chat state)
+        run: |
+          git config user.name "trading-bot"
+          git config user.email "trading-bot@users.noreply.github.com"
+          git add data/trades.db
+          git diff --cached --quiet || git commit -m "chat journal update $(date -u +'%Y-%m-%d %H:%M')"
+          git push
+
+  scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'schedule' && github.event.schedule == '15 */6 * * *'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Polymarket scanner cycle
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python run_scanner.py
+
+      - name: Commit journal (paper bets)
+        run: |
+          git config user.name "trading-bot"
+          git config user.email "trading-bot@users.noreply.github.com"
+          git add data/trades.db
+          git diff --cached --quiet || git commit -m "scanner journal update $(date -u +'%Y-%m-%d %H:%M')"
           git push
 
   report:
