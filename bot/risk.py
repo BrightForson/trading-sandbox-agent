@@ -45,7 +45,7 @@ class RiskEngine:
         baseline_key = f"risk_baseline_equity_{today}"
         baseline = self.journal.get_meta(baseline_key)
         try:
-            acct = self.broker.trading_client.get_account()
+            acct = self.broker.get_account()
             equity = float(acct.equity)
         except Exception:
             return False  # can't read account -> don't hard-block on infra failure
@@ -69,7 +69,7 @@ class RiskEngine:
         max_notional = float(self.risk.get("max_notional_per_trade", 0) or 0)
         target_notional = min(float(fallback_notional), max_notional) if max_notional else float(fallback_notional)
         try:
-            equity = float(self.broker.trading_client.get_account().equity)
+            equity = float(self.broker.get_account().equity)
         except Exception:
             equity = float(cash)
         target_risk = equity * float(self.risk.get("target_risk_pct_per_trade", 0) or 0) / 100.0
@@ -181,7 +181,7 @@ class RiskEngine:
         if allocation_cap > 0:
             if account_equity is None:
                 try:
-                    account_equity = float(self.broker.trading_client.get_account().equity)
+                    account_equity = float(self.broker.get_account().equity)
                 except Exception:
                     # hard cap: if we can't verify equity, we can't verify the cap
                     return False, "cannot verify crypto allocation cap: account equity unreadable"

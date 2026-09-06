@@ -9,13 +9,14 @@ No orders are placed.
 from datetime import datetime
 
 from bot.config import config
-from bot.broker import AlpacaBroker
+from bot.broker import make_broker
 from bot.strategies import get_strategies, sma_cross
 from bot.risk import RiskEngine
 from bot.journal import TradeJournal
 from bot.models import ModelManager
 from bot.research import market_stats, trending_coins, fetch_rss_headlines
 from bot.notify import send_notification
+from bot.timeframe import make_timeframe
 
 
 def main():
@@ -28,13 +29,12 @@ def main():
           f"strategies={getattr(config, 'active_strategies', ['sma_cross'])}")
 
     print("[2/8] broker connectivity...")
-    broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
-    acct = broker.trading_client.get_account()
+    broker = make_broker(config)
+    acct = broker.get_account()
     print(f"      paper equity=${float(acct.equity):,.2f} cash=${float(acct.cash):,.2f}")
 
-    print("[3/8] bar fetch (explicit start/end window)...")
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-    tf = TimeFrame(int(config.timeframe.replace('Min', '')), TimeFrameUnit.Minute)
+    print("[3/8] bar fetch...")
+    tf = make_timeframe(config.timeframe)
     df = broker.get_crypto_bars("BTC/USD", tf, config.lookback_bars)
     assert df is not None and len(df) >= config.sma_slow + 1, f"only {len(df)} bars"
     print(f"      {len(df)} bars fetched (>= {config.sma_slow + 1} needed)")

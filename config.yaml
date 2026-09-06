@@ -1,7 +1,18 @@
 # Trading sandbox agent configuration
 # All parameters for the bot
 
-# Alpaca paper trading credentials (loaded from .env)
+# Broker backend for Tier 1 execution:
+#   alpaca        - Alpaca paper trading (needs ALPACA_API_KEY_ID/SECRET in .env)
+#   binance_paper - local simulated account priced by keyless Binance public
+#                   data (state persists in data/trades.db journal meta)
+broker:
+  name: binance_paper
+  paper:
+    start_cash: 20
+  taker_fee_pct: 0.1
+  slippage_bps: 8
+
+# Alpaca paper trading credentials (loaded from .env, only used when broker.name = alpaca)
 # API keys are read from environment variables: ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY
 
 # Trading symbols (editable)
@@ -17,8 +28,8 @@ sma_slow: 50
 # Position sizing (paper notional per trade in USD)
 notional: 100
 
-# Conservative assumptions used only for research/backtests. Paper execution is
-# still measured from the broker's reported fills.
+# Conservative assumptions used only for research/backtests and paper fills.
+# Binance spot taker fee is 0.1%.
 execution:
   taker_fee_pct: 0.25
   slippage_bps: 8
@@ -41,7 +52,8 @@ risk:
   daily_loss_limit_pct: 5.0
   flatten_on_daily_loss: true
   target_risk_pct_per_trade: 0.5
-  max_crypto_allocation_pct: 15.0
+  # scaled for the $20 binance_paper ledger (15% of $20 would only allow $3 deployed)
+  max_crypto_allocation_pct: 75.0
   atr_period: 14
   catastrophic_atr_multiple: 3.0
   # Stop used only when entry-ATR is unavailable; ATR stop takes precedence
@@ -80,3 +92,6 @@ scanner:
   min_expected_value_pct: 2.0
   max_total_open_exposure: 100
   near_resolution_watchlist_only: true  # false = allow paper bets on near-resolution favorites (>= 12h to close)
+  # Tier 3 betting wallet (virtual $10, mirrors real deployment size)
+  wallet_start_cash: 10
+  wallet_stake: 2

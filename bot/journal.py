@@ -63,6 +63,16 @@ class TradeJournal:
                         notes TEXT
                     )
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS wallet_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        epoch INTEGER NOT NULL DEFAULT 1,
+                        cash REAL NOT NULL,
+                        locked REAL NOT NULL,
+                        equity REAL NOT NULL
+                    )
+                """)
                 self._ensure_columns(cursor, "trades", {
                     "fee": "REAL NOT NULL DEFAULT 0",
                     "order_id": "TEXT",
@@ -339,3 +349,45 @@ class TradeJournal:
                 conn.commit()
         except Exception as e:
             raise JournalError(f"Failed to set meta '{key}': {e}")
+
+    def get_all_bets(self):
+        """All bets across every outcome, oldest first."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM bets ORDER BY timestamp ASC")
+                return cursor.fetchall()
+        except Exception as e:
+            raise JournalError(f"Failed to retrieve bets: {e}")
+
+    def log_wallet_snapshot(self, timestamp, epoch, cash, locked, equity):
+        """Persist one wallet valuation point for trend reporting."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO wallet_snapshots (timestamp, epoch, cash, locked, equity)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (timestamp, epoch, cash, locked, equity))
+                conn.commit()
+        except Exception as e:
+            raise JournalError(f"Failed to log wallet snapshot: {e}")
+
+    def get_wallet_snapshots(self, epoch=None, limit=None):
+        """Wallet valuation history, oldest first, optionally per epoch."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                q = "SELECT * FROM wallet_snapshots"
+                params = []
+                if epoch is not None:
+                    q += " WHERE epoch=?"
+                    params.append(epoch)
+                q += " ORDER BY timestamp DESC"
+                if limit:
+                    q += " LIMIT ?"
+                    params.append(limit)
+                cursor.execute(q, params)
+                return cursor.fetchall()[::-1]
+        except Exception as e:
+            raise JournalError(f"Failed to retrieve wallet snapshots: {e}")

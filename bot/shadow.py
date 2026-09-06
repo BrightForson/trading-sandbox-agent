@@ -68,8 +68,8 @@ class ShadowAccount:
 
     def _last_close(self, symbol):
         try:
-            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-            tf = TimeFrame(int(self.cfg.timeframe.replace("Min", "")), TimeFrameUnit.Minute)
+            from bot.timeframe import make_timeframe
+            tf = make_timeframe(self.cfg.timeframe)
             df = self.broker.get_crypto_bars(symbol, tf, self.cfg.lookback_bars)
             if df is None or df.empty:
                 return None

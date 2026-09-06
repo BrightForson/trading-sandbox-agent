@@ -3,13 +3,13 @@ import schedule
 import pandas as pd
 from datetime import datetime
 from bot.config import config
-from bot.broker import AlpacaBroker
+from bot.broker import make_broker
 from bot.strategies import get_strategies
 from bot.risk import RiskEngine
 from bot.journal import TradeJournal
 from bot.errors import BrokerError
 from bot.notify import send_notification
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from bot.timeframe import make_timeframe
 import time as _time
 
 HEARTBEAT_INTERVAL_SECONDS = 3600
@@ -23,13 +23,13 @@ def send_heartbeat(broker, journal):
     if last is not None and last == current_hour:
         return
     try:
-        acct = broker.trading_client.get_account()
-        positions = list(broker.trading_client.get_all_positions())
+        acct = broker.get_account()
+        positions = list(broker.get_all_positions())
         pos_lines = [f"  • {p.symbol}: {float(p.qty):.6f} (${float(p.unrealized_pl):,.2f} unrealized)" for p in positions]
         pos_section = "\n".join(pos_lines) if pos_lines else "flat (no open positions)"
 
         # SMA gaps per symbol for signal proximity
-        tf = TimeFrame(15, TimeFrameUnit.Minute)
+        tf = make_timeframe(config.timeframe)
         gap_lines = []
         for sym in config.symbols:
             try:
@@ -60,7 +60,7 @@ def run_trading_cycle():
 
     # Initialize components
     try:
-        broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
+        broker = make_broker(config)
         journal = TradeJournal()
     except Exception as e:
         print(f"[{datetime.now()}] Failed to initialize components: {e}")
@@ -74,7 +74,7 @@ def run_trading_cycle():
     risk_engine = RiskEngine(config, broker, journal)
 
     # Set up timeframe for data fetching
-    timeframe = TimeFrame(int(config.timeframe.replace('Min', '')), TimeFrameUnit.Minute)
+    timeframe = make_timeframe(config.timeframe)
 
     # Fetch bars once per symbol; strategies share them
     bars_by_symbol = {}
@@ -96,7 +96,7 @@ def run_trading_cycle():
         print(f"[{datetime.now()}] Daily loss limit hit")
         if (getattr(config, "risk", None) or {}).get("flatten_on_daily_loss", False):
             try:
-                held_symbols = {p.symbol for p in broker.trading_client.get_all_positions()}
+                held_symbols = {p.symbol for p in broker.get_all_positions()}
             except Exception as e:
                 print(f"[{datetime.now()}] Could not enumerate positions for flatten: {e}")
                 held_symbols = set(bars_by_symbol)
@@ -158,7 +158,7 @@ def run_trading_cycle():
     try:
         slash_map = {s.replace("/", ""): s for s in config.symbols}
         held_symbols = {slash_map.get(p.symbol, p.symbol)
-                        for p in broker.trading_client.get_all_positions()}
+                        for p in broker.get_all_positions()}
         for symbol in held_symbols - set(bars_by_symbol):
             position = broker.get_position(symbol)
             if not position:
@@ -200,7 +200,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
     qty = 0.0
     if action == "BUY" and current_qty == 0:
         try:
-            acct = broker.trading_client.get_account()
+            acct = broker.get_account()
             available = float(acct.cash)
         except Exception:
             available = config.notional
@@ -214,10 +214,10 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
 
     if qty > 0 and action == "BUY":
         try:
-            positions = list(broker.trading_client.get_all_positions())
+            positions = list(broker.get_all_positions())
             open_count = len(positions)
             crypto_notional = sum(abs(float(getattr(p, "market_value", 0) or 0)) for p in positions)
-            account_equity = float(broker.trading_client.get_account().equity)
+            account_equity = float(broker.get_account().equity)
         except Exception:
             open_count = 0
             crypto_notional = 0.0
@@ -243,7 +243,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             f"🔔 **Trade signal — {symbol}**\n"
             f"**{action}** {qty:.6f} @ ~${price:,.2f} (notional ${config.notional})\n"
             f"Reason: {reasoning}\n"
-            f"Submitting order to Alpaca paper...",
+            f"Submitting order to broker...",
             config
         )
     except Exception as notify_err:
@@ -323,7 +323,7 @@ def _atr(df, period):
 def run_agent_cycle():
     """One AI agent cycle (babysitter + scout) — shadow mode by default."""
     from bot.agent import TradingAgent
-    broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
+    broker = make_broker(config)
     journal = TradeJournal()
     agent = TradingAgent(config, broker, journal=journal)
     agent.run_cycle()
@@ -332,12 +332,19 @@ def run_agent_cycle():
 def run_scanner_cycle():
     """One Polymarket scanner cycle (read-only API, paper bets)."""
     from bot.polymarket import scan, settle_open_bets
+    from bot.wallet import BettingWallet
     journal = TradeJournal()
     try:
         settle_open_bets(config, journal=journal)
     except Exception as e:
         print(f"[{datetime.now()}] Bet settlement failed: {e}")
     scan(config, journal=journal)
+    try:
+        wallet = BettingWallet(config, journal=journal)
+        wallet.snapshot()
+        send_notification(f"💵 {wallet.status_line()}", config)
+    except Exception as e:
+        print(f"[{datetime.now()}] Wallet snapshot failed: {e}")
 
 
 def main():

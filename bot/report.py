@@ -119,20 +119,20 @@ Note: The narrative generation failed due to: {e}
 
 def account_snapshot():
     """
-    Fetch account equity and open positions from Alpaca paper (pure Python, no LLM).
+    Fetch account equity and open positions from the configured broker (pure Python, no LLM).
     Returns a formatted string section for the daily report.
     """
     try:
         from bot.config import config
-        from bot.broker import AlpacaBroker
-        broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
-        acct = broker.trading_client.get_account()
+        from bot.broker import make_broker
+        broker = make_broker(config)
+        acct = broker.get_account()
         lines = [
-            "Account Snapshot (Alpaca paper):",
+            "Account Snapshot:",
             f"- Equity: ${float(acct.equity):,.2f}",
             f"- Cash: ${float(acct.cash):,.2f}",
         ]
-        positions = list(broker.trading_client.get_all_positions())
+        positions = list(broker.get_all_positions())
         if positions:
             lines.append(f"- Open positions: {len(positions)}")
             for p in positions:
@@ -150,9 +150,9 @@ def shadow_snapshot():
     """Shadow account section for the daily report (virtual $20 ledger)."""
     try:
         from bot.config import config
-        from bot.broker import AlpacaBroker
+        from bot.broker import make_broker
         from bot.shadow import ShadowAccount
-        broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
+        broker = make_broker(config)
         shadow = ShadowAccount(config, broker)
         lines = [f"AI Shadow Account (virtual ${shadow.start_cash:.0f}):",
                  f"- {shadow.status_line()}",
@@ -160,6 +160,23 @@ def shadow_snapshot():
         return "\n".join(lines)
     except Exception as e:
         return f"Shadow account snapshot unavailable: {e}"
+
+
+def tier3_wallet_snapshot():
+    """Tier 3 betting wallet section (virtual $10 Polymarket ledger)."""
+    try:
+        from bot.config import config
+        from bot.wallet import BettingWallet
+        wallet = BettingWallet(config)
+        v = wallet.valuation()
+        net = v["equity"] - wallet.start_cash
+        lines = [f"Tier 3 Betting Wallet (virtual ${wallet.start_cash:.0f}, "
+                 f"epoch {wallet.epoch}):",
+                 f"- {wallet.status_line()}",
+                 f"- Net P&L: {'+' if net >= 0 else '-'}${abs(net):.2f} | recent trend: {wallet.trend_line()}"]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Tier 3 wallet snapshot unavailable: {e}"
 
 
 def experiment_scorecards():
@@ -196,6 +213,8 @@ def create_daily_report():
 
 {shadow_snapshot()}
 
+{tier3_wallet_snapshot()}
+
 {experiment_scorecards()}
 
 Statistics:
@@ -225,6 +244,8 @@ for SMA20/SMA50 crossovers and will act on the first signal.
 {account_snapshot()}
 
 {shadow_snapshot()}
+
+{tier3_wallet_snapshot()}
 
 {experiment_scorecards()}
 

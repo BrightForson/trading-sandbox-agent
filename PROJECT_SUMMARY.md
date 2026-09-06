@@ -4,7 +4,7 @@ Three-tier paper-trading system (NO real money anywhere):
 
 1. **Tier 1 — SMA crossover bot (paper only)**: deterministic SMA20/50 golden/death cross on BTC/USD, ETH/USD, SOL/USD, 15-min closed bars, with ATR-based catastrophic exits and account-level paper-risk controls.
 2. **Tier 2 — AI agent (SHADOW MODE)**: babysits open positions (proposes early exits when thesis breaks) + scouts for high-conviction entries using news/whale/trend research. It never executes. Scout BUY ideas receive a fixed-horizon, BTC-benchmarked scorecard.
-3. **Tier 3 — Polymarket scanner (paper only)**: near-resolution favorites are a watchlist, not automatic bets. LLM candidates must clear an expected-value-after-friction threshold, duplicate and total-exposure checks, then are paper-logged and settled automatically.
+3. **Tier 3 — Polymarket scanner (paper only)**: near-resolution favorites are a watchlist, not automatic bets. LLM candidates must clear an expected-value-after-friction threshold, duplicate and total-exposure checks, then are paper-logged and settled automatically. A virtual $10 betting wallet (real deployment size) mirrors every logged bet at a flat $2 stake, tracks cash/locked equity per epoch, snapshots the trend each cycle, and halts new bets on bust — the tier's go/no-go scoreboard.
 
 All trade/bet/proposal events, heartbeats (hourly, with equity + SMA gaps), model switches, and a daily 18:00 UTC report go to Discord. Two-way Discord chat (Bright Bot) answers questions with live account data — read-only, can never trigger trades.
 
@@ -18,11 +18,14 @@ run_chat.py           # two-way Discord chat cycle
 run_report.py         # daily report
 backtest.py           # SMA strategy backtest (--days N, --timeframe 1Day)
 validation.py         # end-to-end stack sanity check (no orders placed)
-tests/                # pytest suite (14 tests)
+tests/                # pytest suite (54 tests)
 config.yaml           # symbols, strategy params, risk caps, agent/scanner settings
 bot/
   config.py           # yaml + env config (lazy credential checks)
-  broker.py           # Alpaca paper broker (bars/orders/positions)
+  broker.py           # make_broker factory + Alpaca adapter (bars/orders/positions)
+  binance_data.py     # keyless Binance public klines (data-api.binance.vision)
+  binance_paper.py    # local simulated broker priced by real Binance data
+  timeframe.py        # vendor-neutral timeframe objects (15Min / 1Day ...)
   strategy.py         # compute_sma + check_crossover (pure)
   strategies.py       # strategy registry (pluggable, active list in config)
   risk.py             # RiskEngine: notional/exposure caps, daily loss limit, kill switch
@@ -31,6 +34,7 @@ bot/
   models.py           # ModelManager: health probe, auto-failover chain, JSON repair
   research.py         # free research tools: RSS, CoinGecko, Tavily (budget-guarded)
   polymarket.py       # Gamma API scanner + paper bet settlement
+  wallet.py           # Tier 3 virtual $10 betting wallet (derived from bets, epoch-aware)
   chat.py             # two-way Discord chat (bot reads channel, agent replies)
   journal.py          # SQLite: trades, proposals, bets, meta (state)
   report.py           # P&L/win-rate + LLM narrative
@@ -39,15 +43,30 @@ bot/
 data/trades.db        # committed to repo: cross-run state for GitHub Actions
 ```
 
+## Broker backends (config.yaml `broker:`)
+
+- `binance_paper` (active): local simulated account priced by keyless Binance
+  public data (data-api.binance.vision — no API keys, geo-safe). Ledger state
+  (cash, positions, fills) persists in journal meta keys `paper_*`, so it
+  survives CI runs exactly like every other counter. Fills at the latest
+  closed kline ±slippage, minus 0.1% Binance spot taker fee.
+- `alpaca` (switchable): the original Alpaca paper account; set
+  `broker.name: alpaca` and provide ALPACA keys. All consumers go through
+  the same adapter surface, so nothing else changes.
+- Live Binance, when you graduate to real money: slots behind the same
+  interface, but the runner must move off GitHub Actions (US geo) to your
+  machine or a non-US VPS.
+
 ## Config (config.yaml)
 
 - `symbols`, `sma_fast/slow`, `notional` — Tier 1
+- `broker:` — backend selection (`binance_paper` active, `alpaca` switchable) + paper start cash / taker fee / slippage
 - `active_strategies` — which registry entries the loop runs
 - `execution:` — conservative taker-fee and slippage assumptions for backtests
 - `risk:` — max_notional_per_trade (100), max_open_positions (3), daily-loss flattening, volatility-based sizing, entry-fixed stops (entry − 3×ATR, or 5% fallback; level locked at entry, mirrored in the backtester), allocation cap + kill switch (meta key `kill_switch=on`)
 - `agent:` — shadow (true), min_confidence (0.7), max_proposed_notional (50), fixed evaluation horizon, babysitter/scout toggles, cycle interval
 - `research:` — headlines per symbol, Tavily daily (30) / monthly (1000) caps
-- `scanner:` — stake (20), near-resolution watchlist, min_market_volume, mispricing threshold, minimum expected value, and total-open-exposure cap
+- `scanner:` — stake (20), near-resolution watchlist, min_market_volume, mispricing threshold, minimum expected value, total-open-exposure cap, and the betting wallet (`wallet_start_cash: 10`, `wallet_stake: 2`; epoch reset via `bot.wallet.BettingWallet.start_new_epoch()`)
 
 ## Hosting (GitHub Actions, free)
 
@@ -102,6 +121,8 @@ confirmed by paper execution.
 ```
 
 Kill switch: `sqlite3 data/trades.db "INSERT OR REPLACE INTO meta VALUES ('kill_switch','on');"` (blocks all BUYs; SELLs still allowed; set to 'off' to resume).
+
+Switch broker back to Alpaca paper: set `broker.name: alpaca` in config.yaml and ensure ALPACA keys are in .env. The Binance paper ledger (meta keys `paper_cash`, `paper_positions`, `paper_trades`) is untouched by the Alpaca backend, so you can switch back and forth without losing either account's state.
 
 ## Bug log (fixed 2026-09-05)
 

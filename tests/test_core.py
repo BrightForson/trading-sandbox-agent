@@ -583,6 +583,152 @@ def test_backtest_stop_level_fixed_at_entry():
     assert stats_nostop["stop_exits"] == 0
 
 
+# ---------------- binance paper broker ----------------
+
+class _PaperCfg:
+    symbols = ["BTC/USD", "ETH/USD", "SOL/USD"]
+    timeframe = "15Min"
+    lookback_bars = 120
+    execution = {"taker_fee_pct": 0.1, "slippage_bps": 8}
+    broker = {"name": "binance_paper", "paper": {"start_cash": 20},
+              "taker_fee_pct": 0.1, "slippage_bps": 8}
+
+
+class _StubData:
+    """Priced binance-paper broker without network: fixed closes per symbol."""
+
+    def __init__(self, prices):
+        self.prices = prices
+
+    def last_close(self, symbol, interval="15m", limit=2):
+        return self.prices[symbol]
+
+    def get_crypto_bars(self, symbol, timeframe, limit):
+        price = self.prices[symbol]
+        return pd.DataFrame({"open": [price] * 60, "high": [price] * 60,
+                             "low": [price] * 60, "close": [price] * 60,
+                             "volume": [0.0] * 60})
+
+
+def _paper_broker(tmp_path, prices=None):
+    from bot.binance_paper import BinancePaperBroker
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    b = BinancePaperBroker(_PaperCfg, journal=j)
+    b.data = _StubData(prices or {"BTC/USD": 100.0, "ETH/USD": 50.0, "SOL/USD": 10.0})
+    return b, j
+
+
+def test_paper_broker_fill_fee_and_persistence(tmp_path):
+    b, _ = _paper_broker(tmp_path, {"BTC/USD": 100.0, "ETH/USD": 50.0, "SOL/USD": 10.0})
+    acct = b.get_account()
+    assert float(acct.cash) == 20.0 and float(acct.equity) == 20.0
+
+    o = b.place_order("BTC/USD", 0.05, "BUY")
+    assert o.status == "filled"
+    # fill = 100 * (1 + 8bps) = 100.08
+    assert float(o.filled_avg_price) == pytest.approx(100.08)
+    # cash = 20 - 0.05*100.08*(1.001) = 20 - 5.009...
+    expected_cash = 20.0 - 0.05 * 100.08 * 1.001
+    assert float(b.get_account().cash) == pytest.approx(expected_cash)
+
+    pos = b.get_position("BTC/USD")
+    assert float(pos.qty) == pytest.approx(0.05)
+    assert float(pos.avg_entry_price) == pytest.approx(100.08)
+
+    # persistence across a fresh instance on the same journal
+    from bot.binance_paper import BinancePaperBroker
+    b2 = BinancePaperBroker(_PaperCfg, journal=b.journal)
+    b2.data = _StubData({"BTC/USD": 100.0})
+    assert float(b2.get_account().cash) == pytest.approx(expected_cash)
+    assert float(b2.get_position("BTC/USD").qty) == pytest.approx(0.05)
+
+    # sell back: proceeds - fee, position cleared
+    o2 = b.place_order("BTC/USD", 0.05, "SELL")
+    assert float(o2.filled_avg_price) == pytest.approx(100.0 * (1 - 8e-4))
+    assert b.get_position("BTC/USD") is None
+    # round-trip drag = 2 * (fee 0.1% + slippage 8bps) of $5 each side
+    drag = 20.0 - float(b.get_account().cash)
+    assert drag == pytest.approx(5.0 * (0.001 + 8e-4) * 2, rel=0.01)
+
+
+def test_paper_broker_clips_buy_to_cash(tmp_path):
+    b, _ = _paper_broker(tmp_path)
+    # request 1 BTC = $100 but only $20 cash: clipped to affordable qty
+    o = b.place_order("BTC/USD", 1.0, "BUY")
+    cash_after = float(b.get_account().cash)
+    assert 0.0 <= cash_after < 0.01
+    # everything except rounding dust got deployed
+    deployed = float(o.filled_qty) * float(o.filled_avg_price) * 1.001
+    assert deployed == pytest.approx(20.0, abs=0.01)
+
+
+def test_paper_broker_rejects_sell_without_position(tmp_path):
+    from bot.errors import BrokerError
+    b, _ = _paper_broker(tmp_path)
+    with pytest.raises(BrokerError):
+        b.place_order("ETH/USD", 0.1, "SELL")
+
+
+def test_paper_broker_seed_from_alpaca(tmp_path):
+    b, _ = _paper_broker(tmp_path)
+    b.seed_from_alpaca(cash=2.04, positions={
+        "ETH/USD": {"qty": 0.0397, "entry": 2458.29}})
+    acct = b.get_account()
+    assert float(acct.cash) == 2.04
+    pos = b.get_position("ETH/USD")
+    assert float(pos.qty) == pytest.approx(0.0397)
+    assert float(pos.avg_entry_price) == pytest.approx(2458.29)
+    # re-seeding is idempotent on shape: same positions dict wins
+    b.seed_from_alpaca(cash=5.0, positions={})
+    assert b.get_all_positions() == []
+    assert float(b.get_account().cash) == 5.0
+
+
+def test_paper_broker_account_position_shapes(tmp_path):
+    b, _ = _paper_broker(tmp_path)
+    b.place_order("SOL/USD", 1.0, "BUY")
+    acct = b.get_account()
+    for attr in ("equity", "cash"):
+        assert hasattr(acct, attr)
+    p = b.get_position("SOL/USD")
+    for attr in ("symbol", "qty", "avg_entry_price", "current_price",
+                 "market_value", "unrealized_pl"):
+        assert hasattr(p, attr)
+    assert float(p.market_value) == pytest.approx(float(p.qty) * float(p.current_price))
+
+
+def test_make_broker_factory_resolves(tmp_path):
+    from bot.broker import make_broker
+    from bot.errors import BrokerError
+
+    class _CfgAlpaca:
+        broker = {"name": "alpaca"}
+        def require(self, *names):
+            raise ValueError("Missing environment credentials: " + ", ".join(names))
+
+    with pytest.raises(ValueError):
+        make_broker(_CfgAlpaca())
+
+    class _CfgBad:
+        broker = {"name": "kraken"}
+
+    with pytest.raises(BrokerError):
+        make_broker(_CfgBad())
+
+
+# ---------------- binance data client ----------------
+
+def test_binance_interval_mapping():
+    from bot.binance_data import _interval_for, to_binance_symbol
+    from bot.timeframe import make_timeframe
+    assert _interval_for("15Min") == "15m"
+    assert _interval_for("1Day") == "1d"
+    assert _interval_for(make_timeframe("15Min")) == "15m"
+    assert _interval_for(make_timeframe("1Day")) == "1d"
+    assert to_binance_symbol("BTC/USD") == "BTCUSDT"
+    assert to_binance_symbol("ETH/USD") == "ETHUSDT"
+
+
 # ---------------- polymarket exposure caps ----------------
 
 def test_polymarket_journal_caps(tmp_path):
@@ -604,3 +750,111 @@ def test_polymarket_journal_caps(tmp_path):
     card = j.bet_scorecard()
     assert card["settled"] == 1 and card["win_rate_pct"] == 100.0
     assert card["net_pnl"] == pytest.approx(40.0 - 20.0 - 0.2)
+
+
+# ---------------- tier 3 betting wallet ----------------
+
+class _WalletCfg:
+    scanner = {"wallet_start_cash": 10, "wallet_stake": 2}
+
+
+def _wallet(tmp_path):
+    from bot.wallet import BettingWallet
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    return BettingWallet(_WalletCfg, journal=j), j
+
+
+def test_wallet_empty_baseline(tmp_path):
+    w, _ = _wallet(tmp_path)
+    v = w.valuation()
+    assert v["cash"] == 10.0 and v["locked"] == 0.0 and v["equity"] == 10.0
+    assert v["open_bets"] == 0 and v["wins"] == 0 and v["losses"] == 0
+    assert not w.is_bust()
+    assert "Tier 3 wallet: $10.00 (+0.00% of $10 start)" in w.status_line()
+    assert "no settled bets" in w.status_line()
+
+
+def test_wallet_open_bet_locks_stake(tmp_path):
+    w, j = _wallet(tmp_path)
+    j.log_bet("2026-09-05T10:00", "will-x", "q", "Yes", 0.5, 20)
+    v = w.valuation()
+    # open bet: $2 wallet stake moves from cash to locked, equity unchanged
+    assert v["cash"] == pytest.approx(8.0)
+    assert v["locked"] == pytest.approx(2.0)
+    assert v["equity"] == pytest.approx(10.0)
+    assert v["open_bets"] == 1
+
+
+def test_wallet_settled_win_and_loss(tmp_path):
+    w, j = _wallet(tmp_path)
+    # win at 0.5 price: $2 stake -> $4 payout (+$2)
+    j.log_bet("2026-09-05T10:00", "will-x", "q", "Yes", 0.5, 20)
+    j.log_bet("2026-09-05T10:05", "will-y", "q2", "Yes", 0.4, 20)
+    bets = j.get_all_bets()
+    j.update_bet(bets[0][0], "won", 40.0)
+    j.update_bet(bets[1][0], "lost", 0.0)
+    v = w.valuation()
+    # 10 - 2 (won stake) + 4 (payout) - 2 (lost stake) = 10
+    assert v["cash"] == pytest.approx(10.0)
+    assert v["locked"] == 0.0
+    assert v["wins"] == 1 and v["losses"] == 1
+    assert "record 1W-1L" in w.status_line()
+
+
+def test_wallet_expensive_favorite_not_simplified(tmp_path):
+    w, j = _wallet(tmp_path)
+    # a 0.97 favorite still costs the flat $2 stake and pays stake/price on win
+    j.log_bet("2026-09-05T10:00", "will-x", "q", "Yes", 0.97, 20)
+    bets = j.get_all_bets()
+    j.update_bet(bets[0][0], "won", 20.62)
+    v = w.valuation()
+    assert v["cash"] == pytest.approx(10.0 - 2.0 + 2.0 / 0.97, rel=1e-3)
+
+
+def test_wallet_bust_detection(tmp_path):
+    w, j = _wallet(tmp_path)
+    # five straight losses at $2 exhaust the $10 bankroll; only the first
+    # five bets are mirrored (bets after bust are sat out, like a real bettor)
+    for i in range(6):
+        j.log_bet(f"2026-09-05T1{i}:00", f"will-{i}", "q", "Yes", 0.5, 20)
+    for b in j.get_all_bets():
+        j.update_bet(b[0], "lost", 0.0)
+    v = w.valuation()
+    assert v["cash"] == pytest.approx(0.0)
+    assert v["wins"] == 0 and v["losses"] == 5
+    assert w.is_bust()
+    assert "BUST" in w.status_line()
+
+
+def test_wallet_epoch_reset_ignores_old_bets(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    w, j = _wallet(tmp_path)
+    for i in range(5):
+        j.log_bet(f"2026-09-05T1{i}:00", f"will-{i}", "q", "Yes", 0.5, 20)
+    for b in j.get_all_bets():
+        j.update_bet(b[0], "lost", 0.0)
+    assert w.is_bust()
+    w.snapshot()
+    new_epoch = w.start_new_epoch()
+    assert new_epoch == 2 and w.epoch == 2
+    v = w.valuation()
+    assert v["cash"] == pytest.approx(10.0)
+    assert v["wins"] == 0 and v["losses"] == 0
+    assert not w.is_bust()
+    # a bet logged after the epoch start counts only toward the fresh epoch
+    later = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    j.log_bet(later, "will-new", "q", "Yes", 0.5, 20)
+    v = w.valuation()
+    assert v["locked"] == pytest.approx(2.0) and v["cash"] == pytest.approx(8.0)
+
+
+def test_wallet_trend_line_from_snapshots(tmp_path):
+    w, j = _wallet(tmp_path)
+    assert "no history yet" in w.trend_line()
+    w.snapshot()
+    j.log_bet("2026-09-05T10:00", "will-x", "q", "Yes", 0.5, 20)
+    for b in j.get_all_bets():
+        j.update_bet(b[0], "won", 40.0)
+    w.snapshot()
+    trend = w.trend_line()
+    assert "$10.00 -> $12.00" in trend

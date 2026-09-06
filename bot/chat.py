@@ -113,13 +113,13 @@ Helpful, direct answer:"""
 def _system_context(broker, cfg, journal):
     """Compact live snapshot the chat agent can draw from."""
     try:
-        acct = broker.trading_client.get_account()
+        acct = broker.get_account()
         acct_block = (f"Equity ${float(acct.equity):,.2f}, Cash ${float(acct.cash):,.2f}, "
                       f"Paper account, Alpaca")
     except Exception as e:
         acct_block = f"account unavailable ({e})"
     try:
-        positions = list(broker.trading_client.get_all_positions())
+        positions = list(broker.get_all_positions())
         if positions:
             pos_block = "; ".join(
                 f"{p.symbol} {float(p.qty):.6f} @ ${float(p.avg_entry_price):,.0f} "
@@ -142,7 +142,7 @@ def _system_context(broker, cfg, journal):
         ) or "none yet"
     except Exception:
         prop_block = "unavailable"
-    return (
+    context = (
         f"Account: {acct_block}\nPositions: {pos_block}\n"
         f"Recent trades: {trade_block}\nRecent AI proposals: {prop_block}\n"
         f"Strategy: SMA{cfg.sma_fast}/{cfg.sma_slow} crossover on {', '.join(cfg.symbols)}, "
@@ -158,9 +158,16 @@ def _system_context(broker, cfg, journal):
             for sym, p in pos.items():
                 lines.append(f"{sym} qty {p['qty']:.6f} entry ${p['entry']:,.2f}")
             acct_line += " | open: " + "; ".join(lines)
-        return context + f"\nAI shadow account (virtual $20): {acct_line}"
+        context += f"\nAI shadow account (virtual $20): {acct_line}"
     except Exception as e:
-        return context + f"\nAI shadow account: unavailable ({e})"
+        context += f"\nAI shadow account: unavailable ({e})"
+    try:
+        from bot.wallet import BettingWallet
+        wallet = BettingWallet(cfg, journal=journal)
+        context += f"\nTier 3 Polymarket wallet (virtual ${wallet.start_cash:.0f}): {wallet.status_line()}"
+    except Exception as e:
+        context += f"\nTier 3 Polymarket wallet: unavailable ({e})"
+    return context
 
 
 def run_chat_cycle(cfg, broker, journal=None, model=None):

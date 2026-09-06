@@ -26,6 +26,9 @@ PAGE_LIMIT = 500
 
 def fetch_bars(broker, symbol, timeframe, days):
     """Page forward through history to collect `days` worth of closed bars."""
+    if hasattr(broker, "fetch_history"):
+        from bot.binance_data import _interval_for
+        return broker.fetch_history(symbol, days, interval=_interval_for(timeframe))
     end = datetime.now(timezone.utc)
     deadline = end - timedelta(days=days)
     frames = []
@@ -259,17 +262,13 @@ def simulate(bars, sma_fast, sma_slow, notional, taker_fee_pct=0.0, slippage_bps
 
 
 def run(days=30, timeframe_str=None, per_request_limit=500):
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-    from bot.broker import AlpacaBroker
+    from bot.timeframe import make_timeframe
+    from bot.broker import make_broker
 
     tf_str = timeframe_str or config.timeframe
-    if tf_str == "1Day":
-        timeframe = TimeFrame.Day
-    else:
-        minutes = int(tf_str.replace("Min", ""))
-        timeframe = TimeFrame(minutes, TimeFrameUnit.Minute)
+    timeframe = make_timeframe(tf_str)
 
-    broker = AlpacaBroker(config.alpaca_api_key_id, config.alpaca_api_secret_key)
+    broker = make_broker(config)
 
     print(f"=== Backtest: SMA{config.sma_fast}/{config.sma_slow} crossover, "
           f"{tf_str} bars, last {days} days ===")

@@ -9,6 +9,19 @@ from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from bot.errors import BrokerError
 
+
+def make_broker(cfg):
+    """Build the configured broker adapter from config.yaml `broker.name`."""
+    broker_cfg = getattr(cfg, "broker", None) or {}
+    name = str(broker_cfg.get("name", "alpaca")).lower()
+    if name == "binance_paper":
+        from bot.binance_paper import BinancePaperBroker
+        return BinancePaperBroker(cfg)
+    if name == "alpaca":
+        cfg.require("ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY")
+        return AlpacaBroker(cfg.alpaca_api_key_id, cfg.alpaca_api_secret_key)
+    raise BrokerError(f"Unknown broker '{name}' (expected alpaca or binance_paper)")
+
 class AlpacaBroker:
     def __init__(self, api_key, secret_key):
         # Guard: ensure we are using paper trading endpoint
@@ -19,11 +32,12 @@ class AlpacaBroker:
         """
         Fetch historical crypto bars for a given symbol.
         :param symbol: e.g., "BTC/USD"
-        :param timeframe: TimeFrame object (e.g., TimeFrame(15, TimeFrameUnit.Minute))
+        :param timeframe: neutral bot.timeframe object or Alpaca TimeFrame
         :param limit: number of bars to fetch
         :return: pandas DataFrame of bars
         """
         try:
+            timeframe = self._to_alpaca_timeframe(timeframe)
             # Explicit start/end window: a bare limit request returns far fewer
             # bars than requested (free-tier paging quirk), which silently
             # starves the SMA calculations.
@@ -41,6 +55,18 @@ class AlpacaBroker:
             return bars.df
         except Exception as e:
             raise BrokerError(f"Failed to fetch bars for {symbol}: {e}")
+
+    @staticmethod
+    def _to_alpaca_timeframe(timeframe):
+        """Accept neutral bot.timeframe objects or pass Alpaca ones through."""
+        from bot.timeframe import Minutes, Hours, Days
+        if isinstance(timeframe, Minutes):
+            return TimeFrame(timeframe.value_count, TimeFrameUnit.Minute)
+        if isinstance(timeframe, Hours):
+            return TimeFrame(timeframe.value_count // 60, TimeFrameUnit.Hour)
+        if isinstance(timeframe, Days):
+            return TimeFrame(max(1, timeframe.value_count // 1440), TimeFrameUnit.Day)
+        return timeframe
 
     @staticmethod
     def _timeframe_minutes(timeframe):
@@ -98,6 +124,12 @@ class AlpacaBroker:
                 return last
             time.sleep(1)
         return last
+
+    def get_account(self):
+        return self.trading_client.get_account()
+
+    def get_all_positions(self):
+        return list(self.trading_client.get_all_positions())
 
     def get_position(self, symbol):
         """

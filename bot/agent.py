@@ -42,8 +42,8 @@ class TradingAgent:
     def _price_context(self, symbol):
         """SMA state + recent closes for one symbol, compact for the prompt."""
         try:
-            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-            tf = TimeFrame(int(self.cfg.timeframe.replace('Min', '')), TimeFrameUnit.Minute)
+            from bot.timeframe import make_timeframe
+            tf = make_timeframe(self.cfg.timeframe)
             df = self.broker.get_crypto_bars(symbol, tf, self.cfg.lookback_bars)
             if df is None or df.empty:
                 return None
@@ -69,7 +69,7 @@ class TradingAgent:
 
     def _position_context(self):
         try:
-            positions = list(self.broker.trading_client.get_all_positions())
+            positions = list(self.broker.get_all_positions())
             out = []
             # Alpaca returns crypto position symbols without the slash (ETHUSD);
             # map back to our ETH/USD format for whitelist checks

@@ -191,8 +191,11 @@ Respond with ONLY a JSON array of objects:
 
 def scan(cfg, journal=None, model=None):
     """Full scanner cycle: both strategies, paper-log and alert the best finds."""
+    from bot.wallet import BettingWallet
     journal = journal or TradeJournal()
     print(f"[{datetime.now()}] Scanner cycle starting (paper bets only)")
+    wallet = BettingWallet(cfg, journal=journal)
+    wallet_bust = wallet.is_bust()
     raw_markets = _fetch_markets(limit=100)
 
     watchlist = scan_near_resolution(cfg, markets=raw_markets)
@@ -205,6 +208,13 @@ def scan(cfg, journal=None, model=None):
     stake = _cfg_val(cfg, "stake", 20)
     max_exposure = _cfg_val(cfg, "max_total_open_exposure", 100)
     paper_finds = [f for f in finds if f.get("paper_bet_allowed")]
+    if wallet_bust:
+        print("[scanner] wallet BUST — scanning watchlist only, no new paper bets")
+        send_notification(
+            f"💰 {wallet.status_line()} — no new paper bets until epoch reset",
+            cfg,
+        )
+        paper_finds = []
     for f in paper_finds[:5]:
         try:
             market = f["slug"] or f["question"][:60]
@@ -243,7 +253,7 @@ def scan(cfg, journal=None, model=None):
     if watchlist:
         print(f"[scanner] {len(watchlist)} near-resolution favorites kept as watchlist only")
     print(f"[{datetime.now()}] Scanner done: {len(paper_finds)} EV-qualified finds, watchlist={len(watchlist)}")
-    return {"paper_finds": paper_finds, "watchlist": watchlist}
+    return {"paper_finds": paper_finds, "watchlist": watchlist, "bust": wallet_bust}
 
 
 def settle_open_bets(cfg, journal=None):
