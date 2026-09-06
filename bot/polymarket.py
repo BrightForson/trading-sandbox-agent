@@ -275,7 +275,21 @@ def settle_open_bets(cfg, journal=None):
             if not m.get("closed"):
                 continue
             resolved = json.loads(m.get("outcomePrices", "[]"))
-            winner_idx = 0 if float(resolved[0]) >= 0.999 else 1
+            if len(resolved) != 2:
+                continue
+            try:
+                yes_px, no_px = float(resolved[0]), float(resolved[1])
+            except (TypeError, ValueError):
+                continue
+            # settle ONLY on an unambiguous final print (one side at ~1.0);
+            # ambiguous or not-yet-priced markets stay open rather than
+            # being silently scored as a NO win
+            if yes_px >= 0.999 and no_px <= 0.001:
+                winner_idx = 0
+            elif no_px >= 0.999 and yes_px <= 0.001:
+                winner_idx = 1
+            else:
+                continue
             winner = json.loads(m.get("outcomes", "[]"))[winner_idx]
             for b in open_bets:
                 if b[2] != slug:

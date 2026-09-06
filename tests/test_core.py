@@ -858,3 +858,269 @@ def test_wallet_trend_line_from_snapshots(tmp_path):
     w.snapshot()
     trend = w.trend_line()
     assert "$10.00 -> $12.00" in trend
+
+
+# ---------------- stop-ledger self-heal (re-seed survival) ----------------
+
+def test_ensure_stop_heals_missing_stop(tmp_path):
+    # the exact Sep 6 re-seed scenario: a live position whose stop ledger was
+    # wiped. The next cycle must record a working stop, not fall through to
+    # the daily -5% flatten as the only exit.
+    eng, j = _stop_engine(tmp_path)
+    healed, stop = eng.ensure_stop("ETH/USD", 2458.29, atr=12.0)
+    assert healed and stop == pytest.approx(2458.29 - 3.0 * 12.0)
+    entry, level = eng.get_stop("ETH/USD")
+    assert entry == 2458.29 and level == pytest.approx(stop)
+    # idempotent: a second heal never moves the recorded level
+    healed2, stop2 = eng.ensure_stop("ETH/USD", 2458.29, atr=99.0)
+    assert not healed2 and stop2 == pytest.approx(stop)
+
+
+def test_ensure_stop_fallback_without_atr(tmp_path):
+    # barless position (feed down): fallback pct guarantees a stop anyway
+    eng, _ = _stop_engine(tmp_path)
+    healed, stop = eng.ensure_stop("ETH/USD", 200.0, atr=None)
+    assert healed and stop == pytest.approx(190.0)  # 5% below entry
+    hit, _ = eng.stop_triggered("ETH/USD", 189.9)
+    assert hit
+
+
+def test_ensure_stop_unusable_entry(tmp_path):
+    eng, _ = _stop_engine(tmp_path)
+    healed, stop = eng.ensure_stop("ETH/USD", 0.0, atr=12.0)
+    assert not healed and stop is None
+
+
+def test_prune_stale_stops(tmp_path):
+    eng, _ = _stop_engine(tmp_path)
+    eng.record_stop("BTC/USD", 100.0, 94.0)
+    eng.record_stop("ETH/USD", 200.0, 185.0)
+    # a re-seed leaves only ETH held: BTC's stop is dead weight
+    removed = eng.prune_stale_stops({"ETH/USD"})
+    assert removed == ["BTC/USD"]
+    assert eng.get_stop("BTC/USD") == (None, None)
+    entry, level = eng.get_stop("ETH/USD")
+    assert entry == 200.0 and level == 185.0
+    assert eng.prune_stale_stops({"ETH/USD"}) == []  # idempotent
+
+
+def test_paper_broker_seed_clears_stale_stops(tmp_path):
+    # seeding at the source: the re-seed itself must not leave orphaned stops
+    from bot.binance_paper import BinancePaperBroker
+    b, j = _paper_broker(tmp_path)
+    b.place_order("BTC/USD", 0.05, "BUY")
+    j.set_meta("open_stops", '{"BTC/USD": {"entry_price": 100.0, "stop_price": 94.0}}')
+    b.seed_from_alpaca(cash=5.0, positions={
+        "ETH/USD": {"qty": 0.0397, "entry": 2458.29}})
+    from bot.risk import RiskEngine
+    eng = RiskEngine(_PaperCfg, b, journal=j)
+    assert eng.get_stop("BTC/USD") == (None, None)  # orphan pruned at seed time
+    b.place_order("ETH/USD", 0.001, "BUY")
+    o = b.place_order("ETH/USD", 0.001, "BUY")
+    assert o.status == "filled"
+    b.seed_fresh(cash=20.0)
+    assert eng._load_stops() == {}
+
+
+# ---------------- missed-cross catch-up (persistent state) ----------------
+
+class _RelationCfg:
+    sma_fast = 20
+    sma_slow = 50
+
+
+def test_sma_relation_states():
+    from bot.trader import _sma_relation
+    flat = _make_df([10.0] * 60)
+    assert _sma_relation(flat, _RelationCfg) == "below"
+    up = _make_df([10.0] * 50 + [20.0] * 20)
+    assert _sma_relation(up, _RelationCfg) == "above"
+    assert _sma_relation(_make_df([10.0] * 10), _RelationCfg) is None
+
+
+def test_catchup_signal_missed_death_cross():
+    from bot.trader import _catchup_signal
+    # held position, relation flipped above->below, cross NOT on this bar:
+    # the one-cycle-visible death cross was missed — must still exit
+    assert _catchup_signal(True, "below", "above", False) == "SELL"
+    # ...and it keeps firing on later cycles until the exit executes
+    assert _catchup_signal(True, "below", "above", False) == "SELL"
+    # fresh cross on the current bar: the strategy fires for it, no catch-up
+    assert _catchup_signal(True, "below", "above", True) is None
+    # no transition, or transition in the profitable direction: nothing
+    assert _catchup_signal(True, "above", "above", False) is None
+    assert _catchup_signal(True, "above", "below", False) is None
+    assert _catchup_signal(True, None, "above", False) is None
+    assert _catchup_signal(True, "below", None, False) is None
+
+
+def test_catchup_signal_missed_golden_cross():
+    from bot.trader import _catchup_signal
+    # flat, relation flipped below->above while we were blind: one entry shot
+    assert _catchup_signal(False, "above", "below", False) == "BUY"
+    assert _catchup_signal(False, "above", "below", True) is None  # fresh: strategy handles it
+    # holding through a golden cross is not actionable (long-only, already in)
+    assert _catchup_signal(True, "above", "below", False) is None
+
+
+def test_position_state_roundtrip(tmp_path):
+    from bot.trader import _load_position_states, _save_position_states
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    assert _load_position_states(j) == {}
+    _save_position_states(j, {"ETH/USD": "above", "BTC/USD": "below"})
+    assert _load_position_states(j) == {"ETH/USD": "above", "BTC/USD": "below"}
+    # corrupt payload degrades to empty, never crashes the cycle
+    j.set_meta("strat_state_positions", "{not json")
+    assert _load_position_states(j) == {}
+
+
+def test_failed_exit_does_not_advance_state(tmp_path, monkeypatch):
+    """E2E invariant: a death-cross SELL that fails must leave the recorded
+    relation at 'above', so the missed-cross catch-up retries the exit next
+    cycle instead of losing it forever."""
+    import bot.trader as T
+    from bot.errors import BrokerError
+
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+
+    class _Pos:
+        symbol = "ETH/USD"
+        qty = "0.01"
+        avg_entry_price = "100.0"
+        current_price = "99.0"
+        market_value = "0.99"
+        unrealized_pl = "-0.01"
+
+    class _Acct:
+        cash = "20"
+        equity = "20"
+
+    class _FlakyBroker:
+        def __init__(self):
+            self.sell_attempts = 0
+        def get_account(self):
+            return _Acct()
+        def get_all_positions(self):
+            return [_Pos()]
+        def get_position(self, symbol):
+            return _Pos() if symbol == "ETH/USD" else None
+        def get_crypto_bars(self, symbol, timeframe, limit):
+            # death cross on the last closed bar, close 99 stays above the
+            # healed fallback stop (95) so the strategy exit is what fails
+            closes = [200.0] * 50 + [99.0]
+            return pd.DataFrame({"open": closes, "high": closes,
+                                 "low": closes, "close": closes})
+        def place_order(self, symbol, qty, side):
+            self.sell_attempts += 1
+            raise BrokerError("broker down")
+        def await_terminal_order(self, order_id, timeout_seconds=15):
+            return None
+
+    broker = _FlakyBroker()
+    cfg = type("C", (), {
+        "symbols": ["ETH/USD"], "timeframe": "15Min", "lookback_bars": 60,
+        "sma_fast": 20, "sma_slow": 50, "notional": 10,
+        "active_strategies": ["sma_cross"],
+        "risk": {"atr_period": 14, "catastrophic_atr_multiple": 3.0,
+                 "fallback_stop_pct": 5.0, "max_notional_per_trade": 100,
+                 "max_open_positions": 3, "daily_loss_limit_pct": 0},
+        "execution": {"taker_fee_pct": 0.1},
+    })()
+    monkeypatch.setattr(T, "config", cfg)
+    monkeypatch.setattr(T, "make_broker", lambda c: broker)
+    monkeypatch.setattr(T, "TradeJournal", lambda *a, **k: j)
+    monkeypatch.setattr(T, "send_notification", lambda *a, **k: None)
+    monkeypatch.setattr(T, "_load_position_states",
+                        lambda journal: {"ETH/USD": "above"})
+
+    T.run_trading_cycle()
+    assert broker.sell_attempts == 1  # the exit was attempted...
+    # ...and state was NOT advanced: relation stays 'above' so the catch-up
+    # logic retries the exit next cycle instead of losing it forever
+    assert j.get_meta("strat_state_positions") in (None, '{"ETH/USD": "above"}')
+
+
+def test_cross_on_current_edge():
+    from bot.trader import _cross_on_current_edge
+    # the cross is on the last closed bar -> strategy fires this cycle
+    df = _make_df([10.0] * 50 + [20.0])
+    assert _cross_on_current_edge(df, _RelationCfg) is True
+    # the cross happened bars ago (missed cycle) -> needs catch-up
+    df_old = _make_df([10.0] * 50 + [20.0, 20.0, 20.0])
+    assert _cross_on_current_edge(df_old, _RelationCfg) is False
+    # no cross at all
+    assert _cross_on_current_edge(_make_df([10.0] * 60), _RelationCfg) is False
+
+
+# ---------------- report hygiene: shadow trades ----------------
+
+def test_pnl_excludes_shadow_account_trades():
+    from bot.report import compute_pnl_and_winrate
+    trades = [
+        (1, "2026-09-05T10:00", "BTC/USD", "BUY", 0.01, 100.0, "r", 0.02, "o1", "filled"),
+        (2, "2026-09-05T10:05", "SOL/USD", "BUY", 0.1, 100.0, "[shadow-account] scout proposal", 0.0, None, "filled"),
+        (3, "2026-09-05T11:00", "BTC/USD", "SELL", 0.01, 110.0, "r", 0.02, "o3", "filled"),
+        (4, "2026-09-05T12:00", "SOL/USD", "SELL", 0.1, 120.0, "[shadow-account] babysitter exit (pnl +2.00)", 0.0, None, "filled"),
+    ]
+    stats = compute_pnl_and_winrate(trades)
+    # Tier 1 scorecard must contain ONLY the strategy round trip (+$0.06)
+    assert stats["round_trips"] == 1
+    assert stats["total_pnl"] == pytest.approx(0.06)
+
+
+# ---------------- chat: our-bot detection ----------------
+
+def test_is_our_bot_decodes_token_id(monkeypatch):
+    from bot.chat import _is_our_bot
+    import base64
+    bot_id = "1545107532173934644"
+    token = base64.b64encode(bot_id.encode()).decode().rstrip("=") + ".fake.hmac"
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", token)
+    assert _is_our_bot({"author": {"id": bot_id}}) is True
+    # the raw (undecoded) segment must NOT match — that was the old bug
+    raw_first = token.split(".")[0]
+    assert _is_our_bot({"author": {"id": raw_first}}) is False
+    assert _is_our_bot({"author": {"id": "999"}}) is False
+    # bots are filtered by the bot flag regardless of token
+    assert _is_our_bot({"author": {"id": "x", "bot": True}}) is True
+
+
+# ---------------- polymarket settlement ambiguity ----------------
+
+def test_settlement_requires_unambiguous_prices(tmp_path, monkeypatch):
+    from bot import polymarket as pm
+
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    j.log_bet("2026-09-05T10:00", "will-x", "q?", "Yes", 0.6, 20)
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return [{
+                "slug": "will-x", "closed": True,
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '[0.5, 0.5]',  # ambiguous: NOT settled
+            }]
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        return _Resp()
+
+    monkeypatch.setattr(pm.requests, "get", fake_get)
+    settled = pm.settle_open_bets(_WalletCfg, journal=j)
+    assert settled == []
+    assert j.get_open_bets()  # still open, not silently scored a loss
+
+    class _Resp2(_Resp):
+        def json(self):
+            return [{
+                "slug": "will-x", "closed": True,
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '[0.9995, 0.0005]',  # clean Yes win
+            }]
+
+    monkeypatch.setattr(pm.requests, "get", lambda *a, **k: _Resp2())
+    settled = pm.settle_open_bets(_WalletCfg, journal=j)
+    assert len(settled) == 1 and settled[0][1] is True
+    assert j.get_open_bets() == []

@@ -11,6 +11,8 @@ def compute_pnl_and_winrate(trades):
     Matches each BUY with the next SELL for the same symbol.
     Non-filled order records (status != 'filled', e.g. journaled cancels/
     expires) are skipped so they never distort FIFO matching.
+    Shadow-account virtual trades ([shadow-account] reasoning) are excluded:
+    this scorecard measures the Tier 1 strategy's paper performance only.
     :param trades: list of tuples (id, timestamp, symbol, action, qty, price, reasoning[, ...])
     :return: dict with total_pnl, win_rate, num_trades, num_losing, num_winning
     """
@@ -31,7 +33,9 @@ def compute_pnl_and_winrate(trades):
         # We'll use a queue for buys
         buy_queue = []  # each element: (qty, price, fee)
         for trade in symbol_trades:
-            _, timestamp, symbol, action, qty, price, *_ = trade
+            _, timestamp, symbol, action, qty, price, reasoning, *_ = trade
+            if "[shadow-account]" in (reasoning or ""):
+                continue  # virtual Tier-2 trades, not Tier-1 strategy fills
             status = str(trade[9]) if len(trade) > 9 and trade[9] is not None else "filled"
             if status != "filled":
                 continue

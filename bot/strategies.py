@@ -6,23 +6,12 @@ Each strategy exposes evaluate(symbol, df, cfg) -> list of Signal dicts:
 
 The trader loop is strategy-agnostic: it iterates registered strategies,
 validates their signals through the risk module, then executes.
+
+Cross signals are edge-triggered here (fire on the exact transition bar);
+the trading loop carries the persistent relation state that catches
+transitions missed by late or failed cycles.
 """
 from bot.strategy import check_crossover
-
-
-class SMAStates:
-    """Track last-seen crossover state per symbol so each cross fires once."""
-    def __init__(self):
-        self._last = {}
-
-    def seen(self, symbol, state):
-        self._last[symbol] = state
-
-    def last(self, symbol):
-        return self._last.get(symbol)
-
-
-_sma_states = SMAStates()
 
 
 def sma_cross(symbol, df, cfg):

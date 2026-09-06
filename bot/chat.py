@@ -10,8 +10,8 @@ this module never places orders. It can only answer with data + analysis.
 """
 import os
 import time
-import re
 import json
+import base64
 from datetime import datetime, timezone
 
 import requests
@@ -92,7 +92,15 @@ def _is_our_bot(msg):
         return True
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     first = token.split(".")[0] if token else ""
-    return author.get("id") == first
+    if not first:
+        return False
+    try:
+        # the token's first segment is the base64-encoded bot user id
+        padded = first + "=" * (-len(first) % 4)
+        bot_id = base64.b64decode(padded).decode("utf-8", "ignore")
+        return author.get("id") == bot_id
+    except Exception:
+        return False
 
 
 def _answer_prompt(question, context_block):
@@ -187,8 +195,6 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
     now = time.time()
     fresh = []
     for msg in msgs:
-        ts = (datetime.fromisoformat(msg["timestamp"]).timestamp()
-              if "timestamp" in msg else 0)
         try:
             ts = datetime.fromisoformat(msg["timestamp"]).timestamp()
         except Exception:

@@ -115,6 +115,35 @@ class RiskEngine:
             del stops[symbol]
             self.journal.set_meta("open_stops", json.dumps(stops))
 
+    def ensure_stop(self, symbol, entry_price, atr):
+        """Guarantee an open position has a stop recorded.
+
+        Heals positions that predate the stop ledger (e.g. imported by a
+        broker re-seed): if no stop exists, one is computed and recorded NOW
+        from the current bars' ATR (or the fallback pct). An existing level
+        is never moved.
+        :return: (healed, stop_price); stop_price is None if entry unusable
+        """
+        entry_price = float(entry_price or 0)
+        if entry_price <= 0:
+            return False, None
+        _, existing = self.get_stop(symbol)
+        if existing is not None:
+            return False, float(existing)
+        stop_price = self.entry_fixed_stop(symbol, entry_price, atr)
+        self.record_stop(symbol, entry_price, stop_price)
+        return True, stop_price
+
+    def prune_stale_stops(self, held_symbols):
+        """Drop ledger stops for symbols no longer held (e.g. after a re-seed
+        or a close the loop never saw). :return: removed symbols"""
+        removed = []
+        for symbol in list(self._load_stops()):
+            if symbol not in held_symbols:
+                self.clear_stop(symbol)
+                removed.append(symbol)
+        return removed
+
     def _load_stops(self):
         raw = self.journal.get_meta("open_stops")
         if not raw:

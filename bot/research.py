@@ -205,7 +205,7 @@ def whale_activity(symbol, cfg=None):
     day = _day_key()
     cache_key = f"whale_cache_{day}_{symbol.replace('/', '_')}"
     if journal.get_meta(cache_key):
-        cached = journal.get_meta(f"whale_cache_data_{symbol.replace('/', '_')}")
+        cached = journal.get_meta(f"whale_cache_data_{day}_{symbol.replace('/', '_')}")
         if cached:
             import json as _json
             try:
@@ -217,8 +217,17 @@ def whale_activity(symbol, cfg=None):
     if results:
         import json as _json
         payload = {"source": "tavily", "items": results}
+        safe_sym = symbol.replace('/', '_')
         journal.set_meta(cache_key, "done")
-        journal.set_meta(f"whale_cache_data_{symbol.replace('/', '_')}", _json.dumps(payload))
+        journal.set_meta(f"whale_cache_data_{day}_{safe_sym}", _json.dumps(payload))
+        # drop the previous day's bulky cache data (kept for one day only)
+        try:
+            prev = (datetime.now(timezone.utc).date())
+            from datetime import timedelta as _td
+            yesterday = (prev - _td(days=1)).strftime("%Y-%m-%d")
+            journal.set_meta(f"whale_cache_data_{yesterday}_{safe_sym}", "")
+        except Exception:
+            pass
         return payload
     heads = headlines_for_symbol(symbol, limit=5)
     if heads:

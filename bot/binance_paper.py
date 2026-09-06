@@ -240,13 +240,33 @@ class BinancePaperBroker:
 
     # ---------------- seeding ----------------
 
+    @staticmethod
+    def _stops_key(symbol):
+        return f"stop_{symbol.replace('/', '_')}"
+
+    def _clear_all_stops(self):
+        """A (re-)seed replaces the position set: entry-fixed stops for the
+        old set must not survive (they'd mis-fire against the new ledger)."""
+        raw = self.journal.get_meta("open_stops")
+        if not raw:
+            return
+        try:
+            stops = json.loads(raw)
+        except Exception:
+            stops = {}
+        for symbol in list(stops):
+            del stops[symbol]
+        self.journal.set_meta("open_stops", json.dumps(stops))
+
     def seed_from_alpaca(self, cash, positions):
         """One-time import of live Alpaca paper state into this ledger."""
+        self._clear_all_stops()
         ledger = {sym: {"qty": float(p["qty"]), "entry": float(p["entry"])}
                   for sym, p in positions.items()}
         self._save(float(cash), ledger, self._next_order_id())
         self.journal.set_meta("paper_seeded_at", datetime.now(timezone.utc).isoformat())
 
     def seed_fresh(self, cash):
+        self._clear_all_stops()
         self._save(float(cash), {}, self._next_order_id())
         self.journal.set_meta("paper_seeded_at", datetime.now(timezone.utc).isoformat())
