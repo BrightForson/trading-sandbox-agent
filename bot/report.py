@@ -1,5 +1,7 @@
 import json
-from datetime import datetime
+import os
+import requests
+from datetime import datetime, timezone
 from bot.journal import TradeJournal
 from bot.models import ModelClient
 from bot.errors import ModelError, JournalError
@@ -201,6 +203,74 @@ def experiment_scorecards():
         return f"Experiment scorecards unavailable: {e}"
 
 
+WORKFLOW_SCHEDULES = {
+    "trade": (15 * 60, 2),
+    "chat": (15 * 60, 2),
+    "agent": (60 * 60, 3),
+    "scanner": (6 * 60 * 60, 12),
+    "report": (24 * 60 * 60, 30),
+}
+
+
+def actions_health():
+    """Pain-meter: GitHub Actions workflow freshness, straight from the API.
+
+    A missed cron shows up here long before it becomes "why didn't the bot
+    trade?". Uses GITHUB_API_TOKEN if present (public repo read-only works
+    unauthenticated, but the token avoids rate limits on the Actions API).
+    """
+    repo = os.getenv("GITHUB_REPOSITORY", "BrightForson/trading-sandbox-agent")
+    token = os.getenv("GITHUB_API_TOKEN") or os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        lines = []
+        for wf, (interval, grace_runs) in WORKFLOW_SCHEDULES.items():
+            try:
+                resp = requests.get(
+                    f"https://api.github.com/repos/{repo}/actions/workflows/{wf}.yml/runs",
+                    params={"per_page": grace_runs},
+                    headers=headers,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                runs = resp.json().get("workflow_runs", [])
+            except Exception as e:
+                lines.append(f"- {wf}: unavailable ({e})")
+                continue
+            if not runs:
+                lines.append(f"- {wf}: no runs found")
+                continue
+            latest = runs[0]
+            last_ts = datetime.fromisoformat(
+                latest["created_at"].replace("Z", "+00:00")
+            )
+            age_h = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600
+            failures = sum(1 for r in runs if r.get("conclusion") == "failure")
+            status = latest.get("status") or "?"
+            conclusion = latest.get("conclusion") or status
+            if conclusion == "failure":
+                verdict = "LAST RUN FAILED"
+            elif age_h * 3600 > interval * (grace_runs + 1):
+                verdict = "STALLED"
+            else:
+                verdict = "ok"
+            age_txt = f"{age_h:.1f}h" if age_h < 48 else f"{age_h/24:.1f}d"
+            lines.append(
+                f"- {wf}: {verdict} | last run {age_txt} ago ({conclusion}, "
+                f"{failures}/{len(runs)} recent failures)"
+            )
+        header = "Actions Pain-Meter (workflow freshness):"
+        any_pain = any(("FAILED" in ln) or ("STALLED" in ln) or ("unavailable" in ln)
+                       for ln in lines)
+        if any_pain:
+            header += " ⚠ INVESTIGATE"
+        return header + "\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Actions pain-meter unavailable: {e}"
+
+
 def create_daily_report():
     """
     Create a daily report by reading trades from journal, computing stats,
@@ -220,6 +290,8 @@ def create_daily_report():
 {tier3_wallet_snapshot()}
 
 {experiment_scorecards()}
+
+{actions_health()}
 
 Statistics:
 - Total P&L: $0.00
@@ -252,6 +324,8 @@ for SMA20/SMA50 crossovers and will act on the first signal.
 {tier3_wallet_snapshot()}
 
 {experiment_scorecards()}
+
+{actions_health()}
 
 Statistics:
 - Total P&L: ${stats['total_pnl']:.2f}

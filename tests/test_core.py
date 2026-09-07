@@ -1124,3 +1124,87 @@ def test_settlement_requires_unambiguous_prices(tmp_path, monkeypatch):
     settled = pm.settle_open_bets(_WalletCfg, journal=j)
     assert len(settled) == 1 and settled[0][1] is True
     assert j.get_open_bets() == []
+
+
+# ---------------- report: actions pain-meter ----------------
+
+class _PainMeterResp:
+    status_code = 200
+    def __init__(self, runs):
+        self._runs = runs
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return {"workflow_runs": self._runs}
+
+
+def _mk_run(created_at, conclusion):
+    return {"created_at": created_at, "status": "completed",
+            "conclusion": conclusion}
+
+
+def _patch_meter(monkeypatch, runs_by_wf):
+    from datetime import datetime, timedelta, timezone
+    from bot import report as rp
+    now = datetime.now(timezone.utc)
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        wf = url.rstrip("/runs").rsplit("/", 1)[-1].replace(".yml", "")
+        return _PainMeterResp(runs_by_wf.get(wf, []))
+
+    monkeypatch.setattr(rp.requests, "get", fake_get)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "test/repo")
+    return rp
+
+
+def test_pain_meter_flags_stalled_workflow(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    rp = _patch_meter(monkeypatch, {
+        # last trade run 3h ago -> past 2-run grace on a 15-min cron
+        "trade": [_mk_run((datetime.now(timezone.utc) - timedelta(hours=3)
+                          ).isoformat(), "success")],
+        "chat": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
+        "agent": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
+        "scanner": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
+        "report": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
+    })
+    out = rp.actions_health()
+    assert "INVESTIGATE" in out
+    assert "trade: STALLED" in out
+    assert "chat: ok" in out
+
+
+def test_pain_meter_flags_failed_run(monkeypatch):
+    from datetime import datetime, timezone
+    rp = _patch_meter(monkeypatch, {
+        wf: [_mk_run(datetime.now(timezone.utc).isoformat(), "failure")]
+        for wf in ("trade", "chat", "agent", "scanner", "report")
+    })
+    out = rp.actions_health()
+    assert "INVESTIGATE" in out
+    assert "trade: LAST RUN FAILED" in out
+    assert "0 ok" not in out
+
+
+def test_pain_meter_all_healthy(monkeypatch):
+    from datetime import datetime, timezone
+    rp = _patch_meter(monkeypatch, {
+        wf: [_mk_run(datetime.now(timezone.utc).isoformat(), "success")]
+        for wf in ("trade", "chat", "agent", "scanner", "report")
+    })
+    out = rp.actions_health()
+    assert "INVESTIGATE" not in out
+    assert "STALLED" not in out
+    assert "FAILED" not in out
+
+
+def test_pain_meter_api_failure_degrades_gracefully(monkeypatch):
+    rp = _patch_meter(monkeypatch, {})
+
+    def boom(url, params=None, headers=None, timeout=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(rp.requests, "get", boom)
+    out = rp.actions_health()
+    assert "unavailable" in out
+    assert "INVESTIGATE" in out  # blindness is pain too
