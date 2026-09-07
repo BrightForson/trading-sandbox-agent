@@ -62,8 +62,10 @@ def send_heartbeat(broker, journal):
 # PROCESSED one, so a missed bar catch-up happens however late it arrives.
 
 import json as _json
+import hashlib as _hashlib
 
 POSITION_STATE_KEY = "strat_state_positions"
+IDEMPOTENCY_KEY = "executed_client_order_ids"
 
 
 def _load_position_states(journal):
@@ -79,6 +81,48 @@ def _load_position_states(journal):
 
 def _save_position_states(journal, states):
     journal.set_meta(POSITION_STATE_KEY, _json.dumps(states))
+
+
+def _client_order_id(symbol, action, reasoning, qty=0.0):
+    """Deterministic idempotency key for one intended order.
+
+    Same (symbol, action, reasoning, qty) -> same id, so a retried/resent
+    submission of an already-executed intent is recognized as a duplicate
+    instead of filling twice. The reasoning carries the signal context
+    (cross type, SMA levels, stop prices) and qty binds the key to the
+    exact intended order, making keys stable across retries but distinct
+    between genuinely different intents (e.g. the same exit reason on a
+    later, differently-sized position is NOT a duplicate).
+    """
+    raw = f"{symbol}|{action}|{reasoning}|{qty:.8f}"
+    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _already_executed(journal, client_order_id):
+    raw = journal.get_meta(IDEMPOTENCY_KEY)
+    if not raw:
+        return False
+    try:
+        done = _json.loads(raw)
+        return isinstance(done, dict) and client_order_id in done
+    except Exception:
+        return False
+
+
+def _mark_executed(journal, client_order_id, order_ref):
+    raw = journal.get_meta(IDEMPOTENCY_KEY)
+    try:
+        done = _json.loads(raw) if raw else {}
+        if not isinstance(done, dict):
+            done = {}
+    except Exception:
+        done = {}
+    done[client_order_id] = order_ref
+    # bounded: keep the newest 500 entries (idempotency is for near-term
+    # retries, not an unbounded growth key)
+    if len(done) > 500:
+        done = dict(list(done.items())[-500:])
+    journal.set_meta(IDEMPOTENCY_KEY, _json.dumps(done))
 
 
 def _sma_relation(df, cfg):
@@ -410,6 +454,11 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
 
     print(f"[{datetime.now()}] Placing {action} order for {symbol}: qty={qty:.6f}, price={price:.2f}")
     reasoning = sig.get("reasoning", action)
+    client_order_id = _client_order_id(symbol, action, reasoning, qty)
+    if _already_executed(journal, client_order_id):
+        print(f"[{datetime.now()}] Duplicate order suppressed for {symbol} {action} "
+              f"(client_order_id {client_order_id} already executed)")
+        return True
     try:
         send_notification(
             f"🔔 **Trade signal — {symbol}**\n"
@@ -438,6 +487,8 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             qty=fill_qty, price=fill_price, reasoning=reasoning, fee=estimated_fee,
             order_id=str(getattr(order, "id", "")), status="filled"
         )
+        _mark_executed(journal, client_order_id,
+                       str(getattr(order, "id", "")))
         if action == "BUY":
             # fix the stop at entry: level decided now, never moved afterwards
             entry_atr = _atr(df, int((getattr(config, "risk", None) or {}).get("atr_period", 14))) if df is not None else None

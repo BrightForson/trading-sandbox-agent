@@ -974,6 +974,82 @@ def test_position_state_roundtrip(tmp_path):
     assert _load_position_states(j) == {}
 
 
+# ---------------- idempotency keys ----------------
+
+def test_client_order_id_stable_and_distinct():
+    from bot.trader import _client_order_id
+    a = _client_order_id("ETH/USD", "SELL", "death cross reason", 0.01)
+    b = _client_order_id("ETH/USD", "SELL", "death cross reason", 0.01)
+    c = _client_order_id("ETH/USD", "SELL", "death cross reason", 0.02)
+    d = _client_order_id("ETH/USD", "SELL", "other reason", 0.01)
+    assert a == b
+    assert a != c
+    assert a != d
+
+
+def test_mark_executed_bounds_registry(tmp_path):
+    from bot.trader import _mark_executed, _already_executed, IDEMPOTENCY_KEY
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    _mark_executed(j, "abc123", "order-1")
+    assert _already_executed(j, "abc123") is True
+    assert _already_executed(j, "nope") is False
+    for i in range(600):
+        _mark_executed(j, f"k{i}", f"order-{i}")
+    import json as _json
+    raw = _json.loads(j.get_meta(IDEMPOTENCY_KEY))
+    assert len(raw) == 500
+    assert "k599" in raw and "k0" not in raw
+
+
+def test_execute_signal_suppresses_duplicate(tmp_path, monkeypatch):
+    import bot.trader as T
+
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+
+    class _Order:
+        id = "7"
+        status = "filled"
+        filled_qty = "0.01"
+        filled_avg_price = "100.0"
+
+    class _FillingBroker:
+        def __init__(self):
+            self.orders = 0
+        def get_position(self, symbol):
+            return None
+        def get_account(self):
+            class _A:
+                cash = "20"
+                equity = "20"
+            return _A()
+        def get_all_positions(self):
+            return []
+        def place_order(self, symbol, qty, side):
+            self.orders += 1
+            return _Order()
+        def await_terminal_order(self, order_id, timeout_seconds=15):
+            return _Order()
+
+    broker = _FillingBroker()
+    risk = type("R", (), {
+        "size_for_atr": staticmethod(lambda p, a, c, n: 0.01),
+        "check": staticmethod(lambda *a, **k: (True, "")),
+        "entry_fixed_stop": staticmethod(lambda s, e, atr: 95.0),
+        "record_stop": staticmethod(lambda *a: None),
+        "clear_stop": staticmethod(lambda *a: None),
+    })()
+    df = pd.DataFrame({"close": [100.0] * 5})
+    sig = {"action": "BUY", "reasoning": "golden cross retry test"}
+
+    monkeypatch.setattr(T, "config", type("C", (), {
+        "notional": 10, "execution": {"taker_fee_pct": 0.1}})())
+    ok1 = T._execute_signal(broker, j, risk, "ETH/USD", df, sig)
+    ok2 = T._execute_signal(broker, j, risk, "ETH/USD", df, sig)
+    assert ok1 is True and ok2 is True
+    assert broker.orders == 1
+    assert len(j.get_trades()) == 1
+
+
 def test_failed_exit_does_not_advance_state(tmp_path, monkeypatch):
     """E2E invariant: a death-cross SELL that fails must leave the recorded
     relation at 'above', so the missed-cross catch-up retries the exit next
