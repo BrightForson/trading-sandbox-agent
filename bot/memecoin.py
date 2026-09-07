@@ -408,6 +408,21 @@ class MemecoinLedger:
             events.extend(self.sweep())
         except Exception as e:
             print(f"[tier4] sweep failed: {e}")
+        for ev in events:
+            try:
+                from bot.notify import send_notification
+                if ev["type"] == "kill":
+                    send_notification(
+                        f"⛔ **Tier 4 canary KILLED**\n{ev['reason']}\n"
+                        f"All positions flattened; entries blocked until manual "
+                        f"reset (`tools/tier4.py reset-kill`)", self.cfg)
+                else:
+                    send_notification(
+                        f"⚠️ **Tier 4 canary exit swept** ({ev['type']})\n"
+                        f"{ev['symbol']} @ ${ev.get('exit_price', 0):.6f} "
+                        f"(P&L {ev.get('pnl', 0):+.2f})", self.cfg)
+            except Exception as e:
+                print(f"[tier4] event notification failed: {e}")
         trending = []
         spikes = []
         try:

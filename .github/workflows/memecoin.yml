@@ -1,0 +1,41 @@
+name: memecoin
+
+on:
+  schedule:
+    # Tier 4 canary: hourly research-card refresh + exit-check sweep.
+    # Research/monitoring ONLY — this workflow can NEVER place a buy:
+    # it runs `tier4.py cycle` (sweep + card refresh) and nothing else.
+    # Entries stay human-gated via tools/tier4.py buy (OPPORTUNITY_LAB.md).
+    - cron: '37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: memecoin-job
+  cancel-in-progress: false
+
+jobs:
+  memecoin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Tier 4 canary cycle (research + exit sweep only, no entries)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python tools/tier4.py cycle
+
+      - name: Commit journal (lossless merge on conflict)
+        run: bash tools/safe_commit.sh "journal update (memecoin) $(date -u +'%Y-%m-%d %H:%M')"
