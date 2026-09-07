@@ -1,6 +1,6 @@
 # Status Report — 2026-09-07 (end of session)
 
-Everything completed this session. Supersedes the 2026-09-06 report. Tests: 77/77 passing (`./venv/bin/python -m pytest tests/ -q`).
+Everything completed this session. Supersedes the 2026-09-06 report. Tests: 96/96 passing (`./venv/bin/python -m pytest tests/ -q`).
 
 ## 1. Commits (all local, not pushed — gh auth keyring broken)
 
@@ -12,10 +12,12 @@ Everything completed this session. Supersedes the 2026-09-06 report. Tests: 77/7
 | `9b522fc` | Per-tier kill/keep criteria in PROJECT_SUMMARY.md (§4) |
 | `14a7400` | Agent-alpha graduation gate, wired into daily report (§5) |
 | `ef266e3` | Idempotency keys in the execution path (§6) |
+| `77a19d7` | **Tier 4 memecoin canary** (session 2, §11) |
+| `9745ba0` | **Day-zero reset with new allocations** (session 2, §12) |
 
 Push blocked by local gh keyring timeout — run `gh auth login` then `git push origin main` to publish.
 
-## 2. Day-zero reset — done
+## 2. Day-zero reset (superseded by session 2 — §12)
 
 - **Timestamp:** `2026-09-07T13:58:46Z` (persisted as meta key `day_zero_reset_at`)
 - **Archives:** `data/archive/trades.db.pre-reset-2026-09-06T23-59-00Z` and `data/archive/trades.db.pre-reset-2026-09-07T13-58-46Z`, both committed
@@ -29,7 +31,7 @@ Push blocked by local gh keyring timeout — run `gh auth login` then `git push 
 
 **First live read caught a real stall:** GitHub's scheduler skipped the 15-min trade/chat crons for ~3h on 2026-09-07 (last trade run 12:18 UTC, nothing queued, quota fine — known high-frequency-cron quirk). If it recurs, consider an external `workflow_dispatch` pinger or hourly consolidation.
 
-## 4. Kill/keep criteria — written
+## 4. Kill/keep criteria — written (session 1; Tier 4 criteria added session 2)
 
 PROJECT_SUMMARY.md "Kill/keep criteria (per tier)" — measurable verdicts anchored to day zero:
 - Tier 1: kill at < −20% P&L after ≥4 weeks, or >25% drawdown, or divergence from 30-day backtest; keep at ≥0% with gates intact
@@ -60,9 +62,38 @@ Supporting fix: `journal.proposal_scorecard()` gained `avg_return_pct` (per-prop
 
 - Double-entry ledger, correlation-aware heat, regime labeling, reconciliation diff — all still open ideas, never committed to a plan doc. Correlation heat remains HANDOFF.md lever 4.
 
-## 10. Bottom line
+## 10. Bottom line (session 1)
 
 - Bug-fix work: committed and verified
 - Day zero: reset, archived, timestamped
 - Pain-meter, kill/keep criteria, agent-alpha gate, idempotency keys: all built, tested (77/77), committed
 - Outstanding: push to origin (blocked on gh auth), monitor the Actions scheduler stall the pain-meter caught
+
+## 11. Tier 4 memecoin canary — built (session 2, commit `77a19d7`)
+
+New `bot/memecoin.py` (`MemecoinLedger`) + `bot/journal.py` tier4_cards table + `tools/tier4.py` CLI + `tests/test_tier4.py` (19 tests) + report/config/docs wiring:
+
+- **Canary-only, per OPPORTUNITY_LAB.md**: deterministic research signals (CoinGecko trending + DexScreener volume-spike, keyless APIs, no LLM anywhere in the Tier 4 path) produce review cards in the `tier4_cards` table. Entries happen ONLY via the human-gated CLI (`tools/tier4.py buy`); nothing auto-executes.
+- **Exit discipline (verified by tests)**: every entry records entry-fixed stop-loss (25%), take-profit (50%), and a 72h time-stop anchor at entry; the levels never drift with later volatility. The hourly `sweep()` enforces all three plus the hard 25% max-drawdown kill, which flattens every position and blocks new entries until the manual `reset-kill` re-arms the peak.
+- **Structural fail-closed**: `MemecoinLedger.__init__` raises if any exit/drawdown param is missing or ≤ 0 — entries can never run unprotected. Kill history (`t4_kill_count`) survives resets.
+- **Isolation (verified by tests)**: virtual fills are tagged `[tier4-memecoin]` in the trades table; `compute_pnl_and_winrate` in report.py excludes the tag, so Tier 1's scorecard is untouched. `tier4_snapshot()` is a new daily-report section; `WORKFLOW_SCHEDULES["memecoin"] = (60*60, 3)` extends the pain-meter.
+- **Prices**: keyless Binance public data first (shared `BinanceDataClient`), CoinGecko simple-price fallback; both degrade gracefully.
+
+## 12. Day-zero reset #2 — done (session 2, commit `9745ba0`)
+
+- **Timestamp:** `2026-09-07T22:43:44Z` (meta key `day_zero_reset_at`)
+- **Archive:** `data/archive/trades.db.pre-reset-2026-09-07T22-43-44Z`, committed
+- **New capital allocations (config.yaml):** Tier 1 paper $100, Tier 2 shadow $80 (max/position $40), Tier 3 wallet $60 with $12 stakes, Tier 4 canary $40 (max stake $12)
+- **Cleared:** trades, proposals, bets, wallet_snapshots, tier4_cards, all non-preserved meta
+- **Preserved:** `discord_chat_last_seen`, `discord_chat_channel_id`, `active_llm_model`, `t4_kill_count`
+- **Day-zero state verified:** meta contains only the 4 keys above + `day_zero_reset_at`; T4 canary $40 flat, ACTIVE, kills 0
+
+## 13. Scope confirmation (session 2)
+
+`git diff fb4c469..HEAD` touches exactly: `bot/memecoin.py` (new), `bot/journal.py` (tier4_cards additive), `bot/report.py` (tag filter + snapshot + schedule), `config.yaml` (allocations + memecoin section), `tests/test_tier4.py` (new), `tools/tier4.py` (new), `tools/reset_day_zero.py` (new), `data/trades.db` (migration + reset), `data/archive/` (new archive), PROJECT_SUMMARY.md / OPPORTUNITY_LAB.md / HANDOFF.md (docs). **Zero changes** to `bot/research.py`, `bot/agent.py`, `bot/polymarket.py`, `bot/trader.py`, `bot/wallet.py`, `bot/shadow.py`, `run_agent.py`, `run_scanner.py`, `backtest.py`, `validation.py` — all tiers 1–3 behavior paths are byte-identical to session 1.
+
+## 14. Bottom line (session 2)
+
+- Tier 4 canary: built, tested (96/96), committed, day-zero verified
+- New allocations: reset, archived, timestamped
+- Outstanding: push to origin (still blocked on gh auth)
