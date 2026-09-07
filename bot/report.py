@@ -271,6 +271,15 @@ def actions_health():
         return f"Actions pain-meter unavailable: {e}"
 
 
+def gates_section():
+    """Graduation gates in the daily report (recommend-only)."""
+    try:
+        from bot.gates import evaluate_gates
+        return evaluate_gates()
+    except Exception as e:
+        return f"Graduation gates unavailable: {e}"
+
+
 def create_daily_report():
     """
     Create a daily report by reading trades from journal, computing stats,
@@ -292,6 +301,8 @@ def create_daily_report():
 {experiment_scorecards()}
 
 {actions_health()}
+
+{gates_section()}
 
 Statistics:
 - Total P&L: $0.00
@@ -326,6 +337,8 @@ for SMA20/SMA50 crossovers and will act on the first signal.
 {experiment_scorecards()}
 
 {actions_health()}
+
+{gates_section()}
 
 Statistics:
 - Total P&L: ${stats['total_pnl']:.2f}

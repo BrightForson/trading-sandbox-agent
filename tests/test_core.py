@@ -1208,3 +1208,40 @@ def test_pain_meter_api_failure_degrades_gracefully(monkeypatch):
     out = rp.actions_health()
     assert "unavailable" in out
     assert "INVESTIGATE" in out  # blindness is pain too
+
+
+# ---------------- graduation gates ----------------
+
+def _gate_journal(tmp_path):
+    return TradeJournal(db_path=str(tmp_path / "g.db"))
+
+
+def test_agent_alpha_gate_red_on_empty(tmp_path):
+    from bot.gates import agent_alpha_gate
+    j = _gate_journal(tmp_path)
+    r = agent_alpha_gate(j)
+    assert r.passed is False
+    assert "0/20 proposals evaluated" in r.summary
+
+
+def test_agent_alpha_gate_green_on_edge(monkeypatch, tmp_path):
+    from bot.gates import agent_alpha_gate
+    j = _gate_journal(tmp_path)
+    for i in range(20):
+        j.log_proposal("2026-09-07T10:00", "ai_agent", "scout", "BTC/USD",
+                       "BUY", 10, 0.9, "r", exec_status="evaluated",
+                       entry_price=100.0)
+        j.update_proposal_exec(i + 1, "evaluated", "2026-09-08T10:00",
+                               100.0, 1.0, closed_price=105.0,
+                               benchmark_return=0.02)
+
+    class _Shadow:
+        def __init__(self, *a, **k):
+            pass
+        def realized_pnl(self):
+            return 3.0
+
+    monkeypatch.setattr("bot.shadow.ShadowAccount", _Shadow)
+    r = agent_alpha_gate(j)
+    assert r.passed is True, r.summary
+    assert "positive edge" in r.summary

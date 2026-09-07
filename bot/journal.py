@@ -261,15 +261,18 @@ class TradeJournal:
                     SELECT COUNT(*),
                            COALESCE(SUM(simulated_pnl), 0),
                            AVG(benchmark_return),
-                           SUM(CASE WHEN simulated_pnl > 0 THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN simulated_pnl > 0 THEN 1 ELSE 0 END),
+                           AVG(CASE WHEN entry_price > 0 AND closed_price > 0
+                                    THEN (closed_price - entry_price) / entry_price END)
                     FROM proposals
                     WHERE source='ai_agent' AND exec_status='evaluated'
                 """).fetchone()
-                total, pnl, benchmark, wins = row
+                total, pnl, benchmark, wins, avg_return = row
                 return {
                     "evaluated": int(total or 0),
                     "net_pnl": float(pnl or 0.0),
                     "avg_benchmark_return_pct": float(benchmark or 0.0) * 100,
+                    "avg_return_pct": float(avg_return or 0.0) * 100,
                     "win_rate_pct": (float(wins or 0) / total * 100) if total else 0.0,
                 }
         except Exception as e:
