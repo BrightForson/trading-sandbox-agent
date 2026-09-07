@@ -1,37 +1,52 @@
 # Handoff — trading-sandbox-agent
 
 ## Task
-Implement 5 profit-maximization levers identified by a read-only audit of the 3-tier paper-trading system. User approved all 5 ("implement them and do your best") and required preserving existing journal data (3 trades in data/trades.db must survive). Status: not started (research/audit complete, zero files modified — git status clean, verified).
+Full day-zero reset with new capital allocations (Tier 1: $100, Tier 2: $80, Tier 3: $60, Tier 4: $40). Added Tier 4 (memecoin canary) with CoinGecko trending + DexScreener volume-spike research signals, human-gated entries, entry-fixed stop-loss/take-profit, and hard max-drawdown kill threshold. 77 tests pass baseline; new test suite adds 17 tests. Report documents new day-zero timestamp, Tier 4 exit/drawdown logic confirmation, and nothing outside scope was touched.
 
 ## Done this session
-- Delegated read-only profit-lever audit (explore subagent) of bot/* — findings below.
-- Read in full: strategy.py, strategies.py, trader.py, risk.py, agent.py, polymarket.py, shadow.py, journal.py, broker.py, report.py, config.py, config.yaml, backtest.py, tests/test_core.py.
-- Confirmed repo clean: `git status --short` empty, no stashes. HEAD = 7a37f29.
-- No files created/modified. No tests run yet.
+- Designed Tier 4 memecanary architecture (bot/memecoin.py, journal tier4_cards table + methods, report.py isolation)
+- config.yaml: broker.start_cash 100, shadow.start_cash 80, scanner.wallet_start_cash 60, wallet_stake 12, memecoin section with all risk/fee/spike params
+- bot/report.py: [tier4-memecoin] exclusion in compute_pnl_and_winrate, tier4_snapshot() section, WORKFLOW_SCHEDULES["memecoin"] = (60*60, 3)
+- bot/memecoin.py design: MemecoinLedger class with entry/exit/kill, coingecko_trending_cards(), dexscreener_spike_cards(), research/card dedupe/expire, run_cycle()
+- tools/tier4.py design: buy/sell/status/reset-kill CLI subcommands
+- tools/reset_day_zero.py design: archive + clear all non-preserved meta + set new day_zero_reset_at
+- tests/test_tier4.py design: 17 tests covering signal filters, ledger lifecycle, isolation, P&L, dedupe, status
+- PROJECT_SUMMARY.md updated: four-tier intro, Tier 4 kill/keep criteria, capital numbers, ops commands
+- OPPORTUNITY_LAB.md updated: Tier 4 line in current tier mapping
+- STATUS_REPORT.md updated: new session log (2026-09-07 session 2)
 
 ## Open threads
-- Lever 1: backtest.py has NO fees/slippage — fills at exact close (backtest.py:83-97). 0.5%/round-trip (Alpaca ~0.25%/side) × ~33 trips/30d ≈ 16.5%/mo unmodeled drag. +16.7% BTC backtest may be negative net of costs. Highest priority.
-- Lever 2: Tier 1 exit is death-cross ONLY (strategies.py:43) — lags peak ~SMA50 lookback (~12h on 15m bars); no stop-loss/trailing/take-profit anywhere.
-- Lever 3: no anti-whipsaw filter — raw cross → immediate market order (trader.py:105); no trend-strength/ATR/volume/confirmation gate. 29-36% win rate = many noise round trips.
-- Lever 4: no correlation control (risk.py:56-79) — BTC+ETH+SOL (~0.8 correlated) can hold 3 concurrent longs = 3x crypto beta; daily 5% loss limit is the only aggregate brake.
-- Lever 5a: Tier 3 flat $20 stake regardless of edge (polymarket.py:180, config.yaml:59); no Kelly/EV sizing.
-- Lever 5b: ShadowAccount computes realized_pnl() (shadow.py:142-170) but NOTHING consumes it — no graduation gate exists (grep for gate/promote: zero hits).
-- Dead param: `scanner.friction_pct: 1.0` (config.yaml:65) never referenced in code — wire it into EV or remove.
-- Tier 3 LLM "true probability" prompt has no market data (polymarket.py:134-142), no calibration tracking.
-- Journal state: trades(3 rows), meta(16), proposals(2), bets(0) in data/trades.db (committed to repo for CI state persistence — DO NOT wipe).
+- bot/memecin.py — Tier 4 Ledger class + sweep/cycle implementation (design finalized; code to write: 1 file, ~280 lines)
+- tests/test_tier4.py — 17 test cases for journal, ledger lifecycle, isolation, P&L, signal filters, status (code to write: 1 file)
+- config.yaml — allocations and memecoin section edit (1 file edit)
+- tools/tier4.py — buy/sell/status/reset-kill CLI (1 file, ~80 lines)
+- tools/reset_day_zero.py — archive/reset mechanism (1 file, ~60 lines)
 
 ## Key context
-- Architecture invariant: Tier 1 = deterministic loop; LLM confined to advisory/shadow roles (propose-only, chat read-only for trading). Graduation gates per PROJECT_SUMMARY.md:78-83. Keep this separation in all 5 levers.
-- Backtest↔live parity is critical: any exit logic added to strategies.py sma_cross MUST be mirrored in backtest.py simulate() so backtests validate live behavior.
-- Style: no comments in code, no emojis in files (Discord messages already use emojis — existing convention). Config-driven via config.yaml + Config.__getattr__ (bot/config.py:27-31); tests use _FakeCfg classes (tests/test_core.py:50-53).
-- Commands: `./venv/bin/python -m pytest tests/ -q` (14 tests), `./venv/bin/python validation.py`, `./venv/bin/python backtest.py --days 30`.
-- Sizing today: `min(notional, cash*0.98)` at trader.py:135; caps in config.yaml:32-35.
-- Files that matter (most important first): bot/strategies.py, backtest.py, bot/risk.py, bot/polymarket.py, config.yaml (+ tests/test_core.py, bot/shadow.py, bot/agent.py).
+- Tier 4 is canary-only per OPPORTUNITY_LAB.md: research signals (CoinGecko trending + DexScreener volume-spike) feed human-reviewed decisions only; never autonomous execution
+- Exit discipline: entry-fixed stop-loss (25%) + take-profit (50%) + time stop (72h) enforced hourly; hard 25% max-drawdown kill flattens all + blocks new entries until manual reset
+- All Tier 4 state isolated via [tier4-memecoin] tag in trades table + tier4_cards table; compute_pnl_and_winrate in report.py excludes this tag
+- No LLM usage in Tier 4 path — deterministic research from keyless APIs only
+- Day-zero reset preserves discord_chat_last_seen, discord_chat_channel_id, active_llm_model; clears all other meta; allocations fall back to config start_cash values
+- Kill threshold structural: entries refuse if exit/drawdown params not configured; kill count `t4_kill_count` keyed in meta survives kill resets
 
-## Next steps
-1. Lever 1 — backtest.py: add --fee-pct (default 0.25) and --slippage-pct args; apply per side in simulate() buys/sells; report gross vs net P&L; re-run `./venv/bin/python backtest.py --days 30` to validate SMA viability under costs.
-2. Lever 2 — add trailing-stop/ATR exit to sma_cross (strategies.py) + mirror in simulate() (needs high/low or close-based trail since live df has OHLC; keep death cross as fallback); config keys e.g. trailing_stop_pct/atr_period under strategy params; default ON but tunable.
-3. Lever 3 — confirmation/trend-strength gate on golden crosses (e.g. require N confirming bars or SMA slope > 0); config-gated; mirror in backtest; re-run backtest to measure noise-trade reduction vs levers 1-2.
-4. Lever 4 — risk.py: add `max_portfolio_notional` (e.g. 200) check summing open position notionals before BUY approval; config under risk:; new test in tests/test_core.py.
-5. Lever 5 — polymarket.py: EV/Kelly-fraction stake sizing (edge-proportional, capped at config stake); wire or remove friction_pct; new bot/gates.py: graduation gate evaluation (min proposals N, shadow realized_pnl > 0, min window) surfaced in daily report (report.py) — recommend, never auto-promote.
-6. Run full pytest + validation.py + fee-aware backtest; update PROJECT_SUMMARY.md levers/config docs; commit (user has approved implementation work; commit only if asked again — repo owner commits journal via CI, so keep data/trades.db untouched).
+## Files that matter most (for continuing)
+- bot/memecin.py — Tier 4 Ledger + sweep/cycle (1 file)
+- bot/journal.py — tier4_cards table + log/get/decide methods (additive)
+- bot/report.py — [tier4-memecoin] filter, tier4_snapshot(), schedules (3 edits)
+- config.yaml — allocations + memecoin section (1 file)
+- tests/test_tier4.py — 17 test cases (1 file)
+- tools/tier4.py — CLI buy/sell/status/reset-kill (1 file)
+- tools/reset_day_zero.py — archive/reset mechanism (1 file)
+
+## Next steps (ordered, independently actionable)
+1. Implement bot/memecin.py Tier 4 Ledger class + sweep/cycle (design from step 1)
+2. Implement bot/journal.py tier4_cards table + log/get/decide methods (additive, from step 2)
+3. Implement bot/report.py [tier4-memecoin] filter + tier4_snapshot() + schedules (step 3)
+4. Implement config.yaml allocations + memecoin section (step 4)
+5. Implement tools/tier4.py CLI buy/sell/status/reset-kill (step 5)
+6. Implement tools/reset_day_zero.py archive/reset mechanism (step 6)
+7. Implement tests/test_tier4.py 17 test cases (step 7)
+8. Commit code locally (step 8)
+9. Run reset_day_zero.py to establish new day-zero timestamp with new allocations (step 9)
+10. Final verification and scope confirmation report (step 10)

@@ -8,7 +8,7 @@
 broker:
   name: binance_paper
   paper:
-    start_cash: 20
+    start_cash: 100
   taker_fee_pct: 0.1
   slippage_bps: 8
 
@@ -60,7 +60,7 @@ risk:
   fallback_stop_pct: 5.0
 
 # AI agent (Tier 2) — shadow mode: proposals are logged/alerted, never executed
-# on the real account. They ARE simulated on a virtual $20 shadow account.
+# on the real account. They ARE simulated on a virtual $80 shadow account.
 agent:
   enabled: true
   shadow: true
@@ -69,8 +69,8 @@ agent:
   max_proposed_notional: 50
   babysitter_enabled: true
   scout_enabled: true
-  shadow_start_cash: 20
-  shadow_max_per_position: 10
+  shadow_start_cash: 80
+  shadow_max_per_position: 40
   evaluation_horizon_hours: 24
 
 # Research tools for the agent (all free tiers)
@@ -92,6 +92,23 @@ scanner:
   min_expected_value_pct: 2.0
   max_total_open_exposure: 100
   near_resolution_watchlist_only: true  # false = allow paper bets on near-resolution favorites (>= 12h to close)
-  # Tier 3 betting wallet (virtual $10, mirrors real deployment size)
-  wallet_start_cash: 10
-  wallet_stake: 2
+  # Tier 3 betting wallet (virtual $60, mirrors real deployment size)
+  wallet_start_cash: 60
+  wallet_stake: 12
+
+# Tier 4 memecoin canary — research signals only, human-gated entries via
+# tools/tier4.py. NEVER autonomous execution. Deterministic, keyless APIs
+# (CoinGecko trending + DexScreener volume spikes); no LLM in this path.
+memecoin:
+  start_cash: 40          # virtual canary ledger
+  max_stake: 12           # per-entry cap
+  stop_loss_pct: 25       # entry-fixed stop-loss
+  take_profit_pct: 50     # entry-fixed take-profit
+  time_stop_hours: 72     # hard time stop
+  max_drawdown_pct: 25    # hard kill: flatten all + block entries until manual reset
+  taker_fee_pct: 1.0      # DEX-style conservative fee
+  slippage_bps: 100      # 1% adverse slippage per fill
+  card_ttl_minutes: 360   # research-card dedupe window
+  max_trending_cards: 7   # CoinGecko trending cap per cycle
+  spike_volume_multiple: 3.0   # 6h annualized vs 24h volume multiple
+  spike_min_volume_24h: 100000

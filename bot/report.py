@@ -13,7 +13,8 @@ def compute_pnl_and_winrate(trades):
     Matches each BUY with the next SELL for the same symbol.
     Non-filled order records (status != 'filled', e.g. journaled cancels/
     expires) are skipped so they never distort FIFO matching.
-    Shadow-account virtual trades ([shadow-account] reasoning) are excluded:
+    Shadow-account virtual trades ([shadow-account] reasoning) and Tier 4
+    canary virtual trades ([tier4-memecoin] reasoning) are excluded:
     this scorecard measures the Tier 1 strategy's paper performance only.
     :param trades: list of tuples (id, timestamp, symbol, action, qty, price, reasoning[, ...])
     :return: dict with total_pnl, win_rate, num_trades, num_losing, num_winning
@@ -38,6 +39,8 @@ def compute_pnl_and_winrate(trades):
             _, timestamp, symbol, action, qty, price, reasoning, *_ = trade
             if "[shadow-account]" in (reasoning or ""):
                 continue  # virtual Tier-2 trades, not Tier-1 strategy fills
+            if "[tier4-memecoin]" in (reasoning or ""):
+                continue  # virtual Tier-4 canary trades, isolated ledger
             status = str(trade[9]) if len(trade) > 9 and trade[9] is not None else "filled"
             if status != "filled":
                 continue
@@ -185,6 +188,30 @@ def tier3_wallet_snapshot():
         return f"Tier 3 wallet snapshot unavailable: {e}"
 
 
+def tier4_snapshot():
+    """Tier 4 memecoin canary section (virtual ledger, human-gated only)."""
+    try:
+        from bot.config import config
+        from bot.memecoin import MemecoinLedger
+        ledger = MemecoinLedger(config)
+        v = ledger.valuation()
+        net = v["equity"] - ledger.start_cash
+        cards = ledger.journal.get_tier4_cards(status="fresh")
+        lines = [f"Tier 4 Memecoin Canary (virtual ${ledger.start_cash:.0f}, "
+                 f"human-gated entries only):",
+                 f"- {ledger.status_line()}",
+                 f"- Net P&L: {'+' if net >= 0 else '-'}${abs(net):.2f}",
+                 f"- Fresh research cards: {len(cards)} (CoinGecko trending + "
+                 f"DexScreener volume spikes; research only, never auto-executed)"]
+        if ledger.kill_active():
+            reason = ledger.journal.get_meta("t4_kill_reason") or "unknown"
+            lines.append(f"- KILL ACTIVE: {reason} — entries blocked until "
+                         f"manual reset (tools/tier4.py reset-kill)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Tier 4 canary snapshot unavailable: {e}"
+
+
 def experiment_scorecards():
     """Deterministic evaluation of AI proposals and paper prediction bets."""
     try:
@@ -208,6 +235,7 @@ WORKFLOW_SCHEDULES = {
     "chat": (15 * 60, 2),
     "agent": (60 * 60, 3),
     "scanner": (6 * 60 * 60, 12),
+    "memecoin": (60 * 60, 3),
     "report": (24 * 60 * 60, 30),
 }
 
@@ -298,6 +326,8 @@ def create_daily_report():
 
 {tier3_wallet_snapshot()}
 
+{tier4_snapshot()}
+
 {experiment_scorecards()}
 
 {actions_health()}
@@ -333,6 +363,8 @@ for SMA20/SMA50 crossovers and will act on the first signal.
 {shadow_snapshot()}
 
 {tier3_wallet_snapshot()}
+
+{tier4_snapshot()}
 
 {experiment_scorecards()}
 

@@ -73,6 +73,17 @@ class TradeJournal:
                         equity REAL NOT NULL
                     )
                 """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tier4_cards (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        name TEXT,
+                        detail TEXT,
+                        status TEXT NOT NULL DEFAULT 'fresh'
+                    )
+                """)
                 self._ensure_columns(cursor, "trades", {
                     "fee": "REAL NOT NULL DEFAULT 0",
                     "order_id": "TEXT",
@@ -394,3 +405,56 @@ class TradeJournal:
                 return cursor.fetchall()[::-1]
         except Exception as e:
             raise JournalError(f"Failed to retrieve wallet snapshots: {e}")
+
+    # ---------------- tier 4 research cards ----------------
+
+    def log_tier4_card(self, timestamp, kind, symbol, name, detail, status="fresh"):
+        """Log a Tier 4 memecoin research card (human-review input only)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO tier4_cards (timestamp, kind, symbol, name, detail, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (timestamp, kind, symbol, name, detail, status))
+                conn.commit()
+        except Exception as e:
+            raise JournalError(f"Failed to log tier4 card: {e}")
+
+    def get_tier4_cards(self, status="fresh"):
+        """Recent research cards; default: fresh (not expired/shown).
+        Pass status=None for all rows regardless of status."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                if status is not None:
+                    cursor.execute(
+                        "SELECT * FROM tier4_cards WHERE status=? ORDER BY timestamp DESC",
+                        (status,))
+                else:
+                    cursor.execute("SELECT * FROM tier4_cards ORDER BY timestamp DESC")
+                return cursor.fetchall()
+        except Exception as e:
+            raise JournalError(f"Failed to retrieve tier4 cards: {e}")
+
+    def has_tier4_card(self, kind, symbol, status="fresh"):
+        """True if a card with this (kind, symbol) exists in the given status."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM tier4_cards WHERE kind=? AND symbol=? AND status=? LIMIT 1",
+                    (kind, symbol, status or "fresh"),
+                ).fetchone()
+                return row is not None
+        except Exception as e:
+            raise JournalError(f"Failed to check tier4 card: {e}")
+
+    def expire_tier4_card(self, card_id):
+        """Mark a card as expired (dedupe bookkeeping; history preserved)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("UPDATE tier4_cards SET status='expired' WHERE id=?",
+                             (card_id,))
+                conn.commit()
+        except Exception as e:
+            raise JournalError(f"Failed to expire tier4 card: {e}")

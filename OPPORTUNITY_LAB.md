@@ -129,6 +129,9 @@ liquidity failure, or negative out-of-sample result is hit.
 - **Tier 3:** prediction-market research. Near-resolution favorites are a
   watchlist; only friction-adjusted expected-value hypotheses may enter paper
   testing.
+- **Tier 4:** memecoin canary research (CoinGecko trending + DexScreener
+  volume spikes). Human-gated virtual entries only; never autonomous
+  execution.
 
 Memecoins, social-token ideas, or other highly speculative assets are canary
 research only. They cannot be promoted from popularity, a social signal, or an
