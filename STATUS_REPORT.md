@@ -95,5 +95,50 @@ New `bot/memecoin.py` (`MemecoinLedger`) + `bot/journal.py` tier4_cards table + 
 ## 14. Bottom line (session 2)
 
 - Tier 4 canary: built, tested (96/96), committed, day-zero verified
-- New allocations: reset, archived, timestamped
-- Outstanding: push to origin (still blocked on gh auth)
+- Outstanding at the time: push to origin (blocked on gh auth)
+
+## 15. Follow-ups — done (session 3)
+
+### Push
+`gh auth` recovered on its own. All 10 pending commits pushed (`31997a3..a3c2ce7`), then the follow-up commits (`bd1158c` memecoin workflow, docs) — origin/main is current. Verified `gh workflow list` shows the new `memecoin` workflow registered and active.
+
+### Tier 4 Actions workflow (commit `bd1158c`)
+`.github/workflows/memecoin.yml` — hourly at `:37` (offset from other crons), 15-min timeout, concurrency-grouped, journal committed via the lossless `safe_commit.sh` merge. **No-execution guarantee, verified by source inspection:** the workflow's only run command is `python tools/tier4.py cycle`, which maps to `MemecoinLedger.run_cycle()` — that method calls only `sweep()` (SL/TP/time-stop/drawdown checks on open positions, which only ever `_sell_position`) plus the two research-card generators (CoinGecko trending, DexScreener spikes). `buy` is a separate CLI subcommand the workflow never invokes. All entries remain manual via `tools/tier4.py buy`, consistent with the canary-only design in OPPORTUNITY_LAB.md. Also added: swept exits and kill events now send Discord notifications from `run_cycle()` (a 3am stop-loss was previously silent). Tests still 96/96.
+
+## 16. Chat-reply delay diagnosis — measured (session 3)
+
+**Complaint:** 10-15 min message-reply delays. Question: Actions slowness vs something else?
+
+**Live pain-meter reading at diagnosis time:** `⚠ INVESTIGATE` — `trade: STALLED`, `chat: STALLED`, agent/scanner/report ok, memecoin awaiting first run.
+
+**Raw measurements (Actions API, complete run history Sep 5 → Sep 7):**
+
+| Metric | chat | trade | report |
+|---|---|---|---|
+| Queue time (created → run_started) | **0s, every run** | 0s | 0s |
+| Run duration | 21-45s (avg 26s) | similar | similar |
+| Failures | **0/18** | 0/17 | 0/3 |
+| Runs vs cron request | **~5-9/day vs 96 requested** | ~5-8/day vs 96 | 3/3 days (100%) |
+| Inter-run gap | avg **183 min** (95-379) | avg 195 min | ~24h, correct |
+
+**Findings:**
+
+1. **Not queue backlog** — created == run_started on 100% of runs. Once GitHub creates a scheduled run, it starts instantly.
+2. **Not run duration or failures** — 26s average, zero failures. When a run happens, it's fast and healthy. LLM latency (seconds) is likewise exonerated.
+3. **The scheduler simply never creates most runs.** The 15-min crons (`*/15` trade, `9,24,39,54` chat = 96/day each) are being collapsed to ~6-8% of requested runs, continuously since Sep 5.
+4. **The Sep 7 "stall" was not a one-off 3-hour blip — it's the chronic condition.** The pain-meter caught one window of it; the full history shows every day looks like that. Max observed gap: 379 min (8× the 45-min STALLED threshold).
+
+**Reply-latency math:** a message arriving at a random minute waits, on median, half the inter-run gap ≈ **~92 min**, not 0-15 min. The observed 10-15 min replies happen only when a message lands just before a scheduled run that actually fires.
+
+**Verdict on migration thresholds: YES — explicitly past them, chronically.** The pain-meter's STALLED threshold is age > interval × (grace+1) = 45 min for chat/trade; both are past it at essentially every measurement, by up to 8×. This is the known high-frequency-cron quirk from §3, now measured as systemic rather than episodic.
+
+**Options (not yet implemented — owner decision required):**
+- **(a)** External `workflow_dispatch` pinger (e.g., a free uptime service hitting the dispatch API every 15 min) — keeps Actions hosting, bypasses scheduler laziness.
+- **(b)** Consolidate chat to hourly — simple, but accepts up to 60-min reply latency; defeats the purpose of two-way chat.
+- **(c) Recommended:** move the chat poller off Actions entirely (local box/VPS running `run_chat.py` on its own 15-min loop, journal still committed via git). Every other workflow tolerates scheduler sloppiness; chat is the only latency-sensitive one.
+
+## 17. Bottom line (session 3)
+
+- Pushed: all commits on origin/main; memecoin workflow registered and active
+- Memecoin workflow: research + exit-sweep only; entries provably manual-only; exit/kill notifications added
+- Chat delay: root cause measured and confirmed — chronic GitHub scheduler under-delivery on 15-min crons (183-min avg gap, 0s queue, 0% failures). LLM and queue backlog exonerated. Fix options (a)/(b)/(c) above await owner decision.
