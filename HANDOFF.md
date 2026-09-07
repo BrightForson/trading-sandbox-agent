@@ -1,42 +1,33 @@
 # Handoff — trading-sandbox-agent
 
 ## Task
-Full day-zero reset with new capital allocations (Tier 1: $100, Tier 2: $80, Tier 3: $60, Tier 4: $40). Added Tier 4 (memecoin canary) with CoinGecko trending + DexScreener volume-spike research signals, human-gated entries, entry-fixed stop-loss/take-profit, and hard max-drawdown kill threshold. **COMPLETE — 96/96 tests pass.**
+Day-zero reset with new allocations + Tier 4 memecoin canary: **COMPLETE and live.** Follow-ups (push, Tier 4 workflow, delay diagnosis, pinger): **COMPLETE.**
 
-## Done (session 3, 2026-09-07)
-- Implemented `bot/memecoin.py` — `MemecoinLedger` class: entry/exit/kill, `coingecko_trending_cards()`, `dexscreener_spike_cards()`, research-card dedupe/expire, `sweep()`, `run_cycle()`, `status_line()`
-- Implemented `bot/journal.py` tier4_cards table + `log_tier4_card` / `get_tier4_cards` / `has_tier4_card` / `expire_tier4_card` methods (additive)
-- Implemented `bot/report.py` `[tier4-memecoin]` exclusion in `compute_pnl_and_winrate`, `tier4_snapshot()` section, `WORKFLOW_SCHEDULES["memecoin"] = (60*60, 3)`
-- Implemented `config.yaml`: broker.start_cash 100, agent.shadow_start_cash 80 (max/position 40), scanner.wallet_start_cash 60 + wallet_stake 12, full memecoin section (start_cash 40, max_stake 12, SL 25%, TP 50%, time stop 72h, max drawdown 25%, fees 1%, slippage 100bps)
-- Implemented `tools/tier4.py` — human-gated CLI (status/buy/sell/reset-kill/cycle)
-- Implemented `tools/reset_day_zero.py` — archive + clear + new day_zero_reset_at + preserve 4 meta keys
-- Implemented `tests/test_tier4.py` — 19 tests (2 more than planned: structural fail-closed + TTL expiry)
-- Ran day-zero reset: `2026-09-07T22:43:44Z`, archived to `data/archive/trades.db.pre-reset-2026-09-07T22-43-44Z`
-- Updated PROJECT_SUMMARY.md (four-tier intro, Tier 4 kill/keep criteria, ops commands), OPPORTUNITY_LAB.md (Tier 4 in current tier mapping), STATUS_REPORT.md (session 2 sections §11–§14)
-- All committed locally: `77a19d7` (Tier 4 canary), `9745ba0` (day-zero reset), `e4294c9` (STATUS_REPORT)
+## Current state (2026-09-08)
+- **All work pushed to origin/main** through `e616e03`. gh auth recovered; no push debt.
+- **96/96 tests pass** (`./venv/bin/python -m pytest tests/ -q`).
+- **Tier 4 canary live**: virtual $40, human-gated entries only via `tools/tier4.py buy`; hourly Actions workflow (`memecoin.yml`, `:37`) does research cards + exit sweep only — never entries (verified by source inspection + tests).
+- **Pinger LIVE on this machine**: crontab fires `workflow_dispatch` for chat + trade every 15 min (`~/.config/trading-pinger/pinger.sh`, token refreshed Sundays 04:00). Fixes GitHub's chronic scheduler under-delivery (measured: 183-min avg gaps, ~6-8% of requested runs; queue 0s, failures 0 — runs never created, STATUS_REPORT.md §16). First dispatches verified end-to-end (204 → completed/success).
+- Allocations: T1 $100 / T2 $80 / T3 $60 (+$12 stakes) / T4 $40. Day-zero: `2026-09-07T22:43:44Z`, archived under `data/archive/`.
 
-## Open threads
-- Push to origin blocked on gh auth keyring — run `gh auth login` then `git push origin main`
-- Optional: add a GitHub Actions workflow for the hourly memecoin cycle (schedule entry exists in pain-meter; no workflow file created — needs owner decision on hosting cadence)
+## If continuing
+1. Verify pinger health after a day: `tail ~/.config/trading-pinger/pinger.log` (expect HTTP 204 lines) + check the daily report's pain-meter reads `ok` for trade/chat. Run counts should approach 96/day each.
+2. Pinger pings only while this machine is awake. If it becomes unreliable, migrate to cron-job.org (cloud, free) — full instructions in PINGER_SETUP.md.
+3. `agent` (hourly) and `scanner` (6h) stay on native schedules — hourly+ cadences haven't shown under-delivery.
+4. Real-money day on Binance forces a non-US host anyway (geo) — that migration obsoletes the pinger. See STATUS_REPORT.md §16 venue table.
 
 ## Key context
-- Tier 4 is canary-only per OPPORTUNITY_LAB.md: research signals feed human-reviewed decisions only; never autonomous execution
-- Exit discipline: entry-fixed SL (25%) + TP (50%) + time stop (72h) enforced hourly; hard 25% max-drawdown kill flattens all + blocks new entries until `tools/tier4.py reset-kill`
-- All Tier 4 state isolated via `[tier4-memecoin]` tag in trades table + tier4_cards table; `compute_pnl_and_winrate` excludes this tag
-- No LLM in Tier 4 path — deterministic research from keyless APIs only
-- Day-zero reset preserves discord_chat_last_seen, discord_chat_channel_id, active_llm_model, t4_kill_count; allocations fall back to config start_cash values
-- Kill threshold structural: `MemecoinLedger.__init__` raises if exit/drawdown params ≤ 0 (fail-closed, never trades unprotected)
+- Tier 4 is canary-only per OPPORTUNITY_LAB.md: deterministic research (CoinGecko trending + DexScreener volume spikes, keyless, no LLM in path) feeds human-reviewed decisions; never autonomous execution.
+- Tier 4 exits: entry-fixed SL 25% / TP 50% / time stop 72h, hourly sweep; hard 25% drawdown kill flattens + blocks entries until `tools/tier4.py reset-kill`. Kill count survives resets (structural).
+- Tier 4 isolation: `[tier4-memecoin]` tag in trades table (excluded from Tier 1 P&L) + `tier4_cards` table.
+- Day-zero reset preserves: `discord_chat_last_seen`, `discord_chat_channel_id`, `active_llm_model`, `t4_kill_count`. Tool: `tools/reset_day_zero.py` (--dry-run supported).
+- `MemecoinLedger.__init__` raises if exit/drawdown params ≤ 0 — fail-closed, never trades unprotected.
 
-## Files that matter most (for continuing)
-- `bot/memecoin.py` — Tier 4 Ledger + sweep/cycle
-- `bot/journal.py` — tier4_cards table + methods
-- `bot/report.py` — tag filter + tier4_snapshot() + schedules
-- `config.yaml` — allocations + memecoin section
-- `tests/test_tier4.py` — 19 test cases
-- `tools/tier4.py` — CLI buy/sell/status/reset-kill
-- `tools/reset_day_zero.py` — archive/reset mechanism
-
-## Next steps (if continuing)
-1. `gh auth login` + `git push origin main` (3 commits pending)
-2. Decide on memecoin cycle hosting (Actions workflow `memecoin.yml` hourly, or manual `tools/tier4.py cycle`)
-3. Monitor first live `memecoin` pain-meter entry in the daily report
+## Files that matter
+- `bot/memecoin.py` — Tier 4 ledger + sweep/cycle
+- `tools/tier4.py` — human-gated CLI (status/buy/sell/reset-kill/cycle)
+- `tools/reset_day_zero.py` — archive + reset
+- `tests/test_tier4.py` — 19 tests
+- `~/.config/trading-pinger/` — pinger scripts + log (NOT in repo)
+- `PINGER_SETUP.md` — pinger ops + cron-job.org migration path
+- `STATUS_REPORT.md` §11–§17 — session 2/3 record incl. measured delay diagnosis
