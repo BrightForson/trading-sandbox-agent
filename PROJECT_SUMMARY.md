@@ -110,6 +110,40 @@ confirmed by paper execution.
 3. Tier 3: multi-week paper-bet record positive after settlement
 4. Chat is permanently read-only for trading decisions during experiment phase
 
+## Kill/keep criteria (per tier)
+
+Written 2026-09-07 (day zero). Every criterion is measured from the journal
+(`data/trades.db`), starting from the day-zero reset — pre-reset history is
+archived in `data/archive/` and does not count. "Drawdown" = account equity
+peak-to-trough on the relevant ledger. Verdicts are checked when the daily
+report runs; any KILL verdict must be acted on manually within a week.
+
+- **Tier 1 (SMA bot, $20 paper ledger)**
+  - KILL if net P&L < −20% of starting equity after ≥4 weeks of signals
+  - KILL if drawdown > 25% at any point, or > 2 consecutive losing weeks
+  - KILL if live paper results diverge from the 30-day backtest by > 2×
+    the backtest's own drawdown (strategy not doing what was modeled)
+  - KEEP if net P&L ≥ 0 after 4 weeks with all risk gates intact (no
+    bypassed blocks, every exit either stop- or signal-driven)
+- **Tier 2 (AI shadow agent, $20 virtual ledger)**
+  - KILL if < 10 proposals evaluated in 4 weeks (agent not producing) or
+    the agent-alpha gate stays red for 4 consecutive weeks
+  - KILL if net simulated P&L < −10% after ≥20 evaluated proposals, or
+    avg benchmark return ≥ agent return (coin-flipping vs BTC)
+  - KEEP if net simulated P&L > 0 after ≥20 evaluated proposals and
+    beats the BTC benchmark; then consider the semi-auto gate
+- **Tier 3 (Polymarket wallet, $10, epoch-aware)**
+  - KILL if wallet busts (equity < one $2 stake → `start_new_epoch()`),
+    twice within 8 weeks (a double bust in two epochs is a failed
+    edge, not bad luck)
+  - KILL if settled-bet win rate < 40% after ≥10 settled bets with
+    negative net P&L (fees are supposed to make favorites +EV)
+  - KEEP if epoch survives 8 weeks with positive net P&L
+- **Any tier**: kill immediately on unreconcilable ledger corruption,
+  silent risk-gate bypass, or execution without a journal record — those
+  are infrastructure failures, not strategy ones, and stop everything
+  until fixed (see the 2026-09-06 bug log for why).
+
 ## Ops commands
 
 ```bash
