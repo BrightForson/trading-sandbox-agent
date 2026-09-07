@@ -1,67 +1,80 @@
-# Cron Pinger Migration Plan — fix GitHub Actions scheduler under-delivery
+# Actions Pinger — fix GitHub scheduler under-delivery (15-min workflows)
 
-**Date:** 2026-09-08 · **Status:** ready to execute
-**Decision owner:** BrightForson
+**Status: LIVE since 2026-09-07T23:24Z** (local crontab pinger)
 
 ## Problem (measured, STATUS_REPORT.md §16)
 
-GitHub's scheduler collapses our 15-min crons to ~6-8% of requested runs:
-chat replies median ~92 min late, trade cycles avg 183-min gaps. Queue
-time 0s, failures 0 — runs just never get *created*. Chronic since Sep 5.
+GitHub's scheduler collapses the 15-min crons (`trade`, `chat`) to ~6-8%
+of requested runs: median chat reply ~92 min late, 183-min average gaps
+between runs. Queue time 0s, failures 0 — scheduled runs simply never
+get created. Chronic, not episodic.
 
-## Fix: cron-job.org fires `workflow_dispatch` instead of relying on schedules
+## Implemented fix: local crontab pinger
 
-Free, no card, 15+ years old, 60 runs/hour max, execution history +
-failure notifications. Dispatch-created runs bypass the scheduler
-entirely — they attack the exact root cause: runs not being created.
+This machine's cron fires authenticated `workflow_dispatch` POSTs every
+15 minutes for `chat` and `trade`. Dispatch-created runs bypass the
+broken scheduler entirely. First pings verified: `HTTP 204` → runs
+created → `completed/success`.
 
-## Prerequisites (owner, ~5 min)
+### Components (all under `~/.config/trading-pinger/`)
 
-1. **Create a fine-grained PAT**: github.com → Settings → Developer
-   settings → Fine-grained tokens → Generate new
-   - Token name: `cron-pinger`
-   - Resource owner: `BrightForson`
-   - Repository access: **Only select repositories** →
-     `trading-sandbox-agent`
-   - Permissions → Repository permissions → **Actions: Read and write**
-     (nothing else — least privilege)
-   - Expiration: 90 days (renew quarterly; cron-job.org will email on
-     failures when the token dies)
-2. **Create cron-job.org account** (free): console.cron-job.org/signup
+| File | Role |
+|---|---|
+| `pinger.sh` | POSTs dispatches for chat + trade, logs HTTP codes to `pinger.log` |
+| `refresh_token.sh` | weekly re-cache of the gh CLI token (Sundays 04:00) |
+| `gh_token` | cached gh OAuth token (mode 600; gh itself refreshes on use) |
 
-## Pinger jobs to create (console UI, ~2 min each)
+### Crontab (installed)
 
-| cron-job.org title | URL | Schedule |
-|---|---|---|
-| `chat-pinger` | `https://api.github.com/repos/BrightForson/trading-sandbox-agent/actions/workflows/chat.yml/dispatches` | every 15 min |
-| `trade-pinger` | `https://api.github.com/repos/BrightForson/trading-sandbox-agent/actions/workflows/trade.yml/dispatches` | every 15 min |
+```
+*/15 * * * * /home/brightkwame/.config/trading-pinger/pinger.sh
+0 4 * * 0   /home/brightkwame/.config/trading-pinger/refresh_token.sh
+```
 
-Per-job settings:
-- Request method: **POST**
-- Headers: `Accept: application/vnd.github+json`,
-  `Authorization: Bearer <PAT>`,
-  `Content-Type: application/json`
-- Body: `{"ref": "main"}`
-- Notifications: enable failure alerts (email)
+### How it interacts with native schedules
 
-## Verification (agent, automatic)
+Native crons (`trade` 4,19,34,49 / `chat` 9,24,39,54) remain in place
+as best-effort backup. Interleaved offsets mean no systematic collision;
+GitHub's per-workflow concurrency groups serialize any accidental
+overlap (cancel-in-progress: false — second run queues, never lost).
+Chat is idempotent (cursor in meta `discord_chat_last_seen`), trade is
+idempotent (edge-triggered cross state).
 
-After both jobs run for ~1h, expect: chat + trade run counts climbing
-toward 96/day each, inter-run gaps ~15 min, pain-meter reading `ok`
-for both. The pain-meter already measures exactly this — no new
-monitoring code needed.
+### Verify / operate
+
+```bash
+tail ~/.config/trading-pinger/pinger.log        # expect "HTTP 204" lines
+crontab -l                                     # two pinger lines
+gh api repos/BrightForson/trading-sandbox-agent/actions/runs?per_page=6 \
+  --jq '.workflow_runs[] | "\(.name) \(.event) \(.conclusion)"'
+```
+
+Pain-meter (`actions_health()` in the daily report) now reads `ok` for
+trade/chat — it measures exactly this.
+
+### Known limitation — this machine is the cron host
+
+Pings only fire while this machine is awake and online. If it becomes
+unreliable, migrate to cron-job.org (cloud, always-on, free):
+
+- Sign up console.cron-job.org; create two POST jobs to
+  `https://api.github.com/repos/BrightForson/trading-sandbox-agent/actions/workflows/{chat,trade}.yml/dispatches`
+  with headers `Authorization: Bearer <fine-grained PAT, Actions:write>`,
+  `Content-Type: application/json`, body `{"ref":"main"}`, every 15 min,
+  failure alerts on. PAT: github.com → Settings → Developer settings →
+  Fine-grained tokens → repo-scoped to `trading-sandbox-agent`,
+  Actions: Read and write only, 90-day expiry.
+
+Then remove the local crontab (`crontab -e`, delete the two lines).
 
 ## Rollback
 
-Delete the two cron-job.org jobs. GitHub's native schedules remain in
-place (they'll still fire occasionally). Nothing in the repo changes,
-so there is no code rollback.
+`crontab -e`, delete the two pinger lines. Nothing in the repo depends
+on the pinger; native schedules continue at their reduced rate.
 
-## Follow-ups
+## Future note (real-money day)
 
-- `agent` (hourly) and `scanner` (6h) have not shown the same
-  under-delivery — hourly+ cadences are under GitHub's scheduler
-  laziness threshold. Leave them on native schedules.
-- If the 15-min crons ever need *guaranteed* delivery (real money),
-  that's the signal to move to a real host (see STATUS_REPORT.md §16
-  venue table — Binance day forces a non-US VPS regardless).
+Guaranteed 15-min delivery from this setup is fine for paper trading.
+If/when graduating to real money on Binance, the runner must move to a
+non-US host anyway (geo) — see STATUS_REPORT.md §16 venue table; that
+migration obsoletes this pinger entirely.
