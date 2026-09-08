@@ -63,7 +63,14 @@ def interval_minutes(interval):
 
 
 def to_binance_symbol(symbol):
-    return SYMBOL_MAP.get(symbol, symbol.replace("/", ""))
+    # Binance spot quotes against USDT: any "BASE/USD" becomes "BASEUSDT".
+    # Slash-less inputs (e.g. memecoin tickers priced via CoinGecko instead)
+    # pass through untouched.
+    if symbol in SYMBOL_MAP:
+        return SYMBOL_MAP[symbol]
+    if symbol.endswith("/USD"):
+        return symbol[:-4] + "USDT"
+    return symbol.replace("/", "")
 
 
 def get_klines(symbol, interval="15m", limit=500, end_time=None):

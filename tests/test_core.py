@@ -729,6 +729,9 @@ def test_binance_interval_mapping():
     assert _interval_for(make_timeframe("1Day")) == "1d"
     assert to_binance_symbol("BTC/USD") == "BTCUSDT"
     assert to_binance_symbol("ETH/USD") == "ETHUSDT"
+    assert to_binance_symbol("XRP/USD") == "XRPUSDT"
+    assert to_binance_symbol("DOGE/USD") == "DOGEUSDT"
+    assert to_binance_symbol("PEPE") == "PEPE"
 
 
 # ---------------- polymarket exposure caps ----------------
