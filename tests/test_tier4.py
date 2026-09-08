@@ -491,6 +491,9 @@ def test_cooldown_expires_after_window(tmp_path):
 
 def _patch_pipeline(monkeypatch, dossier=None, history=None, pair=None):
     d = dossier if dossier is not None else _dossier()
+    if pair is None:
+        pair = {"liquidity_usd": 2_000_000, "pair_age_days": 400,
+                "volume_24h_usd": 5_000_000, "dex": "raydium"}
     monkeypatch.setattr(MemecoinLedger, "_coingecko_dossier",
                         lambda self, cid: d)
     monkeypatch.setattr(MemecoinLedger, "_coingecko_history",
@@ -538,8 +541,9 @@ def test_auto_entry_rug_guard_rejection_is_journaled(tmp_path, monkeypatch):
     led, j = _ledger(tmp_path)
     led.model = _FakeModel({"buy": True, "confidence": 0.9, "reason": "x"})
     _patch_pipeline(monkeypatch, dossier=_dossier(liquidity_usd=5_000,
-                                                  volume_24h_usd=10_000),
-                    pair=None)
+                                                  volume_24h_usd=10_000,
+                                                  pair_age_days=None),
+                    pair={})  # empty pair profile: liquidity/volume floors do the rejecting
     events = led._auto_entries([{"kind": "coingecko_trending", "symbol": "dogwifhat",
                                  "name": "dogwifhat", "detail": "t"}])
     assert events == []

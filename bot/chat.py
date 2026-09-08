@@ -56,7 +56,8 @@ def extract_channel_id(journal=None):
             journal.set_meta("discord_chat_channel_id", str(channel_id))
         return channel_id
     except Exception as e:
-        print(f"[discord-chat] webhook lookup failed: {e}")
+        from bot.notify import _mask_secrets
+        print(f"[discord-chat] webhook lookup failed: {_mask_secrets(e)}")
         return None
 
 
@@ -123,7 +124,7 @@ def _system_context(broker, cfg, journal):
     try:
         acct = broker.get_account()
         acct_block = (f"Equity ${float(acct.equity):,.2f}, Cash ${float(acct.cash):,.2f}, "
-                      f"Paper account, Alpaca")
+                      f"Paper account, Binance public data (simulated)")
     except Exception as e:
         acct_block = f"account unavailable ({e})"
     try:
@@ -188,7 +189,8 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
     try:
         msgs = _get_messages(channel_id, limit=20)
     except Exception as e:
-        print(f"[discord-chat] read failed: {e}")
+        from bot.notify import _mask_secrets
+        print(f"[discord-chat] read failed: {_mask_secrets(e)}")
         return
 
     last_seen = float(journal.get_meta(STATE_KEY) or 0)
@@ -227,7 +229,8 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
             )
             answer = (raw or "").strip()
         except Exception as e:
-            answer = f"(agent unavailable: {e})"
+            from bot.notify import _mask_secrets
+            answer = f"(agent unavailable: {_mask_secrets(e)})"
         _send_message(channel_id, answer[:1900])
         print(f"[discord-chat] answered {author}: {question[:60]}...")
 

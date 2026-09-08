@@ -1,23 +1,24 @@
-name: report
+name: tests
 
 on:
-  schedule:
-    # Daily report: 18:01 UTC (off the round minute)
-    - cron: '1 18 * * *'
-  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  report:
+  pytest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,11 +28,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate and send daily report to Discord
+      - name: Run test suite
         env:
           ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
           ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python run_report.py
+        run: python -m pytest tests/ -q
+        # conftest.py strips DISCORD_WEBHOOK_URL so tests can never post
+        # to the real channel; no webhook secret is injected here on purpose.

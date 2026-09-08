@@ -1,46 +1,37 @@
 # Handoff — trading-sandbox-agent
 
 ## Task
-Day-zero reset with new allocations + Tier 4 canary: **COMPLETE and live.** Follow-ups (push, Tier 4 workflow, delay diagnosis, pinger): **COMPLETE.** Brief money-first Discord messaging + widened Tier 2 scout universe: **COMPLETE, pushed.**
+Deep dive of the whole project (find bugs + pitch improvements), then fix P0: **COMPLETE.**
+Full findings catalog: `DEEP_DIVE_FINDINGS.md` (32 findings, severity + status per item).
 
-## Current state (2026-09-08)
-- **All work pushed to origin/main** through `2d5a8ac` ("Brief money-first Discord messages + widen Tier 2 scout universe").
-- **102/102 tests pass** (`./venv/bin/python -m pytest tests/ -q`).
-- **All Discord messages are now brief and money-first.** Format contract in `bot/brief.py`: every tier reports equity vs allocation with profit/loss emoji — e.g. `📈 Tier 3 Bets: $68.00 (was $60 → +$8.00 (+13.3%))`. Quiet tiers get ONE short line (`no open trades / no open bets / nothing held`); no SMA/price noise when flat. Heartbeat (`trader.py::send_heartbeat`) stacks all 4 tiers in one message, once per UTC hour. Event alerts are one-liners: `🟢 Tier 1 BUY: $32.50 of BTC/USD @ $98,000.00`, `🎯 Tier 3 bet: YES on "..." @ 98¢ ($12 in)`, `🏆 Tier 3 bet WON: ... — +$0.24`.
-- **Exhausted-cash suppression**: when the $80 Tier 2 ledger can't fund a scout BUY, the idea is STILL journaled + evaluated at its 24h horizon (info-gathering preserved), but Discord gets only `💵 Tier 2 AI: out of money — SYM idea saved, not filled`.
-- **Tier 2 scout universe widened**: `agent.scout_extra_universe` in config.yaml (XRP, DOGE, ADA, AVAX, LINK) — scout may propose beyond BTC/ETH/SOL, priced via the same keyless Binance public data; babysitter + Tier 1 execution stay hard-scoped to `symbols:`. `agent.scout_symbols` = Tier 1 + extras; `_validate` checks kind against the right universe.
-- **Tier 4 dedupe fix**: card TTL now measured from the NEWEST row per (kind, symbol) — `memecoin.py::_dedupe_and_log`.
-- **Pinger LIVE on this machine**: crontab fires `workflow_dispatch` for chat + trade every 15 min (`~/.config/trading-pinger/pinger.sh`). Fixes GitHub's chronic scheduler under-delivery (measured: 183-min avg gaps; queue 0s, failures 0 — runs never created, STATUS_REPORT.md §16).
-- Allocations: T1 $100 / T2 $80 / T3 $60 (+$12 stakes) / T4 $40. Day-zero: `2026-09-07T22:43:44Z`, archived under `data/archive/`.
+## Current state (2026-09-08, post-P0)
+- **150/150 tests pass** (was 127; +23 new: merge_db 3-way unit+e2e rebase-conflict, Tier 4 re-arm/rug-guard/LLM-schema/buy-cap/batch-dedupe, notify masking/429/summary-fallback). `./venv/bin/python -m pytest tests/ -q`
+- **`validation.py` ALL CHECKS PASSED** after the changes.
+- **P0a — CI state integrity FIXED**: `tools/safe_commit.sh` now resolves binary trades.db conflicts via index stages (`:1:` base / `:2:` upstream / `:3:` ours — ours is the merge destination); `tools/merge_db.py` does a true 3-way meta merge (both-changed ⇒ resolving run wins; tavily counters MAX; `tier4_cards` + `wallet_snapshots` added to the row union — they were lost wholesale before); merge failure aborts rebase (fail-closed); final push failure = `exit 1` + best-effort Discord alert (no more silent green data loss); `fetch-depth: 0` on all 6 workflows. E2e test reproduces the exact rebase conflict and proves both sides' rows AND concurrent meta updates survive.
+- **P0b — Tier 4 hotfixes**: kill auto-re-arm now runs BEFORE the kill check (was unreachable dead code); rug-guard rejects unknown pair age (fail-closed); LLM gate requires `isinstance(bool)` buy + numeric confidence (string "false"/"true" rejected); manual `buy()` enforces max_open_positions; batch card dedupe; case-normalized prechecks; prompt treats dossier text as data; `memecoin.yml` timeout 15→30 min.
+- **P0c — Security/CI hygiene**: `_mask_secrets` in `bot/notify.py` + `bot/chat.py` (webhook URL never printed); 429 Retry-After + bounded retries in `_post_chunk`; file fallback appends to `$GITHUB_STEP_SUMMARY` on CI; requirements.txt pinned (bounded) + pytest declared; `tests/conftest.py` COMMITTED (was untracked — fresh clones would have run tests against the real webhook); new `.github/workflows/tests.yml` runs the suite on push/PR; chat says "Binance public data (simulated)" not "Alpaca"; `.env` chmod 600.
 
 ## If continuing
-1. Watch the first day of brief messages on Discord: heartbeats should be ~5 short lines; any regression to verbose alerts means an alert path was missed (grep `send_notification` callers against `bot/brief.py` contract).
-2. Sizing answers given to user (keep): T1 = ATR-risk sizing, 0.5% equity risk/trade, $100 notional cap, max 3 positions, entry-fixed 3×ATR stop, NO take-profit (trend-following); T2 = $40/position cap, no SL (pure LLM measurement, user confirmed keep); T3 = $12 flat = 20% per bet; T4 = $12/30% per entry.
-3. Pinger pings only while this machine is awake. If unreliable, migrate to cron-job.org (cloud, free) — PINGER_SETUP.md.
-4. `agent` (hourly) and `scanner` (6h) stay on native schedules — hourly+ cadences haven't shown under-delivery.
-5. Real-money day on Binance forces a non-US host anyway (geo) — that migration obsoletes the pinger. See STATUS_REPORT.md §16 venue table.
-6. Verify pinger health after a day: `tail ~/.config/trading-pinger/pinger.log` (expect HTTP 204 lines) + pain-meter `ok` for trade/chat.
+1. **PUSH the P0 fixes** (`git add` everything incl. tests/conftest.py, tests/test_merge_db.py, tests/test_tier4_fixes.py, tests/test_notify_fixes.py, DEEP_DIVE_FINDINGS.md, .github/workflows/tests.yml) — the five journal workflows now rebase with the fixed script on their next run.
+2. **Watch the first day**: look for `resolved trades.db conflict` lines in Actions logs (now visible, previously silent), and the tests workflow's first green run.
+3. **Remaining findings (P1/P2) are cataloged in DEEP_DIVE_FINDINGS.md** with file:line evidence. Recommended next order:
+   - P1a: Tier 1 exit hardening — pending-exit intent flag (F12, whipsaw abandons missed death-cross exits), idempotency nonce for exits (F13, constant-reasoning suppression), `kill_switch` in reset_day_zero PRESERVED_META (F14), UTC timestamps (F15), risk-gate fail-closed (F18).
+   - P1b: chat hardening — owner allowlist, per-message checkpoint, ops grounding (F25).
+   - P2: Tier 4 ticker→coin-id resolution (F8, spike leg is dead code), stale-mark exclusion + price pacing (F9/F10), fee single-source-of-truth (F16), Tier 2 scout fixes (F20-F23), Tier 3 dead knobs/liquidity floor/event dedupe (F24), gates.py Tier 1/3/4 verdicts (F26), backtest parity (F27), report PAT (F29), journal infra (F30).
+4. Pinger unaffected (still fires workflow_dispatch for trade+chat; runs will now rebase safely).
+5. Rotate the Discord webhook if pre-fix CI logs may have captured the token (public logs, URL-embedded secret — cheap insurance).
 
 ## Key context
-- Tier 4 is canary-only per OPPORTUNITY_LAB.md: deterministic research (CoinGecko trending + DexScreener volume spikes, keyless, no LLM in path) feeds human-reviewed decisions; never autonomous execution.
-- Tier 4 exits: entry-fixed SL 25% / TP 50% / time stop 72h, hourly sweep; hard 25% drawdown kill flattens + blocks entries until `tools/tier4.py reset-kill`. Kill count survives resets (structural).
-- Tier 4 isolation: `[tier4-memecoin]` tag in trades table (excluded from Tier 1 P&L) + `tier4_cards` table.
-- Day-zero reset preserves: `discord_chat_last_seen`, `discord_chat_channel_id`, `active_llm_model`, `t4_kill_count`. Tool: `tools/reset_day_zero.py` (--dry-run supported).
-- `MemecoinLedger.__init__` raises if exit/drawdown params ≤ 0 — fail-closed, never trades unprotected.
-- Shadow/virtual trades tagged `[shadow-account]` / `[tier4-memecoin]` are excluded from Tier 1 P&L (`report.py::compute_pnl_and_winrate`).
-- Model rotation live: probe every 20h via `daily_health_check`, ranked failover chain (`nemotron-3-super-120b` → kimi-k3 → deepseek-v4-flash → …), switch announced to Discord, choice persisted in meta.
+- Merge destination rule: the RESOLVING run's journal always wins shared-key conflicts (it is the newest commit); row tables union by logical key; tavily counters take MAX.
+- `memecoin.yml` timeout is 30 min; worst-case cycle ~16 min (paced CG dossiers).
+- conftest.py double-guards tests (delenv + no-op patches every send_notification holder) — keep it committed forever.
+- Requirements are bounded pins (e.g. `openai>=3.7,<4`); venv has openai 3.7.0, pandas 3.0.5 — consistent.
 
 ## Files that matter
-- `bot/brief.py` — money-first message format contract (money_line, emoji_for)
-- `bot/trader.py` — heartbeat (all-tier brief block), Tier 1 execution alerts
-- `bot/agent.py` — Tier 2 scout/babysitter, exhausted-cash suppression, scout_symbols
-- `bot/shadow.py` — $80 virtual ledger (tradable = Tier 1 + scout extras)
-- `bot/polymarket.py` — Tier 3 scan/settle messages
-- `bot/memecoin.py` — Tier 4 ledger + sweep/cycle, dedupe fix
-- `tools/tier4.py` — human-gated CLI (status/buy/sell/reset-kill/cycle)
-- `tools/reset_day_zero.py` — archive + reset
-- `tests/test_core.py` — messaging/scout-universe/heartbeat tests
-- `tests/test_tier4.py` — 20 tests
-- `~/.config/trading-pinger/` — pinger scripts + log (NOT in repo)
-- `PINGER_SETUP.md` — pinger ops + cron-job.org migration path
-- `STATUS_REPORT.md` §11–§17 — session 2/3 record incl. measured delay diagnosis
+- `DEEP_DIVE_FINDINGS.md` — the full review: 32 findings, each with file:line, severity, status
+- `tools/safe_commit.sh`, `tools/merge_db.py` — state integrity (heavily rewritten)
+- `bot/memecoin.py` — P0b fixes at lines ~316 (buy cap), ~494 (age fail-close), ~537 (LLM schema), ~553 (re-arm order), ~870 (batch dedupe)
+- `bot/notify.py` — masking + 429 + GITHUB_STEP_SUMMARY
+- `.github/workflows/tests.yml` — new CI test workflow
+- `tests/test_merge_db.py`, `tests/test_tier4_fixes.py`, `tests/test_notify_fixes.py` — new test files
+- `PROJECT_SUMMARY.md` — bug log (fixed 2026-09-08) section appended
