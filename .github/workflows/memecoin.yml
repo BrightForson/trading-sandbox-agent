@@ -2,10 +2,8 @@ name: memecoin
 
 on:
   schedule:
-    # Tier 4 canary: hourly research-card refresh + exit-check sweep.
-    # Research/monitoring ONLY — this workflow can NEVER place a buy:
-    # it runs `tier4.py cycle` (sweep + card refresh) and nothing else.
-    # Entries stay human-gated via tools/tier4.py buy (OPPORTUNITY_LAB.md).
+    # Tier 4 canary: hourly sweep (deterministic exits) + research cards +
+    # gated auto-entries (dossier -> rug-guard -> LLM conviction gate).
     - cron: '37 * * * *'
   workflow_dispatch:
 
@@ -32,9 +30,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Tier 4 canary cycle (research + exit sweep only, no entries)
+      - name: Run Tier 4 canary cycle (sweep + research + gated auto-entries)
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: python tools/tier4.py cycle
 
       - name: Commit journal (lossless merge on conflict)

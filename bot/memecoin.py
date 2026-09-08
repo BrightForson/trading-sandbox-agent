@@ -1,24 +1,62 @@
-"""Tier 4 memecoin canary: research signals feed human-reviewed decisions only.
+"""Tier 4 memecoin canary: automated entries with full research and hard risk rails.
 
-Canary scope (per OPPORTUNITY_LAB.md): memecoins are canary research only.
-This module NEVER autonomously executes anything. Its job is:
+Evolution from the human-gated design (owner decision, 2026-09-08): this is a
+virtual $40 test ledger with no real money, so the tier now runs fully
+automated like the others. The owner explicitly opted in: "make it automated
+and like the rest, there should be thorough research about the coin about to
+be bought and everything before it is executed with stop loss and take profit
+and everything which is necessary or is recommended when trading memecoins."
 
-  1. research: CoinGecko trending + DexScreener volume-spike cards —
-     deterministic, keyless APIs, no LLM anywhere in the Tier 4 path
-  2. ledger: a virtual $40 canary ledger (memecoin.start_cash); entries
-     happen ONLY via the human-gated CLI (tools/tier4.py buy). Every
-     entry gets an entry-fixed stop-loss, take-profit and 72h time stop
-  3. sweep: an hourly deterministic check enforcing those exits, plus a
-     hard max-drawdown kill that flattens everything and blocks new
-     entries until a manual reset
+Pipeline per hourly cycle:
+
+  1. SWEEP (deterministic exits first): enforce per-position entry-fixed
+     stop-loss / take-profit, the new trailing stop, the peak-liquidity
+     partial take-profit, the 72h time stop, and the account 25%
+     max-drawdown kill. Exits are never delegated to the LLM.
+  2. RESEARCH (deterministic, keyless): CoinGecko trending cards +
+     DexScreener volume-spike cards; each candidate gets a deep DOSSIER:
+     CoinGecko market data (market cap rank, ATH + distance, liquidity/vol
+     proxies), a 30-day price history for trend/velocity, and (where found)
+     a DexScreener pair profile with liquidity, volume and age.
+  3. RUG-GUARD SCREEN (deterministic fail-closed filters, no LLM): minimum
+     age, minimum liquidity, minimum 24h volume, market-cap-rank ceiling,
+     symbol not already held / in the cooldown blacklist, max open positions,
+     and cash floor. A candidate failing ANY filter never reaches the LLM.
+  4. LLM CONVICTION GATE: the full dossier is handed to the tier-2 model
+     chain with a strict memecoin-risk rubric (momentum vs exhaustion,
+     liquidity exit capacity, holder concentration proxies, hype-vs-fundamentals,
+     rug signals). The model must return >= min_llm_confidence (0.75) to buy.
+     Model failure/unavailability = NO entry (fail-closed).
+  5. SIZED ENTRY: stake = base_max_stake * llm_confidence, capped at
+     max_stake and available cash; entry price carries DEX-style slippage
+     and fees. Stop-loss/take-profit/trailing-stop anchors are fixed at
+     entry. Every auto entry is journaled as a proposal (source=tier4,
+     kind=auto_entry) plus a virtual fill tagged [tier4-memecoin].
+
+Memecoin-specific risk rules baked in (the "recommended" checklist):
+  - hard stop-loss at entry (default -25%; memecoins routinely -80%)
+  - take-profit at entry (+50%) plus a trailing stop (default 20% trail
+    activating after +25% unrealized) so winners are never round-tripped
+  - partial profit taking at the first +80%: sell half, ride the rest
+  - 72h time stop: memecoin momentum decays fast; dead positions recycle
+  - entry cooldown (default 7 days) per symbol after ANY exit: a stopped
+    coin never gets re-bought into the same dead cat bounce
+  - 25% account drawdown kill: flatten all + cooldown (default 24h) before
+    auto entries resume; kills are permanent history (scorecard-visible)
+  - stake sizing by conviction: the LLM never sizes its own order; the
+    ledger derives stake from confidence with a hard cap
+  - dossier-only research: no TA-only gambling; the LLM sees liquidity,
+    age, volume, ATH distance and trend before it may say yes
 
 All state is isolated: virtual fills are logged to the trades table with
-a `[tier4-memecoin]` reasoning tag (excluded from Tier 1 P&L) and research
-cards go to the tier4_cards table. Prices come from the same keyless
-Binance public data when the symbol exists there, else CoinGecko simple
-price; both degrade gracefully.
+a `[tier4-memecoin]` reasoning tag (excluded from Tier 1 P&L), research
+cards live in the tier4_cards table, and auto entries are proposals with
+source='tier4' so the graduation scorecard can evaluate them later.
+Prices come from the same keyless Binance public data when the symbol
+exists there, else CoinGecko simple price; both degrade gracefully.
 """
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -28,11 +66,27 @@ from bot.journal import TradeJournal
 HEADERS = {"User-Agent": "Mozilla/5.0 (trading-sandbox-agent tier4 canary)"}
 COINGECKO_TRENDING_URL = "https://api.coingecko.com/api/v3/search/trending"
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+COINGECKO_COIN_URL = "https://api.coingecko.com/api/v3/coins"
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/search"
+
+# CoinGecko free tier rate-limits hard; pace dossier/history calls well
+# under the public cap so a 7-card cycle never trips 429s
+COINGECKO_MIN_INTERVAL_SECONDS = 12.0
+_last_coingecko_call = [0.0]
+
+
+def _pace_coingecko():
+    wait = (_last_coingecko_call[0] + COINGECKO_MIN_INTERVAL_SECONDS
+            - time.monotonic())
+    if wait > 0:
+        time.sleep(wait)
+    _last_coingecko_call[0] = time.monotonic()
 
 TIER4_TAG = "[tier4-memecoin]"
 KILL_META = "t4_kill"
 KILL_COUNT_META = "t4_kill_count"
+COOLDOWN_META = "t4_entry_cooldowns"
+PARTIAL_META = "t4_partial_taken"
 
 
 def _now_iso():
@@ -47,12 +101,14 @@ def _parse_ts(ts):
 
 
 class MemecoinLedger:
-    """Virtual $40 canary ledger. Human-gated entries, deterministic exits."""
+    """Virtual $40 canary ledger: automated entries behind a research
+    dossier + rug-guard screen + LLM conviction gate; deterministic exits."""
 
-    def __init__(self, cfg, journal=None):
+    def __init__(self, cfg, journal=None, model=None):
         self.cfg = cfg
         self.journal = journal or TradeJournal()
         m = getattr(cfg, "memecoin", None) or {}
+        self.model = model
         self.start_cash = float(m.get("start_cash", 40))
         self.max_stake = float(m.get("max_stake", 12))
         self.stop_loss_pct = float(m.get("stop_loss_pct", 25))
@@ -65,6 +121,21 @@ class MemecoinLedger:
         self.max_trending_cards = int(m.get("max_trending_cards", 7))
         self.spike_volume_multiple = float(m.get("spike_volume_multiple", 3.0))
         self.spike_min_volume_24h = float(m.get("spike_min_volume_24h", 100000))
+        # automation settings (owner opt-in 2026-09-08)
+        self.auto_entry = bool(m.get("auto_entry", True))
+        self.auto_cooldown_hours = float(m.get("auto_cooldown_hours", 24))
+        self.min_llm_confidence = float(m.get("min_llm_confidence", 0.75))
+        self.base_stake = float(m.get("base_stake", 6))
+        self.max_open_positions = int(m.get("max_open_positions", 3))
+        self.min_liquidity_usd = float(m.get("min_liquidity_usd", 250000))
+        self.min_volume_24h_usd = float(m.get("min_volume_24h_usd", 500000))
+        self.min_age_hours = float(m.get("min_age_hours", 168))
+        self.max_mcap_rank = int(m.get("max_mcap_rank", 300))
+        self.trailing_stop_pct = float(m.get("trailing_stop_pct", 20))
+        self.trailing_activate_pct = float(m.get("trailing_activate_pct", 25))
+        self.partial_tp_pct = float(m.get("partial_tp_pct", 80))
+        self.partial_tp_sell_frac = float(m.get("partial_tp_sell_frac", 0.5))
+        self.entry_cooldown_hours = float(m.get("entry_cooldown_hours", 24 * 7))
         self._check_exit_params()
 
     def _check_exit_params(self):
@@ -109,6 +180,30 @@ class MemecoinLedger:
         v = self.journal.get_meta("t4_peak_equity")
         return float(v) if v is not None else None
 
+    def _cooldowns(self):
+        raw = self.journal.get_meta(COOLDOWN_META)
+        try:
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _add_cooldown(self, symbol, hours):
+        cds = self._cooldowns()
+        cds[str(symbol).upper()] = _now_iso(), hours
+        # never grow unbounded: keep newest 200
+        items = sorted(cds.items(), key=lambda kv: kv[1][0], reverse=True)[:200]
+        self.journal.set_meta(COOLDOWN_META,
+                              json.dumps({k: list(v) for k, v in items}))
+
+    def _in_cooldown(self, symbol):
+        cd = self._cooldowns().get(str(symbol).upper())
+        if not cd:
+            return False
+        ts = _parse_ts(cd[0])
+        hours = float(cd[1] or self.entry_cooldown_hours)
+        return ts is not None and datetime.now(timezone.utc) - ts < timedelta(hours=hours)
+
     # ---------------- prices ----------------
 
     def price_for(self, symbol):
@@ -132,7 +227,7 @@ class MemecoinLedger:
             if symbol.lower() in data and "usd" in data[symbol.lower()]:
                 px = float(data[symbol.lower()]["usd"])
                 if px > 0:
-                    return px
+                    return float(px)
         except Exception:
             pass
         return None
@@ -174,8 +269,11 @@ class MemecoinLedger:
             return False
         return (peak - equity) / peak * 100 >= self.max_drawdown_pct
 
-    def _trigger_kill(self, reason):
-        """Hard kill: flatten everything, block new entries until manual reset."""
+    def _trigger_kill(self, reason, auto_rearm_hours=None):
+        """Hard kill: flatten everything, block new entries for a cooldown.
+        Automation makes kills self-healing: after auto_cooldown_hours the
+        cycle re-arms automatically (the tier is a no-real-money test ledger;
+        kills remain permanent history for the scorecard)."""
         count = self.kill_count() + 1
         self.journal.set_meta(KILL_META, "on")
         self.journal.set_meta(KILL_COUNT_META, str(count))
@@ -186,9 +284,20 @@ class MemecoinLedger:
                 self._sell_position(symbol, note="kill flatten")
             except Exception as e:
                 print(f"[tier4] kill flatten failed for {symbol}: {e}")
+        self._add_cooldown("__kill__", self.auto_cooldown_hours)
 
-    def reset_kill(self):
-        """Manual reset after a kill: re-arms entries with a fresh peak."""
+    def _auto_rearm_after_cooldown(self):
+        """If a kill is older than the auto cooldown, re-arm automatically."""
+        kill_at = _parse_ts(self.journal.get_meta("t4_kill_at"))
+        if kill_at is None:
+            return False
+        if datetime.now(timezone.utc) - kill_at >= timedelta(hours=self.auto_cooldown_hours):
+            self.reset_kill(quiet=True)
+            return True
+        return False
+
+    def reset_kill(self, quiet=False):
+        """Reset after a kill: re-arms entries with a fresh peak."""
         if not self.kill_active():
             return False, "no kill active"
         self.journal.set_meta(KILL_META, "off")
@@ -198,14 +307,14 @@ class MemecoinLedger:
         self.journal.set_meta("t4_peak_equity", str(round(v["equity"], 8)))
         return True, f"kill reset; canary equity ${v['equity']:.2f}, peak re-armed"
 
-    # ---------------- entries (human-gated only) ----------------
+    # ---------------- entries (automated, gated) ----------------
 
-    def buy(self, symbol, stake=None):
-        """Human-gated entry via CLI. Refuses under kill, insufficient cash,
-        duplicate symbol, or unpriceable symbols. Entry-fixed SL/TP/time stop."""
+    def buy(self, symbol, stake=None, reason="human-gated canary entry"):
+        """Virtual entry. Refuses under kill, insufficient cash, duplicate
+        symbol, or unpriceable symbols. Entry-fixed SL/TP/trailing/time stop."""
         symbol = str(symbol).upper()
         if self.kill_active():
-            return False, "kill active — entries blocked until manual reset (tools/tier4.py reset-kill)"
+            return False, "kill active — entries blocked until reset"
         if symbol in self._positions():
             return False, f"already holding {symbol}"
         price = self.price_for(symbol)
@@ -230,16 +339,319 @@ class MemecoinLedger:
             "entry": entry,
             "stop": entry * (1 - self.stop_loss_pct / 100.0),
             "take_profit": entry * (1 + self.take_profit_pct / 100.0),
+            "trailing_stop": None,  # armed by sweep after +activation
+            "partial_taken": False,
             "opened": _now_iso(),
         }
         self._save(cash - stake, positions)
-        self._log_trade(symbol, "BUY", qty, entry, note=f"human-gated canary entry")
+        self._log_trade(symbol, "BUY", qty, entry, note=reason)
         self._update_peak(self.valuation()["equity"])
         return True, (f"canary BUY {symbol}: ${stake:.2f} @ ${entry:.6f} (qty {qty:.6f}) | "
                       f"SL ${positions[symbol]['stop']:.6f} TP ${positions[symbol]['take_profit']:.6f} "
                       f"time stop {self.time_stop_hours:.0f}h")
 
-    def _sell_position(self, symbol, note=""):
+    # ---------------- automated entry pipeline ----------------
+
+    def _get_model(self):
+        if self.model is not None:
+            return self.model
+        from bot.models import ModelManager
+        return ModelManager(journal=self.journal)
+
+    def _coingecko_dossier(self, coin_id):
+        """Deep per-coin market data from CoinGecko /coins/{id} (keyless)."""
+        try:
+            _pace_coingecko()
+            resp = requests.get(
+                f"{COINGECKO_COIN_URL}/{coin_id}",
+                params={"localization": "false", "tickers": "false",
+                        "community_data": "false", "developer_data": "false"},
+                headers=HEADERS, timeout=15,
+            )
+            resp.raise_for_status()
+            d = resp.json()
+            md = d.get("market_data") or {}
+            at_top = (d.get("market_cap_rank") or 999999)
+            ath = float(md.get("ath", {}).get("usd") or 0)
+            cur = float(md.get("current_price", {}).get("usd") or 0)
+            ath_dist = ((cur / ath - 1) * 100) if (ath > 0 and cur > 0) else None
+            atl = float(md.get("atl", {}).get("usd") or 0)
+            from_atl = ((cur / atl - 1) * 100) if (atl > 0 and cur > 0) else None
+            return {
+                "coin_id": coin_id,
+                "name": d.get("name") or coin_id,
+                "symbol": (d.get("symbol") or "").upper(),
+                "mcap_rank": int(at_top) if isinstance(at_top, int) else None,
+                "price_usd": cur,
+                "market_cap_usd": float(md.get("market_cap", {}).get("usd") or 0),
+                "volume_24h_usd": float(md.get("total_volume", {}).get("usd") or 0),
+                "ath_usd": ath,
+                "ath_distance_pct": round(ath_dist, 1) if ath_dist is not None else None,
+                "from_atl_pct": round(from_atl, 1) if from_atl is not None else None,
+                "price_change_24h_pct": float(md.get("price_change_percentage_24h") or 0),
+                "price_change_7d_pct": float(md.get("price_change_percentage_7d_in_currency", {}).get("usd") or 0),
+                "genesis_date": d.get("genesis_date") or (d.get("watch_counter") and None),
+                "categories": [c for c in (d.get("categories") or []) if c][:4],
+            }
+        except Exception as e:
+            print(f"[tier4] dossier fetch failed for {coin_id}: {e}")
+            return None
+
+    def _coingecko_history(self, coin_id, days=30):
+        """30-day daily close series for trend/velocity context."""
+        try:
+            _pace_coingecko()
+            resp = requests.get(
+                f"{COINGECKO_COIN_URL}/{coin_id}/market_chart",
+                params={"vs_currency": "usd", "days": days, "interval": "daily"},
+                headers=HEADERS, timeout=15,
+            )
+            resp.raise_for_status()
+            prices = resp.json().get("prices") or []
+            closes = [float(p[1]) for p in prices if p[1] and p[1] > 0]
+            if len(closes) < 10:
+                return None
+            return {
+                "days": len(closes),
+                "first": closes[0],
+                "last": closes[-1],
+                "min": min(closes),
+                "max": max(closes),
+                "change_pct": (closes[-1] / closes[0] - 1) * 100 if closes[0] else 0,
+                "recent_closes": [round(c, 8) for c in closes[-10:]],
+            }
+        except Exception as e:
+            print(f"[tier4] history fetch failed for {coin_id}: {e}")
+            return None
+
+    def _dexscreener_pair(self, symbol):
+        """Best DexScreener pair profile for a base symbol (liquidity, age)."""
+        try:
+            resp = requests.get(
+                DEXSCREENER_URL,
+                params={"q": str(symbol)},
+                headers=HEADERS, timeout=15,
+            )
+            resp.raise_for_status()
+            pairs = resp.json().get("pairs") or []
+            if not pairs:
+                return None
+            best = None
+            for p in pairs:
+                try:
+                    liq = float(p.get("liquidity", {}).get("usd") or 0)
+                    if best is None or liq > best[0]:
+                        best = (liq, p)
+                except Exception:
+                    continue
+            if not best or not best[1]:
+                return None
+            p = best[1]
+            created_ms = p.get("pairCreatedAt") or 0
+            pair_created = (datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
+                            if created_ms else None)
+            age_days = ((datetime.now(timezone.utc) - pair_created).total_seconds() / 86400
+                        if pair_created else None)
+            txns = p.get("txns") or {}
+            h24 = txns.get("h24") or {}
+            h24_total = (float(h24.get("buys") or 0) + float(h24.get("sells") or 0)
+                         if isinstance(h24, dict) else float(h24 or 0))
+            fdv = float(p.get("fdv") or 0)
+            mcap = float(p.get("marketCap") or 0)
+            return {
+                "pair_age_days": round(age_days, 1) if age_days is not None else None,
+                "liquidity_usd": float(p.get("liquidity", {}).get("usd") or 0),
+                "volume_24h_usd": float(p.get("volume", {}).get("h24") or 0),
+                "volume_6h_usd": float(p.get("volume", {}).get("h6") or 0),
+                "volume_1h_usd": float(p.get("volume", {}).get("h1") or 0),
+                "price_change_24h_pct": float((p.get("priceChange") or {}).get("h24") or 0),
+                "price_change_1h_pct": float((p.get("priceChange") or {}).get("h1") or 0),
+                "txns_24h": h24_total,
+                "fdv_usd": fdv,
+                "mcap_usd": mcap,
+                "dex": (p.get("dexId") or "").lower(),
+            }
+        except Exception as e:
+            print(f"[tier4] dexscreener profile failed for {symbol}: {e}")
+            return None
+
+    def _rug_guard(self, dossier):
+        """Deterministic fail-closed filters: the LLM never sees unvetted coins.
+        Returns (ok, reasons_list)."""
+        reasons = []
+        mcap_rank = dossier.get("mcap_rank")
+        liq = float(dossier.get("liquidity_usd") or 0)
+        vol24 = float(dossier.get("volume_24h_usd") or 0)
+        age_days = dossier.get("pair_age_days")
+        if dossier.get("coin_id") in (None, ""):
+            reasons.append("no CoinGecko id")
+        if mcap_rank is None or mcap_rank > self.max_mcap_rank:
+            reasons.append(f"mcap rank {mcap_rank} > {self.max_mcap_rank}")
+        if liq < self.min_liquidity_usd:
+            reasons.append(f"liquidity ${liq:,.0f} < ${self.min_liquidity_usd:,.0f}")
+        if vol24 < self.min_volume_24h_usd:
+            reasons.append(f"24h volume ${vol24:,.0f} < ${self.min_volume_24h_usd:,.0f}")
+        if age_days is not None and age_days * 24 < self.min_age_hours:
+            reasons.append(f"pair age {age_days:.0f}d < {self.min_age_hours/24:.0f}d")
+        return (not reasons), reasons
+
+    def _llm_conviction(self, dossier, history, pair):
+        """LLM conviction gate on the full research dossier. Fail-closed:
+        any error -> (False, 0.0, reason). Returns (buy, confidence, reason)."""
+        try:
+            model = self._get_model()
+        except Exception as e:
+            return False, 0.0, f"model unavailable: {e}"
+        context = json.dumps({"dossier": dossier, "history_30d": history,
+                              "dex_pair": pair})
+        prompt = f"""You are a memecoin risk analyst for a virtual $40 test ledger.
+Evaluate this coin for a SMALL speculative entry (max $12). Memecoins are
+momentum assets that go to zero often: your job is to separate a tradeable
+momentum leg from an exit-liquidity trap or a rug.
+
+RESEARCH DOSSIER (deterministic data, verified):
+{context}
+
+RUBRIC — check each before answering:
+1. Momentum vs exhaustion: is the 24h/7d move early (room to run) or parabolic/exhausted (late)?
+2. Exit capacity: is liquidity >= several multiples of the stake? Thin liquidity means the stop-loss is fictional.
+3. Age & survival: has the pair/coin existed long enough (>7 days) to have survived at least one pump-dump cycle?
+4. Holder/hype quality: CoinGecko trending rank + volume profile — organic sustained interest or a single-hour spike?
+5. ATH distance: near ATH after a big run (risk) vs constructive recovery?
+6. Rug signals: extremely low mcap rank, near-zero liquidity, day-old pair.
+
+Respond with ONLY a JSON object:
+{{"buy": true|false, "confidence": 0.0-1.0, "reason": "<= 40 words citing the data"}}"""
+        try:
+            out = model.generate_json(prompt, max_tokens=300)
+        except Exception as e:
+            return False, 0.0, f"LLM call failed: {e}"
+        if not isinstance(out, dict):
+            return False, 0.0, "LLM response not a JSON object"
+        try:
+            conf = float(out.get("confidence", 0))
+        except (TypeError, ValueError):
+            return False, 0.0, "confidence not numeric"
+        if not 0.0 <= conf <= 1.0:
+            return False, 0.0, "confidence out of range"
+        buy = bool(out.get("buy", False))
+        reason = str(out.get("reason", ""))[:200]
+        if not buy:
+            return False, conf, f"LLM declined: {reason}"
+        if conf < self.min_llm_confidence:
+            return False, conf, f"confidence {conf:.2f} below threshold {self.min_llm_confidence}"
+        return True, conf, reason
+
+    def _auto_entries(self, cards):
+        """Research -> rug-guard -> LLM gate -> sized entry, for each card.
+        One entry per cycle max (momentum decisions, not spray)."""
+        events = []
+        if not self.auto_entry:
+            return events
+        if self.kill_active():
+            return events
+        if self._auto_rearm_after_cooldown():
+            try:
+                from bot.notify import send_notification
+                send_notification(
+                    f"🟢 Tier 4 Coins: kill cooldown elapsed — auto re-armed. "
+                    f"Peak reset to current equity.", self.cfg)
+            except Exception:
+                pass
+        if self.kill_active():  # still on (clock says cooldown not elapsed)
+            return events
+        positions = self._positions()
+        if len(positions) >= self.max_open_positions:
+            return events
+        v = self.valuation()
+        if v["cash"] < self.base_stake * 0.5:
+            return events
+        for card in cards:
+            coin_id = card.get("symbol")
+            if not coin_id:
+                continue
+            if self._in_cooldown(coin_id):
+                continue
+            if coin_id in positions:
+                continue
+            dossier = self._coingecko_dossier(coin_id)
+            if not dossier:
+                continue
+            ticker = dossier.get("symbol") or coin_id
+            pair = self._dexscreener_pair(ticker)
+            # exit-liquidity truth: the deepest DEX pool. Volume is a
+            # liquidity proxy when no pair profile exists (major CEX-only
+            # coins): allow the rug-guard to weigh it at half weight.
+            pair_liq = float((pair or {}).get("liquidity_usd") or 0)
+            vol24 = float(dossier.get("volume_24h_usd") or 0)
+            dossier["liquidity_usd"] = max(pair_liq, vol24 / 2.0)
+            dossier["pair_age_days"] = (pair or {}).get("pair_age_days")
+            dossier["dex"] = (pair or {}).get("dex")
+            history = self._coingecko_history(coin_id)
+            ok, reasons = self._rug_guard(dossier)
+            if not ok:
+                print(f"[tier4] rug-guard rejected {coin_id}: {'; '.join(reasons)}")
+                self.journal.log_proposal(
+                    timestamp=_now_iso(), source="tier4", kind="auto_entry",
+                    symbol=coin_id, action="BUY", notional=0.0, confidence=0.0,
+                    rationale=f"rug-guard rejected: {'; '.join(reasons)}",
+                    exec_status="rejected",
+                    context_json=json.dumps({k: dossier.get(k) for k in
+                                              ("mcap_rank", "liquidity_usd",
+                                               "volume_24h_usd", "pair_age_days")}))
+                continue
+            buy_ok, conf, reason = self._llm_conviction(dossier, history, pair)
+            if not buy_ok:
+                print(f"[tier4] LLM gate rejected {coin_id}: {reason}")
+                self.journal.log_proposal(
+                    timestamp=_now_iso(), source="tier4", kind="auto_entry",
+                    symbol=coin_id, action="BUY",
+                    notional=self._stake_for(conf), confidence=round(conf, 3),
+                    rationale=f"LLM gate: {reason}",
+                    exec_status="shadow",
+                    context_json=json.dumps({k: dossier.get(k) for k in
+                                              ("mcap_rank", "liquidity_usd",
+                                               "volume_24h_usd", "ath_distance_pct")}))
+                continue
+            stake = self._stake_for(conf)
+            ok, note = self.buy(coin_id, stake=stake,
+                                reason=f"auto entry (LLM conf {conf:.2f}: {reason})")
+            if ok:
+                self.journal.log_proposal(
+                    timestamp=_now_iso(), source="tier4", kind="auto_entry",
+                    symbol=coin_id, action="BUY", notional=stake,
+                    confidence=round(conf, 3), rationale=reason,
+                    exec_status="executed",
+                    context_json=json.dumps({k: dossier.get(k) for k in
+                                             ("mcap_rank", "liquidity_usd",
+                                              "volume_24h_usd", "ath_distance_pct",
+                                              "price_change_24h_pct")}))
+                events.append({"type": "auto_buy", "symbol": coin_id,
+                               "stake": stake, "confidence": conf, "reason": reason})
+                try:
+                    from bot.notify import send_notification
+                    send_notification(
+                        f"🚀 Tier 4 auto BUY {coin_id}: ${stake:.2f} stake "
+                        f"(LLM conviction {conf:.0%}) — {reason}", self.cfg)
+                except Exception:
+                    pass
+                break  # one entry per cycle
+            else:
+                print(f"[tier4] auto entry failed for {coin_id}: {note}")
+        return events
+
+    def _stake_for(self, confidence):
+        """Conviction-sized stake: base at threshold, max_stake at confidence 1.0.
+        The LLM never sizes its own order."""
+        if confidence >= 0.95:
+            return self.max_stake
+        span = max(0.95 - self.min_llm_confidence, 1e-9)
+        frac = max(0.0, (confidence - self.min_llm_confidence)) / span
+        return round(self.base_stake + frac * (self.max_stake - self.base_stake), 2)
+
+    # ---------------- exits ----------------
+
+    def _sell_position(self, symbol, note="", qty=None):
         positions = self._positions()
         pos = positions.get(symbol)
         if not pos:
@@ -248,17 +660,25 @@ class MemecoinLedger:
         if mark is None:
             mark = float(pos["entry"])
         exit_price = mark * (1 - self.slippage_bps / 10_000.0)
-        qty = float(pos["qty"])
-        proceeds = qty * exit_price
+        sell_qty = float(qty if qty is not None else pos["qty"])
+        sell_qty = min(sell_qty, float(pos["qty"]))
+        proceeds = sell_qty * exit_price
         fee = proceeds * self.taker_fee_pct / 100.0
-        pnl = proceeds - fee - qty * float(pos["entry"])
-        del positions[symbol]
+        pnl = proceeds - fee - sell_qty * float(pos["entry"])
+        remaining = float(pos["qty"]) - sell_qty
+        if remaining > 1e-12:
+            positions[symbol] = {**pos, "qty": remaining}
+        else:
+            del positions[symbol]
+            self._add_cooldown(symbol, self.entry_cooldown_hours)
         self._save(self._cash() + proceeds - fee, positions)
-        self._log_trade(symbol, "SELL", qty, exit_price, note=f"{note} (pnl {pnl:+.2f})")
-        return {"symbol": symbol, "exit_price": exit_price, "pnl": pnl}
+        self._log_trade(symbol, "SELL", sell_qty, exit_price,
+                        note=f"{note} (pnl {pnl:+.2f})")
+        return {"symbol": symbol, "exit_price": exit_price, "pnl": pnl,
+                "qty": sell_qty}
 
     def sell(self, symbol):
-        """Human-gated exit via CLI."""
+        """Manual exit (CLI)."""
         symbol = str(symbol).upper()
         if symbol not in self._positions():
             return False, f"no canary position in {symbol}"
@@ -266,12 +686,13 @@ class MemecoinLedger:
         if r is None:
             return False, f"no canary position in {symbol}"
         return True, (f"canary SELL {symbol} @ ${r['exit_price']:.6f}: "
-                       f"P&L {r['pnl']:+.2f}")
+                      f"P&L {r['pnl']:+.2f}")
 
     # ---------------- hourly sweep (deterministic exits) ----------------
 
     def sweep(self):
-        """Enforce entry-fixed exits + drawdown kill. Returns list of events."""
+        """Enforce entry-fixed SL/TP + trailing stop + partial TP + time stop
+        + drawdown kill. Returns list of events."""
         events = []
         if self.kill_active():
             return events
@@ -287,18 +708,55 @@ class MemecoinLedger:
             mark = self.price_for(symbol)
             if mark is None:
                 continue
+            entry = float(pos["entry"])
+            gain_pct = (mark / entry - 1) * 100
+            # 1) time stop: momentum decayed
             opened = _parse_ts(pos.get("opened"))
             if opened and datetime.now(timezone.utc) - opened >= timedelta(hours=self.time_stop_hours):
                 r = self._sell_position(symbol, note="time stop")
                 if r:
                     events.append({"type": "time_stop", **r})
                 continue
+            # 2) hard stop-loss (entry-fixed)
             if mark <= float(pos["stop"]):
                 r = self._sell_position(symbol, note="stop loss")
                 if r:
                     events.append({"type": "stop_loss", **r})
                 continue
-            if mark >= float(pos["take_profit"]):
+            # 3) trailing stop: arm after activation, then ratchet up only
+            ts = pos.get("trailing_stop")
+            if gain_pct >= self.trailing_activate_pct:
+                new_ts = mark * (1 - self.trailing_stop_pct / 100.0)
+                if ts is None or new_ts > float(ts):
+                    positions = self._positions()
+                    positions[symbol]["trailing_stop"] = new_ts
+                    self._save(self._cash(), positions)
+                    ts = new_ts
+            if ts is not None and mark <= float(ts):
+                r = self._sell_position(symbol, note="trailing stop")
+                if r:
+                    events.append({"type": "trailing_stop", **r})
+                continue
+            # 4) partial take-profit: bank half at the first big spike
+            if (not pos.get("partial_taken") and gain_pct >= self.partial_tp_pct
+                    and float(pos["qty"]) > 0):
+                sell_frac = min(self.partial_tp_sell_frac, 0.9)
+                sell_qty = float(pos["qty"]) * sell_frac
+                r = self._sell_position(symbol, qty=sell_qty,
+                                        note=f"partial take profit ({sell_frac:.0%})")
+                if r:
+                    positions = self._positions()
+                    if symbol in positions:
+                        positions[symbol]["partial_taken"] = True
+                        self._save(self._cash(), positions)
+                    events.append({"type": "partial_tp", **r})
+                continue
+            # 5) full take-profit (entry-fixed) — only for positions that
+            #    haven't banked a partial: the runner rides the trailing
+            #    stop alone, otherwise the +50% TP would exit it on the
+            #    very next sweep after the +80% partial
+            if (not pos.get("partial_taken")
+                    and mark >= float(pos["take_profit"])):
                 r = self._sell_position(symbol, note="take profit")
                 if r:
                     events.append({"type": "take_profit", **r})
@@ -409,7 +867,7 @@ class MemecoinLedger:
     # ---------------- cycle ----------------
 
     def run_cycle(self):
-        """Research + sweep. Human-gated entries stay outside this path."""
+        """Sweep exits, refresh research, run gated auto-entries."""
         print(f"[tier4] canary cycle starting ({_now_iso()})")
         events = []
         try:
@@ -421,12 +879,16 @@ class MemecoinLedger:
                 from bot.notify import send_notification
                 if ev["type"] == "kill":
                     send_notification(
-                        f"⛔ Tier 4 Coins: KILLED — {ev['reason']}. All sold, "
-                        f"paused until you run `tier4.py reset-kill`", self.cfg)
+                        f"⛔ Tier 4 Coins: KILLED — {ev['reason']}. All sold; "
+                        f"auto re-arms after {self.auto_cooldown_hours:.0f}h cooldown.",
+                        self.cfg)
+                elif ev["type"] == "auto_buy":
+                    pass  # already alerted inside _auto_entries
                 else:
                     pnl = ev.get("pnl", 0)
                     emoji = "📈" if pnl >= 0 else "📉"
                     label = {"stop_loss": "safety exit", "take_profit": "profit exit",
+                             "trailing_stop": "trail exit", "partial_tp": "partial exit",
                              "time_stop": "time exit"}.get(ev["type"], ev["type"])
                     send_notification(
                         f"{emoji} Tier 4 Coins {label}: {ev['symbol']} — "
@@ -443,6 +905,11 @@ class MemecoinLedger:
             spikes = self.dexscreener_spike_cards()
         except Exception as e:
             print(f"[tier4] spike cards failed: {e}")
+        cards = trending + spikes
+        try:
+            events.extend(self._auto_entries(cards))
+        except Exception as e:
+            print(f"[tier4] auto entries failed: {e}")
         v = self.valuation()
         print(f"[tier4] canary cycle done: {len(trending)} trending, "
               f"{len(spikes)} spike cards, equity ${v['equity']:.2f}")

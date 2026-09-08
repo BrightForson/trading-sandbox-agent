@@ -5,7 +5,7 @@ Four-tier paper-trading system (NO real money anywhere):
 1. **Tier 1 — SMA crossover bot (paper only)**: deterministic SMA20/50 golden/death cross on BTC/USD, ETH/USD, SOL/USD, 15-min closed bars, with ATR-based catastrophic exits and account-level paper-risk controls.
 2. **Tier 2 — AI agent (SHADOW MODE)**: babysits open positions (proposes early exits when thesis breaks) + scouts for high-conviction entries using news/whale/trend research. It never executes. Scout BUY ideas receive a fixed-horizon, BTC-benchmarked scorecard.
 3. **Tier 3 — Polymarket scanner (paper only)**: near-resolution favorites are a watchlist, not automatic bets. LLM candidates must clear an expected-value-after-friction threshold, duplicate and total-exposure checks, then are paper-logged and settled automatically. A virtual betting wallet (real deployment size) mirrors every logged bet at a flat stake, tracks cash/locked equity per epoch, snapshots the trend each cycle, and halts new bets on bust — the tier's go/no-go scoreboard.
-4. **Tier 4 — Memecoin canary (human-gated, virtual $40)**: deterministic research signals (CoinGecko trending + DexScreener volume spikes; keyless APIs, no LLM anywhere in the path) produce review cards. Entries happen ONLY via the human-gated CLI (`tools/tier4.py buy`). Every entry gets an entry-fixed stop-loss (25%), take-profit (50%), and 72h time stop enforced by an hourly sweep, plus a hard 25% max-drawdown kill that flattens everything and blocks new entries until a manual reset. All state is isolated: virtual fills carry a `[tier4-memecoin]` tag (excluded from Tier 1 P&L) and cards live in their own `tier4_cards` table.
+4. **Tier 4 — Memecoin canary (automated, virtual $40)**: owner opt-in 2026-09-08 (no real money; automation like the other tiers). Hourly pipeline: deterministic research cards (CoinGecko trending + DexScreener volume spikes) -> per-coin dossier (market data, ATH distance, 30d history, DEX pair profile: liquidity/age) -> fail-closed rug-guard screen (min liquidity $250k, min 24h volume $500k, min pair age 7d, mcap rank <= 300) -> LLM conviction gate (>= 0.75 confidence, memecoin-risk rubric; model failure = no entry) -> conviction-sized entry ($6-$12). Exits, deterministic always: entry-fixed stop-loss (25%), take-profit (50%), partial take-profit (bank half at +80%, runner rides a ratcheting 20% trailing stop armed at +25%), 72h time stop, 7-day per-symbol entry cooldown, and a hard 25% max-drawdown kill that flattens all and auto re-arms after a 24h cooldown. Every auto entry is journaled as a proposal (source=tier4) for the scorecard; virtual fills carry a `[tier4-memecoin]` tag (excluded from Tier 1 P&L) and cards live in their own `tier4_cards` table. `tools/tier4.py` remains the manual override surface (buy/sell/status/reset-kill).
 
 All trade/bet/proposal events, heartbeats (hourly, with equity + SMA gaps), model switches, and a daily 18:00 UTC report go to Discord. Two-way Discord chat (Bright Bot) answers questions with live account data — read-only, can never trigger trades.
 
@@ -36,14 +36,14 @@ bot/
   research.py         # free research tools: RSS, CoinGecko, Tavily (budget-guarded)
   polymarket.py       # Gamma API scanner + paper bet settlement
   wallet.py           # Tier 3 virtual betting wallet (derived from bets, epoch-aware)
-  memecoin.py         # Tier 4 canary: research cards + virtual ledger + exit sweep
+  memecoin.py         # Tier 4 canary: research + dossier + rug-guard + LLM gate + auto entries + exit sweep
   chat.py             # two-way Discord chat (bot reads channel, agent replies)
   journal.py          # SQLite: trades, proposals, bets, tier4_cards, meta (state)
   report.py           # P&L/win-rate + LLM narrative
   notify.py           # Discord webhook (chunked) with file fallback
   errors.py           # custom exceptions
 tools/
-  tier4.py            # Tier 4 human-gated CLI: buy/sell/status/reset-kill/cycle
+  tier4.py            # Tier 4 ops CLI (manual overrides): buy/sell/status/reset-kill/cycle
   reset_day_zero.py   # day-zero reset: archive + clear + new timestamp
   merge_db.py         # lossless SQLite merge for CI push conflicts
 data/trades.db        # committed to repo: cross-run state for GitHub Actions
@@ -73,7 +73,7 @@ data/trades.db        # committed to repo: cross-run state for GitHub Actions
 - `agent:` — shadow (true), min_confidence (0.7), max_proposed_notional (50), shadow_start_cash (80), fixed evaluation horizon, babysitter/scout toggles, cycle interval
 - `research:` — headlines per symbol, Tavily daily (30) / monthly (1000) caps
 - `scanner:` — stake (20), near-resolution watchlist, min_market_volume, mispricing threshold, minimum expected value, total-open-exposure cap, and the betting wallet (`wallet_start_cash: 60`, `wallet_stake: 12`; epoch reset via `bot.wallet.BettingWallet.start_new_epoch()`)
-- `memecoin:` — Tier 4 canary: start_cash (40), max_stake (12), entry-fixed stop_loss_pct (25) / take_profit_pct (50) / time_stop_hours (72), max_drawdown_pct (25) hard kill, DEX-style fee/slippage (1% / 100bps), research-card TTL + spike filters
+- `memecoin:` — Tier 4 canary: start_cash (40), max_stake (12), entry-fixed stop_loss_pct (25) / take_profit_pct (50) / time_stop_hours (72), trailing stop (20% trail armed at +25%), partial TP (half at +80%), max_drawdown_pct (25) hard kill w/ 24h auto re-arm, DEX-style fee/slippage (1% / 100bps), research-card TTL + spike filters; automation block: auto_entry, min_llm_confidence (0.75), base_stake (6), max_open_positions (3), rug-guard floors (liquidity 250k / volume 500k / age 7d / mcap rank 300), entry_cooldown_hours (168)
 
 ## Hosting (GitHub Actions, free)
 
@@ -146,13 +146,14 @@ report runs; any KILL verdict must be acted on manually within a week.
   - KILL if settled-bet win rate < 40% after ≥10 settled bets with
     negative net P&L (fees are supposed to make favorites +EV)
   - KEEP if epoch survives 8 weeks with positive net P&L
-- **Tier 4 (memecoin canary, $40, human-gated)**
-  - KILL on the hard 25% max-drawdown trigger (auto-flattens + blocks
-    entries; manual `tools/tier4.py reset-kill` re-arms) — a second kill
-    after reset within 8 weeks is a failed edge, stop the tier
+- **Tier 4 (memecoin canary, $40, automated since 2026-09-08)**
+  - KILL on the hard 25% max-drawdown trigger (auto-flattens; entries
+    resume automatically after the 24h kill cooldown) — a second kill
+    within 8 weeks of the first is a failed edge, stop the tier
   - KILL if net P&L < −25% of starting equity over ≥4 weeks even without
-    a formal drawdown trigger, or if any exit (SL/TP/time stop) is found
-    not to have fired on schedule (discipline failure = infrastructure)
+    a formal drawdown trigger, or if any exit (SL/TP/trailing/time stop)
+    is found not to have fired on schedule (discipline failure =
+    infrastructure)
   - KEEP if the canary survives 8 weeks with positive net P&L after all
     costs; then consider whether the signal justifies a paper test
 - **Any tier**: kill immediately on unreconcilable ledger corruption,
@@ -169,8 +170,9 @@ report runs; any KILL verdict must be acted on manually within a week.
 ./venv/bin/python run_agent.py --once      # agent cycle
 ./venv/bin/python run_scanner.py           # scanner cycle
 ./venv/bin/python tools/tier4.py status    # Tier 4 canary status + cards
-./venv/bin/python tools/tier4.py buy DOGE 12   # human-gated canary entry
-./venv/bin/python tools/tier4.py reset-kill   # re-arm after a kill
+./venv/bin/python tools/tier4.py cycle       # one full auto cycle now
+./venv/bin/python tools/tier4.py buy DOGE 12   # manual entry override
+./venv/bin/python tools/tier4.py reset-kill   # force re-arm after a kill
 ./venv/bin/python tools/reset_day_zero.py --dry-run  # preview a day-zero reset
 ```
 

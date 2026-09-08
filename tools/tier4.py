@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Tier 4 memecoin canary CLI — the ONLY entry path (human-gated by design).
+"""Tier 4 memecoin canary CLI — ops override panel for the automated canary.
 
-Research signals (CoinGecko trending, DexScreener volume spikes) are
-advisory only; nothing in this tier auto-executes. The owner reviews
-cards via `status` and places virtual canary entries/exits here.
+The tier runs itself (auto_entry: true — sweep, research, dossier,
+rug-guard, LLM gate, sized entries; see bot/memecoin.py). This CLI is the
+human override surface: manual entries/exits still work, plus kill control
+and research inspection.
 
 Usage:
   python tools/tier4.py status              # ledger + fresh research cards
-  python tools/tier4.py buy DOGE 12         # human-gated entry ($ cap)
-  python tools/tier4.py sell DOGE           # human-gated exit
-  python tools/tier4.py reset-kill          # manual re-arm after a kill
-  python tools/tier4.py cycle               # research sweep (deterministic)
+  python tools/tier4.py buy DOGE 12         # manual entry override ($ cap)
+  python tools/tier4.py sell DOGE           # manual exit override
+  python tools/tier4.py reset-kill           # force re-arm after a kill
+  python tools/tier4.py cycle               # one full auto cycle now
 """
 import os
 import sys

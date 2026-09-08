@@ -106,19 +106,37 @@ scanner:
   wallet_start_cash: 60
   wallet_stake: 12
 
-# Tier 4 memecoin canary — research signals only, human-gated entries via
-# tools/tier4.py. NEVER autonomous execution. Deterministic, keyless APIs
-# (CoinGecko trending + DexScreener volume spikes); no LLM in this path.
+# Tier 4 memecoin canary — automated (owner opt-in 2026-09-08, virtual money
+# only). Pipeline per hourly cycle: deterministic research cards (CoinGecko
+# trending + DexScreener volume spikes) -> deep per-coin dossier (market data,
+# 30d history, DEX pair profile) -> fail-closed rug-guard screen -> LLM
+# conviction gate -> conviction-sized entry. Deterministic exits: entry-fixed
+# SL/TP, trailing stop, partial TP, time stop, drawdown kill w/ auto re-arm.
 memecoin:
   start_cash: 40          # virtual canary ledger
   max_stake: 12           # per-entry cap
   stop_loss_pct: 25       # entry-fixed stop-loss
   take_profit_pct: 50     # entry-fixed take-profit
   time_stop_hours: 72     # hard time stop
-  max_drawdown_pct: 25    # hard kill: flatten all + block entries until manual reset
+  max_drawdown_pct: 25    # hard kill: flatten all; auto re-arm after cooldown
   taker_fee_pct: 1.0      # DEX-style conservative fee
   slippage_bps: 100      # 1% adverse slippage per fill
   card_ttl_minutes: 360   # research-card dedupe window
   max_trending_cards: 7   # CoinGecko trending cap per cycle
   spike_volume_multiple: 3.0   # 6h annualized vs 24h volume multiple
   spike_min_volume_24h: 100000
+  # --- automation (Tier 4 runs itself; the owner opted in 2026-09-08) ---
+  auto_entry: true            # master switch: false = research-only (old behavior)
+  auto_cooldown_hours: 24     # kill cooldown before entries auto-resume
+  min_llm_confidence: 0.75     # LLM must be this convinced before any buy
+  base_stake: 6               # stake at the confidence threshold
+  max_open_positions: 3        # concurrent positions cap
+  min_liquidity_usd: 250000    # rug-guard: exit liquidity floor
+  min_volume_24h_usd: 500000   # rug-guard: sustained interest floor
+  min_age_hours: 168           # rug-guard: must have survived >= 7 days
+  max_mcap_rank: 300           # rug-guard: no micro-cap obscurities
+  trailing_stop_pct: 20        # trail distance once activated
+  trailing_activate_pct: 25    # arm the trail after +25%
+  partial_tp_pct: 80           # bank half at +80%
+  partial_tp_sell_frac: 0.5    # fraction sold at the partial TP
+  entry_cooldown_hours: 168    # no re-entry into a symbol for 7 days after any exit
