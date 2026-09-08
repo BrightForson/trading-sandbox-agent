@@ -211,7 +211,7 @@ def scan(cfg, journal=None, model=None):
     if wallet_bust:
         print("[scanner] wallet BUST — scanning watchlist only, no new paper bets")
         send_notification(
-            f"💰 {wallet.status_line()} — no new paper bets until epoch reset",
+            f"💀 Tier 3 Bets: out of money — no new bets until reset",
             cfg,
         )
         paper_finds = []
@@ -239,12 +239,8 @@ def scan(cfg, journal=None, model=None):
                 expected_value=f.get("expected_value"),
             )
             send_notification(
-                f"🎯 **Paper bet — {f['strategy']}** (Polymarket scan)\n"
-                f"**{f['question'][:120]}**\n"
-                f"Side: **{f['side']}** @ {f['price']:.3f} | Stake ${stake:.0f} (paper)\n"
-                f"Estimated probability {f['estimated_probability']:.3f} | "
-                f"expected value ${f['expected_value']:+.2f} after ${fee:.2f} estimated friction\n"
-                f"24h vol ${f['volume_24h']:,.0f} | ends {f.get('end_ts')}",
+                f"🎯 Tier 3 bet: {f['side'].upper()} on \"{f['question'][:80]}\" "
+                f"@ {f['price'] * 100:.0f}¢ (${stake:.0f} in)",
                 cfg,
             )
         except Exception as e:
@@ -299,10 +295,10 @@ def settle_open_bets(cfg, journal=None):
                 journal.update_bet(b[0], "won" if won else "lost", round(payout, 2))
                 settled.append((b, won, payout))
                 try:
+                    won_txt = f"+${payout - b[6]:,.2f}" if won else f"-${b[6]:,.2f}"
                     send_notification(
-                        f"{'🏆' if won else '💀'} **Paper bet settled**\n"
-                        f"{b[3]}\n{'Won' if won else 'Lost'} {b[4]} @ {b[5]:.3f} — "
-                        f"payout ${payout:.2f} on ${b[6]:.0f} stake",
+                        f"{'🏆' if won else '💀'} Tier 3 bet {'WON' if won else 'LOST'}: "
+                        f"{b[3][:60]} — {won_txt}",
                         cfg,
                     )
                 except Exception:

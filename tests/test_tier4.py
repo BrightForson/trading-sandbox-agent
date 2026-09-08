@@ -296,6 +296,46 @@ def test_card_dedupe_expires_after_ttl(tmp_path, monkeypatch):
     assert len(j.get_tier4_cards(status="fresh")) == 1
 
 
+def test_card_dedupe_uses_newest_row(tmp_path, monkeypatch):
+    """TTL must be measured from the NEWEST card per (kind, symbol).
+
+    Regression: rows come newest-first; the old code overwrote 'seen' so the
+    OLDEST row won, letting a symbol re-log duplicates once its oldest card
+    aged out even though a newer card was still fresh."""
+    led, j = _ledger(tmp_path)
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"coins": [{"item": {"name": "Pepe", "id": "pepe",
+                                        "market_cap_rank": 51}}]}
+
+    monkeypatch.setattr("bot.memecoin.requests.get", lambda *a, **k: _Resp())
+    assert len(led.coingecko_trending_cards()) == 1
+    # age the FIRST logged card past TTL while keeping it fresh-eligible,
+    # then simulate a second log: the newest row's timestamp is what matters
+    import sqlite3
+    ttl = led.card_ttl_minutes
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=ttl + 1)).isoformat()
+    recent = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(j.db_path) as conn:
+        # two rows for pepe: an old one (beyond TTL) and a recent one (fresh)
+        conn.execute(
+            "INSERT INTO tier4_cards (timestamp, kind, symbol, name, detail, status) "
+            "VALUES (?, 'coingecko_trending', 'pepe', 'Pepe', 'd', 'fresh')",
+            (stale,))
+        conn.execute(
+            "INSERT INTO tier4_cards (timestamp, kind, symbol, name, detail, status) "
+            "VALUES (?, 'coingecko_trending', 'pepe', 'Pepe', 'd', 'fresh')",
+            (recent,))
+        conn.commit()
+    # the recent row is inside the TTL window -> NO new card may be logged
+    assert led.coingecko_trending_cards() == []
+    assert len(j.get_tier4_cards(status="fresh")) == 3  # original + 2 seeded
+
+
 # ---------------- status ----------------
 
 def test_status_line_shape(tmp_path):

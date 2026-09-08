@@ -378,7 +378,12 @@ class MemecoinLedger:
         existing = self.journal.get_tier4_cards()
         seen = {}
         for c in existing:
-            seen[(c[2], c[3])] = c  # (kind, symbol) -> row
+            key = (c[2], c[3])  # (kind, symbol) -> row
+            if key not in seen:
+                # rows are newest-first: keep the NEWEST row per key so the
+                # TTL window is measured from the most recent card, not the
+                # oldest (which would re-admit duplicates early)
+                seen[key] = c
         out = []
         for card in cards:
             key = (card["kind"], card["symbol"])
@@ -388,6 +393,9 @@ class MemecoinLedger:
                 if ts and now - ts < timedelta(minutes=self.card_ttl_minutes):
                     continue
                 self.journal.expire_tier4_card(prev[0])
+                # the just-expired row was the NEWEST for this key (get_tier4_cards
+                # returns newest-first and 'seen' keeps the first sight of each
+                # key); nothing fresh remains, so the new card may be logged
             self.journal.log_tier4_card(
                 timestamp=_now_iso(),
                 kind=card["kind"],
@@ -413,14 +421,16 @@ class MemecoinLedger:
                 from bot.notify import send_notification
                 if ev["type"] == "kill":
                     send_notification(
-                        f"⛔ **Tier 4 canary KILLED**\n{ev['reason']}\n"
-                        f"All positions flattened; entries blocked until manual "
-                        f"reset (`tools/tier4.py reset-kill`)", self.cfg)
+                        f"⛔ Tier 4 Coins: KILLED — {ev['reason']}. All sold, "
+                        f"paused until you run `tier4.py reset-kill`", self.cfg)
                 else:
+                    pnl = ev.get("pnl", 0)
+                    emoji = "📈" if pnl >= 0 else "📉"
+                    label = {"stop_loss": "safety exit", "take_profit": "profit exit",
+                             "time_stop": "time exit"}.get(ev["type"], ev["type"])
                     send_notification(
-                        f"⚠️ **Tier 4 canary exit swept** ({ev['type']})\n"
-                        f"{ev['symbol']} @ ${ev.get('exit_price', 0):.6f} "
-                        f"(P&L {ev.get('pnl', 0):+.2f})", self.cfg)
+                        f"{emoji} Tier 4 Coins {label}: {ev['symbol']} — "
+                        f"{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}", self.cfg)
             except Exception as e:
                 print(f"[tier4] event notification failed: {e}")
         trending = []

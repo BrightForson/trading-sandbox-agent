@@ -15,38 +15,76 @@ import time as _time
 HEARTBEAT_INTERVAL_SECONDS = 3600
 
 
+def _tier_one_liners(journal, broker):
+    """Money lines + activity one-liners for tiers 2/3/4 (best-effort each)."""
+    from bot.brief import money_line, emoji_for
+    lines = []
+    # Tier 2 — AI shadow account
+    try:
+        from bot.shadow import ShadowAccount
+        sh = ShadowAccount(config, broker, journal=journal)
+        v = sh.mark_to_market()
+        delta = v[0] - sh.start_cash
+        lines.append(f"{emoji_for(delta)} {money_line('Tier 2 AI', v[0], sh.start_cash)}"
+                     + (f" | {len(sh._positions())} open AI trade(s)" if sh._positions() else " | no open trades"))
+    except Exception:
+        pass
+    # Tier 3 — Polymarket wallet
+    try:
+        from bot.wallet import BettingWallet
+        w = BettingWallet(config, journal=journal)
+        v = w.valuation()
+        delta = v["equity"] - w.start_cash
+        lines.append(f"{emoji_for(delta)} {money_line('Tier 3 Bets', v['equity'], w.start_cash)}"
+                     + (f" | {v['open_bets']} open bet(s)" if v["open_bets"] else " | no open bets"))
+    except Exception:
+        pass
+    # Tier 4 — memecoin canary
+    try:
+        from bot.memecoin import MemecoinLedger
+        led = MemecoinLedger(config, journal=journal)
+        v = led.valuation()
+        delta = v["equity"] - led.start_cash
+        pos = led._positions()
+        lines.append(f"{emoji_for(delta)} {money_line('Tier 4 Coins', v['equity'], led.start_cash)}"
+                     + (f" | holding {', '.join(sorted(pos))}" if pos else " | nothing held"))
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
 def send_heartbeat(broker, journal):
-    """Send a status message to Discord once per UTC clock hour."""
+    """One brief hourly glance: money per tier, activity only if it exists."""
     now = _time.time()
     current_hour = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H")
     last = journal.get_meta("last_heartbeat_hour")
     if last is not None and last == current_hour:
         return
     try:
+        from bot.brief import money_line, emoji_for
         acct = broker.get_account()
         positions = list(broker.get_all_positions())
-        pos_lines = [f"  • {p.symbol}: {float(p.qty):.6f} (${float(p.unrealized_pl):,.2f} unrealized)" for p in positions]
-        pos_section = "\n".join(pos_lines) if pos_lines else "flat (no open positions)"
 
-        # SMA gaps per symbol for signal proximity (closed bars only)
-        tf = make_timeframe(config.timeframe)
-        gap_lines = []
-        for sym in config.symbols:
-            try:
-                df = broker.get_crypto_bars(sym, tf, config.lookback_bars)
-                close = df['close'].iloc[:-1]  # drop the still-forming bar
-                f = close.rolling(20).mean().iloc[-1]
-                s = close.rolling(50).mean().iloc[-1]
-                gap_lines.append(f"  • {sym}: SMA20 {f:,.2f} vs SMA50 {s:,.2f} ({(f-s)/s*100:+.2f}%)")
-            except Exception:
-                gap_lines.append(f"  • {sym}: data unavailable")
+        # Tier 1 money line: equity vs the paper start cash allocation
+        start_cash = float((getattr(config, "broker", None) or {})
+                           .get("paper", {}).get("start_cash", 100) or 100)
+        equity = float(acct.equity)
+        delta = equity - start_cash
 
-        msg = (
-            f"🫀 **Heartbeat** {datetime.now(timezone.utc).strftime('%H:%M UTC')} (paper)\n"
-            f"Equity ${float(acct.equity):,.2f} | Cash ${float(acct.cash):,.2f}\n"
-            f"Positions: {pos_section}\n"
-            f"Signal gaps (SMA20−SMA50):\n" + "\n".join(gap_lines)
-        )
+        lines = [f"🫀 {emoji_for(delta)} "
+                 f"{money_line('Tier 1 BTC/ETH/SOL', equity, start_cash)}"]
+        if positions:
+            # activity: open positions with unrealized P&L each
+            for p in positions:
+                pl = float(p.unrealized_pl)
+                lines.append(f"   {emoji_for(pl)} {p.symbol}: {float(p.qty):.4f} @ ${float(p.avg_entry_price):,.2f} "
+                             f"({('+' if pl >= 0 else '-')}${abs(pl):,.2f} now)")
+        else:
+            lines.append("   ➖ no open trades")
+
+        lines.append(_tier_one_liners(journal, broker))
+
+        msg = "\n".join(lines)
         send_notification(msg, config)
         journal.set_meta("last_heartbeat_hour", current_hour)
         print(f"[{datetime.now()}] Heartbeat sent (hour {current_hour})")
@@ -445,7 +483,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             print(f"[{datetime.now()}] RISK BLOCKED {action} {symbol}: {reason}")
             try:
                 send_notification(
-                    f"🛑 **Risk blocked {action} — {symbol}**\nReason: {reason}",
+                    f"🛑 Tier 1: {action} {symbol} blocked — {reason}",
                     config
                 )
             except Exception:
@@ -461,10 +499,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
         return True
     try:
         send_notification(
-            f"🔔 **Trade signal — {symbol}**\n"
-            f"**{action}** {qty:.6f} @ ~${price:,.2f} (notional ~${qty * price:,.2f})\n"
-            f"Reason: {reasoning}\n"
-            f"Submitting order to broker...",
+            f"🟡 Tier 1: {action} {symbol} @ ${price:,.2f} — placing order…",
             config
         )
     except Exception as notify_err:
@@ -505,11 +540,17 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
                 risk_engine.clear_stop(symbol)
         print(f"[{datetime.now()}] Confirmed paper fill for {symbol}: {action} {fill_qty:.6f} @ {fill_price:.2f}")
         try:
+            notional = fill_qty * fill_price
+            # realized P&L on a full exit: equity move tells the money story
+            emoji = "🟢" if action == "BUY" else "🔴"
+            pnl_txt = ""
+            if action == "SELL":
+                from bot.report import compute_pnl_and_winrate
+                stats = compute_pnl_and_winrate(journal.get_trades())
+                pnl_txt = (f" | total so far {'+' if stats['total_pnl'] >= 0 else '-'}"
+                           f"${abs(stats['total_pnl']):,.2f}")
             send_notification(
-                f"✅ **Trade executed — {symbol}**\n"
-                f"**{action}** {fill_qty:.6f} @ ${fill_price:,.2f}\n"
-                f"Order ID: {getattr(order, 'id', 'unknown')}\n"
-                f"Reason: {reasoning}",
+                f"{emoji} Tier 1 {action}: {notional:,.2f} of {symbol} @ ${fill_price:,.2f}{pnl_txt}",
                 config
             )
         except Exception as notify_err:
@@ -567,7 +608,11 @@ def run_scanner_cycle():
     try:
         wallet = BettingWallet(config, journal=journal)
         wallet.snapshot()
-        send_notification(f"💵 {wallet.status_line()}", config)
+        from bot.brief import money_line, emoji_for
+        v = wallet.valuation()
+        delta = v["equity"] - wallet.start_cash
+        bets_txt = f" | {v['open_bets']} open bet(s)" if v["open_bets"] else " | no open bets"
+        send_notification(f"{emoji_for(delta)} {money_line('Tier 3 Bets', v['equity'], wallet.start_cash)}{bets_txt}", config)
     except Exception as e:
         print(f"[{datetime.now()}] Wallet snapshot failed: {e}")
 

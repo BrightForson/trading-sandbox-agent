@@ -1,13 +1,13 @@
-"""Shadow account: a virtual $20 ledger for AI proposals (money that doesn't exist).
+"""Shadow account: a virtual $80 ledger for AI proposals (money that doesn't exist).
 
-The AI agent's proposals never touch the real Alpaca account (shadow mode).
+The AI agent's proposals never touch the real broker account (shadow mode).
 This module simulates what WOULD have happened if they had been executed with
-real dollars, on a dedicated virtual $20 account:
+real dollars, on a dedicated virtual $80 account:
 
-  - starts at $20.00 cash (config agent.shadow_start_cash, default 20)
+  - starts at $80.00 cash (config agent.shadow_start_cash, default 80)
   - scout BUY (confidence >= min_confidence) opens a virtual position at the
     current close, sized to the proposed notional, capped at max_per_position
-    (default $10) and by remaining shadow cash
+    (default $40) and by remaining shadow cash
   - babysitter SELL closes the virtual position, realizes P&L
   - every agent cycle marks positions to market; equity = cash + position value
   - state persists in journal tables (shadow_trades) + meta (shadow_cash,
@@ -28,9 +28,15 @@ class ShadowAccount:
         self.broker = broker
         self.journal = journal or TradeJournal()
         self.agent_cfg = getattr(cfg, "agent", None) or {}
-        self.start_cash = float(self.agent_cfg.get("shadow_start_cash", 20))
-        self.max_per_position = float(self.agent_cfg.get("shadow_max_per_position", 10))
+        self.start_cash = float(self.agent_cfg.get("shadow_start_cash", 80))
+        self.max_per_position = float(self.agent_cfg.get("shadow_max_per_position", 40))
+        # tradable = Tier 1 symbols + the AI scout's extra universe; both
+        # priced from the same keyless Binance public data
         self.symbols = list(cfg.symbols)
+        for s in (self.agent_cfg.get("scout_extra_universe") or []):
+            s = str(s).strip().upper()
+            if s and s not in self.symbols:
+                self.symbols.append(s)
 
     # ---------------- state ----------------
 

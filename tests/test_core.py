@@ -267,6 +267,7 @@ def test_agent_proposal_validation(tmp_path):
     a.cfg = _Cfg
     a.agent_cfg = _Cfg.agent
     a.symbols = _Cfg.symbols
+    a.scout_symbols = _Cfg.symbols
 
     ok, errs = a._validate({"action": "BUY", "symbol": "BTC/USD", "notional": 30,
                             "confidence": 0.8, "rationale": "r"}, "scout")
@@ -293,6 +294,7 @@ def test_agent_validation_role_restrictions(tmp_path):
     a.cfg = _Cfg
     a.agent_cfg = _Cfg.agent
     a.symbols = _Cfg.symbols
+    a.scout_symbols = _Cfg.symbols
 
     # scout may not propose SELL
     ok, errs = a._validate({"action": "SELL", "symbol": "BTC/USD", "notional": 0,
@@ -1321,3 +1323,196 @@ def test_agent_alpha_gate_green_on_edge(monkeypatch, tmp_path):
     r = agent_alpha_gate(j)
     assert r.passed is True, r.summary
     assert "positive edge" in r.summary
+
+
+# ---------------- agent messaging: exhausted-cash suppression ----------------
+
+def _agent_for_messaging(tmp_path, monkeypatch, shadow_cash="80"):
+    """A TradingAgent wired for _log_and_alert tests: fake broker, journal,
+    shadow account, and a captured send_notification."""
+    from bot.agent import TradingAgent
+    j = TradeJournal(db_path=str(tmp_path / "a.db"))
+    j.set_meta("shadow_cash", shadow_cash)
+
+    class _Cfg:
+        symbols = ["BTC/USD"]
+        agent = {"shadow": True, "max_proposed_notional": 50,
+                 "min_confidence": 0.7, "evaluation_horizon_hours": 24,
+                 "shadow_max_per_position": 40}
+        research = {}
+        timeframe = "15Min"
+        lookback_bars = 60
+        sma_fast = 20
+        sma_slow = 50
+
+    class _Broker:
+        def get_crypto_bars(self, symbol, timeframe, limit):
+            closes = [100.0] * 60
+            return pd.DataFrame({"open": closes, "high": closes,
+                                "low": closes, "close": closes})
+
+    a = TradingAgent.__new__(TradingAgent)
+    a.cfg = _Cfg
+    a.agent_cfg = _Cfg.agent
+    a.symbols = _Cfg.symbols
+    a.scout_symbols = _Cfg.symbols + ["XRP/USD"]
+    a.journal = j
+    a.broker = _Broker()
+    from bot.shadow import ShadowAccount
+    a.shadow = ShadowAccount(_Cfg, _Broker(), journal=j)
+    sent = []
+    monkeypatch.setattr("bot.agent.send_notification",
+                        lambda msg, cfg: sent.append(msg))
+    return a, j, sent
+
+
+def test_exhausted_cash_proposal_journaled_compact_alert_only(tmp_path, monkeypatch):
+    a, j, sent = _agent_for_messaging(tmp_path, monkeypatch, shadow_cash="0.30")
+    proposal = {"kind": "scout", "symbol": "BTC/USD", "action": "BUY",
+                "notional": 40.0, "confidence": 0.9, "rationale": "strong setup"}
+    a._log_and_alert(proposal)
+    # journaled with full context (evaluation at horizon continues)
+    rows = j.get_proposals()
+    assert len(rows) == 1
+    assert rows[0][4] == "BTC/USD" and rows[0][5] == "BUY"
+    # only ONE compact money message, no full recommendation blast
+    assert len(sent) == 1
+    assert "out of money" in sent[0]
+    assert "rationale" not in sent[0].lower()
+    assert "confidence" not in sent[0].lower()
+
+
+def test_funded_proposal_brief_fill_alert(tmp_path, monkeypatch):
+    a, j, sent = _agent_for_messaging(tmp_path, monkeypatch, shadow_cash="80")
+    proposal = {"kind": "scout", "symbol": "BTC/USD", "action": "BUY",
+                "notional": 40.0, "confidence": 0.9, "rationale": "strong setup"}
+    a._log_and_alert(proposal)
+    assert len(sent) == 1
+    assert sent[0].startswith("🟢 Tier 2 AI BUY: BTC/USD")
+    assert "$40.00 @ $100.00" in sent[0]
+
+
+def test_scout_accepts_extra_universe_babysitter_does_not(tmp_path):
+    from bot.agent import TradingAgent
+
+    class _Cfg:
+        symbols = ["BTC/USD"]
+        agent = {"max_proposed_notional": 50, "min_confidence": 0.7,
+                 "scout_extra_universe": ["XRP/USD", "DOGE/USD"]}
+
+    a = TradingAgent.__new__(TradingAgent)
+    a.cfg = _Cfg
+    a.agent_cfg = _Cfg.agent
+    a.symbols = _Cfg.symbols
+    a.scout_symbols = _Cfg.symbols + _Cfg.agent["scout_extra_universe"]
+
+    # scout may propose XRP (extra universe)
+    ok, errs = a._validate({"action": "BUY", "symbol": "XRP/USD", "notional": 30,
+                            "confidence": 0.9, "rationale": "r"}, "scout")
+    assert ok is not None and errs == []
+    # babysitter may NOT (stays scoped to Tier 1 held positions)
+    ok, errs = a._validate({"action": "SELL", "symbol": "XRP/USD", "notional": 0,
+                            "confidence": 0.9, "rationale": "r"}, "babysitter")
+    assert ok is None and any("whitelist" in e for e in errs)
+    # unknown coin still rejected for scout
+    ok, errs = a._validate({"action": "BUY", "symbol": "SHIT/USD", "notional": 30,
+                            "confidence": 0.9, "rationale": "r"}, "scout")
+    assert ok is None and any("whitelist" in e for e in errs)
+
+
+# ---------------- heartbeat tier labeling ----------------
+
+def test_heartbeat_tier1_label_and_tier_one_liners(tmp_path, monkeypatch):
+    import bot.trader as T
+
+    class _Pos:
+        symbol = "BTC/USD"
+        qty = "0.01"
+        avg_entry_price = "100.0"
+        unrealized_pl = "0.5"
+
+    class _Acct:
+        cash = "50"
+        equity = "100"
+
+    class _Broker:
+        def get_account(self):
+            return _Acct()
+        def get_all_positions(self):
+            return [_Pos()]
+        def get_crypto_bars(self, symbol, timeframe, limit):
+            closes = [100.0] * 60
+            return pd.DataFrame({"open": closes, "high": closes,
+                                 "low": closes, "close": closes})
+
+    j = TradeJournal(db_path=str(tmp_path / "h.db"))
+    sent = []
+    monkeypatch.setattr(T, "send_notification", lambda msg, cfg: sent.append(msg))
+    monkeypatch.setattr(T, "config", type("C", (), {
+        "symbols": ["BTC/USD"], "timeframe": "15Min", "lookback_bars": 60,
+        "sma_fast": 20, "sma_slow": 50, "notional": 100,
+        "active_strategies": ["sma_cross"],
+        "broker": {"name": "binance_paper", "paper": {"start_cash": 100}},
+        "agent": {"shadow_start_cash": 80, "shadow_max_per_position": 40,
+                  "scout_extra_universe": []},
+        "scanner": {"wallet_start_cash": 60, "wallet_stake": 12},
+        "memecoin": {"start_cash": 40, "max_stake": 12, "stop_loss_pct": 25,
+                     "take_profit_pct": 50, "time_stop_hours": 72,
+                     "max_drawdown_pct": 25},
+    })())
+    T.send_heartbeat(_Broker(), j)
+    assert len(sent) == 1
+    msg = sent[0]
+    # Tier 1 money line + open position
+    assert "Tier 1 BTC/ETH/SOL" in msg
+    assert "was $100" in msg
+    assert "BTC/USD" in msg
+    # one-liners for the other tiers, money-first
+    assert "Tier 2 AI" in msg
+    assert "Tier 3 Bets" in msg
+    assert "Tier 4 Coins" in msg
+    assert "$80" in msg and "$60" in msg and "$40" in msg
+    # idempotent per hour
+    T.send_heartbeat(_Broker(), j)
+    assert len(sent) == 1
+
+
+def test_heartbeat_quiet_when_flat(tmp_path, monkeypatch):
+    import bot.trader as T
+
+    class _Acct:
+        cash = "100"
+        equity = "100"
+
+    class _Broker:
+        def get_account(self):
+            return _Acct()
+        def get_all_positions(self):
+            return []
+        def get_crypto_bars(self, symbol, timeframe, limit):
+            closes = [100.0] * 60
+            return pd.DataFrame({"open": closes, "high": closes,
+                                 "low": closes, "close": closes})
+
+    j = TradeJournal(db_path=str(tmp_path / "h2.db"))
+    sent = []
+    monkeypatch.setattr(T, "send_notification", lambda msg, cfg: sent.append(msg))
+    monkeypatch.setattr(T, "config", type("C", (), {
+        "symbols": ["BTC/USD"], "timeframe": "15Min", "lookback_bars": 60,
+        "sma_fast": 20, "sma_slow": 50, "notional": 100,
+        "active_strategies": ["sma_cross"],
+        "broker": {"name": "binance_paper", "paper": {"start_cash": 100}},
+        "agent": {"shadow_start_cash": 80, "shadow_max_per_position": 40,
+                  "scout_extra_universe": []},
+        "scanner": {"wallet_start_cash": 60, "wallet_stake": 12},
+        "memecoin": {"start_cash": 40, "max_stake": 12, "stop_loss_pct": 25,
+                     "take_profit_pct": 50, "time_stop_hours": 72,
+                     "max_drawdown_pct": 25},
+    })())
+    T.send_heartbeat(_Broker(), j)
+    msg = sent[0]
+    # flat everywhere: quiet-day format, no SMA/price noise
+    assert "no open trades" in msg
+    assert "no open bets" in msg
+    assert "nothing held" in msg
+    assert "SMA" not in msg

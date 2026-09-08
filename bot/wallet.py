@@ -1,9 +1,9 @@
-"""Tier 3 betting wallet: a virtual $10 ledger mirroring Polymarket paper bets.
+"""Tier 3 betting wallet: a virtual $60 ledger mirroring Polymarket paper bets.
 
 Mirrors the Tier 2 shadow-account idea at the user's real deployment size
-($10): every paper bet the scanner logs is re-staked on this wallet at a
-flat stake, settled wins pay stake/price, losses return nothing, and the
-resulting equity trend shows whether the tier earns its place at
+($60, $12 flat stake): every paper bet the scanner logs is re-staked on this
+wallet at a flat stake, settled wins pay stake/price, losses return nothing,
+and the resulting equity trend shows whether the tier earns its place at
 real-money scale.
 
 The wallet holds no state of its own. It replays the journal's bets table

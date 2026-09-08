@@ -33,7 +33,15 @@ class TradingAgent:
         self.model = model or ModelManager(journal=self.journal)
         self.agent_cfg = getattr(cfg, "agent", None) or {}
         self.research_cfg = getattr(cfg, "research", None) or {}
+        # Tier 1 execution universe (hard scope: BTC/ETH/SOL)
         self.symbols = list(cfg.symbols)
+        # Tier 2 scout universe: Tier 1 symbols + configurable extra coins
+        # (any liquid Binance spot pair) the AI may propose ideas on
+        self.scout_symbols = list(self.symbols)
+        for s in (self.agent_cfg.get("scout_extra_universe") or []):
+            s = str(s).strip().upper()
+            if s and s not in self.scout_symbols:
+                self.scout_symbols.append(s)
         from bot.shadow import ShadowAccount
         self.shadow = ShadowAccount(cfg, broker, journal=self.journal)
 
@@ -101,7 +109,8 @@ class TradingAgent:
         symbol = proposal.get("symbol")
         if symbol is not None:
             symbol = self._normalize_symbol(str(symbol))
-        if symbol and symbol not in self.symbols:
+        universe = self.scout_symbols if kind == "scout" else self.symbols
+        if symbol and symbol not in universe:
             errors.append(f"symbol {symbol} not in whitelist")
         try:
             conf = float(proposal.get("confidence", 0))
@@ -137,10 +146,11 @@ class TradingAgent:
     def _normalize_symbol(self, raw):
         """Fuzzy-fix model symbol output: 'sol', 'SOL/', 'solusd' -> 'SOL/USD'."""
         s = raw.strip().upper().replace(" ", "")
-        if s in self.symbols:
+        universe = self.scout_symbols
+        if s in universe:
             return s
         base = s.replace("/USD", "").rstrip("/").replace("USD", "")
-        for sym in self.symbols:
+        for sym in universe:
             if sym.split("/")[0] == base:
                 return sym
         return raw
@@ -182,9 +192,13 @@ class TradingAgent:
             expiry_timestamp=expiry if evaluate else None,
         )
         emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(proposal["action"], "⚪")
-        mode = "SHADOW (no execution)" if self.agent_cfg.get("shadow", True) else "LIVE"
-        # simulate on the virtual shadow account ($20) when in shadow mode
-        shadow_note = ""
+        # simulate on the virtual shadow account ($80) when in shadow mode.
+        # Journaling always happens (above), so the 24h-horizon evaluation of
+        # the idea is NEVER lost — the LLM's info-gathering continues even when
+        # the shadow ledger can't fund it. Discord messaging is what changes:
+        cash_exhausted = False
+        fill_txt = ""
+        note = ""
         if self.agent_cfg.get("shadow", True) and proposal["action"] in ("BUY", "SELL"):
             try:
                 if proposal["action"] == "BUY":
@@ -199,20 +213,37 @@ class TradingAgent:
                         rationale=proposal.get("rationale", ""),
                     )
                 if ok:
-                    shadow_note = f"\n💵 {note}"
+                    # note reads 'shadow BUY SYM: $40 @ $100 (qty 0.40)':
+                    # strip the leading action/symbol, the header has it
+                    fill_txt = note.split(":", 1)[1].strip() if ":" in note else note
                 else:
-                    shadow_note = f"\n💵 (shadow acct: {note})"
+                    if "insufficient" in note.lower():
+                        cash_exhausted = True
             except Exception as e:
                 print(f"[agent] shadow account execution failed: {e}")
         try:
-            send_notification(
-                f"{emoji} **Agent proposal — {proposal['kind']}** [{mode}]\n"
-                f"**{proposal['action']}** {proposal.get('symbol') or 'market'}"
-                + (f" | ${proposal.get('notional'):.0f}" if proposal.get("notional") else "")
-                + f" | confidence {proposal.get('confidence', 0):.2f}\n"
-                f"Rationale: {proposal.get('rationale', '')}\n{extra}{shadow_note}",
-                self.cfg,
-            )
+            if cash_exhausted:
+                # money message ONLY: the idea is journaled + will still be
+                # evaluated at its horizon; no recommendation blast when the
+                # tier's allocated cash is exhausted
+                send_notification(
+                    f"💵 Tier 2 AI: out of money — {proposal.get('symbol') or 'market'} idea saved, "
+                    f"not filled",
+                    self.cfg,
+                )
+            elif fill_txt:
+                send_notification(
+                    f"{emoji} Tier 2 AI {proposal['action']}: "
+                    f"{proposal.get('symbol') or 'market'} — {fill_txt}",
+                    self.cfg,
+                )
+            else:
+                # no shadow fill path (e.g. HOLD downgrades): keep it minimal
+                send_notification(
+                    f"{emoji} Tier 2 AI {proposal['action']} idea: "
+                    f"{proposal.get('symbol') or 'market'} — logged, watching",
+                    self.cfg,
+                )
         except Exception as e:
             print(f"[agent] proposal alert failed: {e}")
 
@@ -291,10 +322,14 @@ Respond with ONLY a JSON object, max 60 words total:
     # ---------------- scout ----------------
 
     def scout(self):
-        """Research the market for high-conviction entries beyond SMA crosses."""
+        """Research the market for high-conviction entries beyond SMA crosses.
+
+        Universe: Tier 1 symbols PLUS agent.scout_extra_universe (any liquid
+        Binance spot coin, e.g. XRP/DOGE) — the AI's idea net is wider than
+        the SMA strategy's execution scope by design."""
         bundle = research_bundle(self.symbols, self.research_cfg)
         price_ctxs = []
-        for sym in self.symbols:
+        for sym in self.scout_symbols:
             ctx = self._price_context(sym)
             if ctx:
                 price_ctxs.append({k: ctx[k] for k in
@@ -312,12 +347,12 @@ DATA (compact):
 - News headlines: {json.dumps(bundle.get('headlines', [])[:6])}
 - Whale/flow headlines per symbol: {json.dumps(per_sym_heads)}
 
-TASK: pick AT MOST one trade among {self.symbols} ONLY if evidence is strong
+TASK: pick AT MOST one trade among {self.scout_symbols} ONLY if evidence is strong
 (confluence of technicals + news + sentiment). No strong setup = HOLD.
 No rationale text outside the JSON.
 
 OUTPUT: a single JSON object, nothing else, rationale under 40 words:
-{{"action": "BUY"|"HOLD", "symbol": one of {self.symbols}, "notional": number <= {self.agent_cfg.get('max_proposed_notional', 50)}, "confidence": 0.0-1.0, "rationale": "1-3 sentences citing the evidence"}}"""
+{{"action": "BUY"|"HOLD", "symbol": one of {self.scout_symbols}, "notional": number <= {self.agent_cfg.get('max_proposed_notional', 50)}, "confidence": 0.0-1.0, "rationale": "1-3 sentences citing the evidence"}}"""
         try:
             proposal = self.model.generate_json(prompt, max_tokens=700)
         except Exception as e:
@@ -354,9 +389,13 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
             except Exception as e:
                 print(f"[agent] scout error: {e}")
         print(f"[{datetime.now()}] Agent cycle done: {len(proposals)} actionable proposals, {evaluated} evaluated")
-        # per-cycle shadow account status to Discord
+        # per-cycle Tier 2 money line to Discord
         try:
-            send_notification(f"💵 {self.shadow.status_line()}", self.cfg)
+            from bot.brief import money_line, emoji_for
+            v = self.shadow.mark_to_market()
+            delta = v[0] - self.shadow.start_cash
+            pos_txt = f" | holding {', '.join(sorted(self.shadow._positions()))}" if self.shadow._positions() else " | no open trades"
+            send_notification(f"{emoji_for(delta)} {money_line('Tier 2 AI', v[0], self.shadow.start_cash)}{pos_txt}", self.cfg)
         except Exception as e:
             print(f"[agent] shadow status alert failed: {e}")
         return proposals

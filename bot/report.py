@@ -156,7 +156,7 @@ def account_snapshot():
         return f"Account snapshot unavailable: {e}"
 
 def shadow_snapshot():
-    """Shadow account section for the daily report (virtual $20 ledger)."""
+    """Shadow account section for the daily report (virtual $80 ledger)."""
     try:
         from bot.config import config
         from bot.broker import make_broker
@@ -172,7 +172,7 @@ def shadow_snapshot():
 
 
 def tier3_wallet_snapshot():
-    """Tier 3 betting wallet section (virtual $10 Polymarket ledger)."""
+    """Tier 3 betting wallet section (virtual $60 Polymarket ledger)."""
     try:
         from bot.config import config
         from bot.wallet import BettingWallet

@@ -52,7 +52,7 @@ risk:
   daily_loss_limit_pct: 5.0
   flatten_on_daily_loss: true
   target_risk_pct_per_trade: 0.5
-  # scaled for the $20 binance_paper ledger (15% of $20 would only allow $3 deployed)
+  # scaled for the $100 binance_paper ledger
   max_crypto_allocation_pct: 75.0
   atr_period: 14
   catastrophic_atr_multiple: 3.0
@@ -72,6 +72,16 @@ agent:
   shadow_start_cash: 80
   shadow_max_per_position: 40
   evaluation_horizon_hours: 24
+  # Scout may ALSO propose high-conviction ideas OUTSIDE the Tier 1 universe
+  # (e.g. XRP, DOGE — any liquid Binance spot coin with news behind it).
+  # Tier 1 execution stays hard-scoped to `symbols:`; this widens the AI's
+  # idea net only. Babysitter stays scoped to held positions.
+  scout_extra_universe:
+    - XRP/USD
+    - DOGE/USD
+    - ADA/USD
+    - AVAX/USD
+    - LINK/USD
 
 # Research tools for the agent (all free tiers)
 research:
