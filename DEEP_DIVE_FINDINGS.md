@@ -132,7 +132,9 @@ DEFERRED to P2.
   (`memecoin.py:833-865`). Fixed in P0b.
 - Manual `buy()` ignores `max_open_positions` (`memecoin.py:312-351`). Fixed in P0b.
 - No memecoin-ness filter — trending includes Polkadot/Zcash/Pudgy Penguins;
-  `categories` fetched but unused (`memecoin.py:767-790,394`). DEFERRED P2.
+  `categories` fetched but unused (`memecoin.py:767-790,394`). FIXED 2026-09-09:
+  meme-category screen in rug-guard — CoinGecko categories must match
+  `meme_category_keywords` (config.yaml; empty list disables).
 
 ## F12. [FIXED 2026-09-08, P1a] Tier 1 missed-death-cross retry abandoned on whipsaw — MEDIUM — `bot/trader.py:328-337` + `_catchup_signal:191-207`
 

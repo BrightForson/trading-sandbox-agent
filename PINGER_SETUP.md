@@ -20,7 +20,7 @@ created → `completed/success`.
 
 | File | Role |
 |---|---|
-| `pinger.sh` | POSTs dispatches for chat + trade, logs HTTP codes to `pinger.log` |
+| `pinger.sh` | POSTs dispatches for chat + trade; freshness-checks agent + futures workflows (>100 min stale → dispatch); logs HTTP codes to `pinger.log` |
 | `refresh_token.sh` | weekly re-cache of the gh CLI token (Sundays 04:00) |
 | `gh_token` | cached gh OAuth token (mode 600; gh itself refreshes on use) |
 
@@ -52,10 +52,21 @@ gh api repos/BrightForson/trading-sandbox-agent/actions/runs?per_page=6 \
 Pain-meter (`actions_health()` in the daily report) now reads `ok` for
 trade/chat — it measures exactly this.
 
+### Staleness net for hourly workflows (added 2026-09-09)
+
+The pinger now also checks the LAST RUN of `agent` and `futures` (hourly
+workflows GitHub delivers reliably). If either is >100 min stale it
+dispatches them too. This plus the agent-cycle heartbeat fallback means
+an asleep laptop can no longer cause a missing-hour heartbeat — the
+hourly agent workflow posts it even when 15-min trade cycles never ran.
+
 ### Known limitation — this machine is the cron host
 
-Pings only fire while this machine is awake and online. If it becomes
-unreliable, migrate to cron-job.org (cloud, always-on, free):
+Pings only fire while this machine is awake and online. If the trading
+stack later moves to the Oracle Cloud / GCP free-tier VPS (planned),
+copy `~/.config/trading-pinger/` there and install the same crontab —
+an always-on VPS cron host fully solves the asleep-laptop problem.
+Alternative cloud option: migrate to cron-job.org (always-on, free):
 
 - Sign up console.cron-job.org; create two POST jobs to
   `https://api.github.com/repos/BrightForson/trading-sandbox-agent/actions/workflows/{chat,trade}.yml/dispatches`
