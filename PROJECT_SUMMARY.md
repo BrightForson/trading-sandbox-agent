@@ -20,7 +20,7 @@ run_chat.py           # two-way Discord chat cycle
 run_report.py         # daily report
 backtest.py           # SMA strategy backtest (--days N, --timeframe 1Day)
 validation.py         # end-to-end stack sanity check (no orders placed)
-tests/                # pytest suite (195 tests)
+tests/                # pytest suite (199 tests)
 config.yaml           # symbols, strategy params, risk caps, agent/scanner/memecoin settings
 bot/
   config.py           # yaml + env config (lazy credential checks)

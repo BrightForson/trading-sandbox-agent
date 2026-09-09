@@ -167,7 +167,7 @@ class FuturesLedger:
         self.journal.set_meta(CASH_META, str(round(cash, 8)))
         self.journal.set_meta(POSITIONS_META, json.dumps(positions))
 
-    def _log_trade(self, symbol, action, qty, price, note=""):
+    def _log_trade(self, symbol, action, qty, price, note="", fee=0.0):
         self.journal.log_trade(
             timestamp=_now_iso(),
             symbol=symbol,
@@ -175,6 +175,7 @@ class FuturesLedger:
             qty=qty,
             price=price,
             reasoning=f"{TIER5_TAG} {note}",
+            fee=float(fee),
         )
 
     def _cooldowns(self):
@@ -450,7 +451,7 @@ class FuturesLedger:
             "funding_accrued": 0.0,
         }
         self._save(v["cash"] - margin - fee, positions)
-        self._log_trade(symbol, f"OPEN-{side}", qty, entry, note=reason)
+        self._log_trade(symbol, f"OPEN-{side}", qty, entry, note=reason, fee=fee)
         self._update_peak(self.valuation()["equity"])
         return True, (f"futures {side} {symbol}: ${margin:.2f} margin @ ${entry:.2f} "
                       f"({self.leverage:.0f}x, notional ${notional:.2f}) | "
@@ -481,7 +482,8 @@ class FuturesLedger:
         self._save(self._cash() + margin + pnl_net, positions)
         self._add_cooldown(symbol, self.cooldown_hours)
         self._log_trade(symbol, f"CLOSE-{side}", qty, exit_price,
-                        note=f"{note} (pnl {pnl_net:+.2f})")
+                        note=f"{note} (pnl {pnl_net:+.2f})",
+                        fee=fee + float(pos.get("funding_accrued") or 0.0))
         return {"symbol": symbol, "side": side, "exit_price": exit_price,
                 "pnl": pnl_net, "margin": margin}
 

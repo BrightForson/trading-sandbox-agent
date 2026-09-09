@@ -485,3 +485,37 @@ def test_status_line_and_valuation_stale_marks(tmp_path):
     assert v["equity"] == pytest.approx(20.0, rel=1e-9)  # not marked at entry
     line = led.status_line()
     assert "Tier 5" in line and "KILLED" not in line
+
+
+# ---------------- fee journaling (ledger/audit reconciliation) ----------------
+
+def test_open_journals_actual_fee(tmp_path):
+    bars15, bars1h = _mk_bars(price=100.0, atr=1.0)
+    led, j = _ledger(tmp_path, prices={"BTC/USD": 100.0},
+                     bars={"BTC/USD": (bars15, bars1h)})
+    ok, msg = led.open("BTC/USD", "LONG", margin=10, reason="test",
+                       confidence=0.8)
+    assert ok, msg
+    trades = j.get_trades()
+    assert len(trades) == 1
+    # fee = notional(10*10=100) * 0.05% = 0.05; row fee col index 7
+    assert trades[0][7] == pytest.approx(0.05, abs=1e-9)
+    assert led._cash() == pytest.approx(50 - 10 - 0.05, rel=1e-9)
+
+
+def test_close_journals_exit_fee_and_funding(tmp_path):
+    bars15, bars1h = _mk_bars(price=100.0, atr=1.0)
+    led, j = _ledger(tmp_path, prices={"BTC/USD": 100.0},
+                     bars={"BTC/USD": (bars15, bars1h)})
+    ok, msg = led.open("BTC/USD", "LONG", margin=10, reason="test",
+                       confidence=0.8)
+    assert ok, msg
+    # simulate funding accrued on the open position
+    pos = led._positions()["BTC/USD"]
+    pos["funding_accrued"] = 0.02
+    led._save(led._cash(), {**led._positions(), "BTC/USD": pos})
+    r = led._close_position("BTC/USD", mark=100.0, note="test close")
+    assert r is not None
+    close_row = next(t for t in j.get_trades() if t[3] == "CLOSE-LONG")
+    # CLOSE row fee = exit fee (0.05) + funding (0.02)
+    assert close_row[7] == pytest.approx(0.07, abs=1e-9)

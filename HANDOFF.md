@@ -6,7 +6,7 @@ Five-tier paper system is fully live on GitHub Actions. Next phase: the 4-week
 no-touch test — monitoring, not building.
 
 ## Session state (what just happened)
-1. **Full suite green after models.py overhaul**: 195/195 passed. Two test-fake
+1. **Full suite green after models.py overhaul**: 199/199 passed. Two test-fake
    signatures needed the new `system=` kwarg (tests/test_tier4.py:450,
    tests/test_tier4_fixes.py:79).
 2. **LLM gate verified live**: `FuturesLedger._llm_conviction` 5 trials across
@@ -31,7 +31,7 @@ no-touch test — monitoring, not building.
    registered; first dispatch run completed SUCCESS (3 signals, equity
    $49.91, safe commit back). Pinger staleness net now also covers futures.
 6. **Docs updated**: PROJECT_SUMMARY.md (Tier 5 in tier list/layout/config/
-   crons/model chain/kill-keep/ops, five-tier, 195 tests), DEEP_DIVE_FINDINGS
+   crons/model chain/kill-keep/ops, five-tier, 199 tests), DEEP_DIVE_FINDINGS
    (F11 meme filter closed), PINGER_SETUP.md (staleness net + VPS note).
    validation.py ALL CHECKS PASSED (model roundtrip via rotation-active chain).
 
@@ -77,8 +77,20 @@ no-touch test — monitoring, not building.
 - Journal DB data/trades.db committed by safe_commit.sh; NEVER merge
   data/archive into it (pre-reset archives corrupted by design).
 - Audit: `./venv/bin/python tools/audit_ledgers.py`; tests:
-  `./venv/bin/python -m pytest tests/ -q` (195); sanity:
+  `./venv/bin/python -m pytest tests/ -q` (199); sanity:
   `./venv/bin/python validation.py`.
+
+## Post-session fix (2026-09-09 ~18:00 UTC, fee-journaling reconciliation)
+- Audit was flagging PROBLEMS; root causes found and fixed:
+  1. `config.yaml execution.taker_fee_pct` was 0.25 vs broker's actual 0.1
+     — historical tier1 rows journaled inflated fees (orders 1-3 pre-fix).
+     Repaired in DB (recomputed at 0.1%); config now 0.1 to match broker.
+  2. Tier 4/5 ledgers journaled fee=0 rows (cash correct, audit blind) —
+     `_log_trade` now journals actual fee (and funding on futures CLOSE).
+  3. Audit excluded tier5 rows from tier1 filter → 2 phantom-sell false
+     positives; tier5 gets an informational section (margins/kill state).
+- Audit now CLEAN: tier1/tier2/tier4 reconcile to the cent.
+- 4 regression tests added (fee journaling); suite 199/199 green.
 
 ## Current live state (at session end)
 - Tier 1 paper: ~$99.77 (SMA bot, flat, whipsaw losses all-time -$0.31).

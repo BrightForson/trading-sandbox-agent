@@ -129,3 +129,31 @@ def test_batch_card_dedupe(tmp_path):
     fresh = led._dedupe_and_log([card, dict(card), dict(card)])
     assert len(fresh) == 1
     assert len(j.get_tier4_cards()) == 1
+
+
+# ---------------- fee journaling (ledger/audit reconciliation) ----------------
+
+def test_buy_journals_actual_fee(tmp_path):
+    led, j = _ledger(tmp_path, prices={"A": 0.1})
+    ok, msg = led.buy("A", 9)
+    assert ok
+    trades = j.get_trades()
+    assert len(trades) == 1
+    # get_trades returns DESC (newest first): row = (id, ts, sym, action,
+    # qty, price, reasoning, fee, ...)
+    assert trades[0][7] == pytest.approx(0.09, abs=1e-6)
+    # fee model matches: cash left = 40 - 9 (fee embedded in qty, see _buy)
+    assert led._cash() == pytest.approx(31.0, abs=1e-9)
+
+
+def test_sell_journals_actual_fee(tmp_path):
+    led, j = _ledger(tmp_path, prices={"A": 0.1})
+    assert led.buy("A", 9)[0]
+    r = led._sell_position("A", note="test exit")
+    assert r is not None
+    rows = j.get_trades()
+    sell_row = next(t for t in rows if t[3] == "SELL")
+    # SELL fee = proceeds * 1% journaled on the row
+    sell_fee = sell_row[7]
+    assert sell_fee > 0
+    assert sell_fee == pytest.approx(sell_row[4] * sell_row[5] * 0.01, rel=1e-6)

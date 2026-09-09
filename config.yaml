@@ -29,9 +29,10 @@ sma_slow: 50
 notional: 100
 
 # Conservative assumptions used only for research/backtests and paper fills.
-# Binance spot taker fee is 0.1%.
+# Binance spot taker fee is 0.1%. Must match broker.taker_fee_pct — the broker
+# journals its actual fill fees, and a mismatch here skews backtests.
 execution:
-  taker_fee_pct: 0.25
+  taker_fee_pct: 0.1
   slippage_bps: 8
 
 # Report delivery
