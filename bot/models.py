@@ -20,10 +20,13 @@ from bot.errors import ModelError
 
 load_dotenv()
 
-# Ranked preference chain (verified against the live /v1/models catalog; probed at runtime)
+# Ranked preference chain (verified against the live /v1/models catalog; probed at runtime).
+# kimi-k3 leads since 2026-09-09: nemotron-3-super's JSON compliance degraded
+# badly under load (persistent narration instead of JSON objects; 503s) —
+# kimi emits clean JSON with response_format on the same prompts.
 MODEL_CHAIN = [
-    "nvidia/nemotron-3-super-120b-a12b",   # current primary
-    "moonshotai/kimi-k3",
+    "moonshotai/kimi-k3",                  # current primary
+    "nvidia/nemotron-3-super-120b-a12b",
     "deepseek-ai/deepseek-v4-flash-0731",
     "minimaxai/minimax-m3",
     "nvidia/nemotron-3-ultra-550b-a55b",
@@ -92,6 +95,29 @@ class ModelManager:
                 return candidate
         raise ModelError(f"No working model in chain: {MODEL_CHAIN}")
 
+    def rotate_model(self, announce=True):
+        """Switch to the NEXT chain model (true rotation). select_model()
+        always re-picks the chain head, so mid-gate retries on a narrating
+        model would loop the same model; rotation actually changes it."""
+        try:
+            idx = (MODEL_CHAIN.index(self.active_model)
+                    if self.active_model in MODEL_CHAIN else -1)
+        except ValueError:
+            idx = -1
+        for offset in range(1, len(MODEL_CHAIN) + 1):
+            candidate = MODEL_CHAIN[(idx + offset) % len(MODEL_CHAIN)]
+            if candidate == self.active_model:
+                break
+            if self._probe(candidate):
+                previous = self.active_model
+                self.active_model = candidate
+                self._persist()
+                self._record_probe_time()
+                if announce and previous != candidate:
+                    self._announce_switch(previous, candidate)
+                return candidate
+        return self.select_model(announce=announce)
+
     def _record_probe_time(self):
         if self.journal:
             self.journal.set_meta(META_PROBED_KEY,
@@ -137,13 +163,21 @@ class ModelManager:
 
     # ---------- generation ----------
 
-    def generate_text(self, prompt, max_tokens=800, temperature=0.7, retries=1):
-        """Generate text with the active model; on failure reselect once and retry."""
+    def generate_text(self, prompt, max_tokens=800, temperature=0.7, retries=1,
+                      system=None):
+        """Generate text with the active model; on failure reselect once and retry.
+
+        `system` optionally pins a system-role instruction (models comply with
+        system contracts far better than in-prompt ones)."""
         for attempt in range(retries + 1):
             try:
+                messages = []
+                if system:
+                    messages.append({"role": "system", "content": system})
+                messages.append({"role": "user", "content": prompt})
                 response = self.client.chat.completions.create(
                     model=self.active_model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
                 )
@@ -155,30 +189,125 @@ class ModelManager:
                 else:
                     raise ModelError(f"All model attempts failed: {e}")
 
-    def generate_json(self, prompt, max_tokens=800, temperature=0.2):
-        """Generate and parse a JSON object; repair-retries + regex last resort."""
-        raw = self.generate_text(prompt, max_tokens=max_tokens, temperature=temperature)
+    JSON_SYSTEM = (
+        "You are a JSON API endpoint. You NEVER write prose, questions, or "
+        "explanations — you output exactly one valid JSON object and nothing "
+        "else. The first character of every response is '{' and the last is '}'. "
+        "If you are unsure, still emit your best-guess JSON object."
+    )
+
+    def generate_json(self, prompt, max_tokens=800, temperature=0.2, system=None):
+        """Generate and parse a JSON object.
+
+        Strategy (each stage retries the stochastic failures the nemotron
+        chain exhibits — narration-instead-of-JSON and empty objects):
+          1. native JSON mode, up to 3 draws, rejecting empty dicts
+          2. system-role plain call
+          3. strict repair retry
+          4. regex extraction / fragment reconstruction
+        Fail-closed raise.
+
+        `system` optionally overrides the JSON-contract system role — gates
+        pass their full dossier there and keep the user prompt terse
+        (long user prompts reliably make nemotron narrate instead of emit)."""
+        json_system = system if system is not None else self.JSON_SYSTEM
+
+        def _usable(obj):
+            return isinstance(obj, dict) and len(obj) > 0
+
+        # 1) native JSON mode, several draws (narration/empty are stochastic);
+        #    on repeated garbage, rotate to the NEXT model in the chain
+        #    (service quality varies per model; a stuck one shouldn't block
+        #    the gate for the whole cycle)
+        rotations = 0
+        for draw in range(8):
+            if draw in (3, 6) and rotations < 2:
+                try:
+                    self.rotate_model(announce=True)
+                    rotations += 1
+                except Exception:
+                    pass
+            try:
+                messages = [
+                    {"role": "system", "content": json_system},
+                    {"role": "user", "content": prompt},
+                ]
+                response = self.client.chat.completions.create(
+                    model=self.active_model,
+                    messages=messages,
+                    max_tokens=max(max_tokens, 500),
+                    temperature=temperature,
+                    response_format={"type": "json_object"},
+                )
+                out = self._parse_json(response.choices[0].message.content)
+                if _usable(out) and any(k for k in out if k):
+                    return out
+                # empty/garbage object: redraw
+            except ModelError:
+                # narration or unparseable: redraw
+                continue
+            except Exception as e:
+                # API/model doesn't support response_format at all: stop trying
+                print(f"[model-manager] JSON mode unavailable ({str(e)[:120]}); using system-role path")
+                break
+        # 2) system-role plain call + repair retry + fragment reconstruction
+        raw = self.generate_text(prompt, max_tokens=max_tokens,
+                                 temperature=temperature, system=json_system)
         try:
-            return self._parse_json(raw)
+            out = self._parse_json(raw)
+            if _usable(out):
+                return out
         except ModelError:
             pass
         # retry with strict repair instruction
         repair = (
             "Your previous answer was not valid JSON. Output ONLY the JSON object, "
-            "no prose, no analysis, no markdown. Begin your response with '{' and end "
-            "with '}'. Previous answer (truncated): "
-            f"{raw[:300]}\n\nOriginal request:\n{prompt}\n\nJSON only now:"
+            "no prose, no analysis, no markdown. Your very first character must be "
+            "'{' and your very last must be '}'. Do not discuss the task; just emit "
+            "the object. Previous answer (truncated): "
+            f"{raw[:300]}\n\nOriginal request:\n{prompt}\n\nJSON object only now:"
         )
         raw2 = ""
         try:
-            raw2 = self.generate_text(repair, max_tokens=max_tokens, temperature=0.0)
-            return self._parse_json(raw2)
+            raw2 = self.generate_text(repair, max_tokens=max_tokens, temperature=0.0,
+                                      system=json_system)
+            out = self._parse_json(raw2)
+            if _usable(out):
+                return out
         except ModelError:
             pass
-        # last resort: regex-extract the fields we care about from prose
+        # last resort 1: regex-extract the fields we care about from prose
         extracted = self._regex_extract(raw + "\n" + raw2)
         if extracted:
             return extracted
+        # last resort 2: reconstruct an object from quoted JSON fragments the
+        # model wrote INSIDE prose (nemotron often narrates the object without
+        # emitting it): {"take": true, "confidence": 0.78, "reason": "..."}
+        import re
+        merged = {}
+        for m in re.finditer(r'\{["\']?\w+["\']?\s*:.*?\}', raw + "\n" + raw2, re.DOTALL):
+            frag = m.group(0)
+            # normalize single quotes and unquoted keys enough to parse
+            frag = re.sub(r'(\w+)\s*:', r'"\1":', frag)
+            frag = frag.replace("'", '"')
+            try:
+                obj = json.loads(frag)
+                if isinstance(obj, dict):
+                    merged.update({k: v for k, v in obj.items() if v is not None})
+            except Exception:
+                continue
+        # boolean/numeric coercion for known gate fields
+        if merged:
+            for key in ("take", "buy"):
+                if key in merged and not isinstance(merged[key], bool):
+                    merged[key] = str(merged[key]).strip().lower() in ("true", "yes", "1")
+            if "confidence" in merged:
+                try:
+                    merged["confidence"] = float(merged["confidence"])
+                except (TypeError, ValueError):
+                    merged.pop("confidence", None)
+            if any(k in merged for k in ("take", "buy", "action", "confidence")):
+                return merged
         raise ModelError(f"Model refused JSON twice: {raw[:200]}")
 
     def generate_json_arr(self, prompt, max_tokens=800, temperature=0.2):
@@ -242,11 +371,16 @@ class ModelManager:
 
     @staticmethod
     def _parse_json(raw):
+        if raw is None:
+            raise ModelError("Model returned no content")
         text = raw.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
+        # some JSON-mode backends emit a doubled opening brace: "{ {"
+        if text.startswith("{ {"):
+            text = text[2:]
         start, end = text.find("{"), text.rfind("}")
         if start == -1:
             raise ModelError(f"No JSON object in model output: {raw[:200]}")
