@@ -28,6 +28,8 @@ PRESERVED_META = {
     "discord_chat_channel_id",
     "active_llm_model",
     "t4_kill_count",
+    "kill_switch",
+    "kill_switch_reason",
 }
 CLEAR_TABLES = ["trades", "proposals", "bets", "wallet_snapshots", "tier4_cards"]
 

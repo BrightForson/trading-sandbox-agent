@@ -69,15 +69,22 @@ def fetch_bars(broker, symbol, timeframe, days):
 
 def simulate(bars, sma_fast, sma_slow, notional, taker_fee_pct=0.0, slippage_bps=0.0,
              max_notional_per_trade=0.0, compound=False,
-             atr_period=0, catastrophic_atr_multiple=0.0, fallback_stop_pct=0.0):
+             atr_period=0, catastrophic_atr_multiple=0.0, fallback_stop_pct=0.0,
+             target_risk_pct_per_trade=0.0, equity_cap_pct=0.0):
     """Simulate a long-only crossover using only information available at close.
 
     A cross observed on bar ``i`` is filled at the following bar's open. Fees and
     adverse slippage are applied on every fill so the result is not a same-bar,
     zero-friction estimate.
 
-    Sizing mirrors the live loop: each BUY deploys at most
-    ``max_notional_per_trade`` (0 = uncapped), never more than the requested
+    Sizing mirrors the live loop (bot.risk.RiskEngine.size_for_atr): each BUY
+    deploys at most ``max_notional_per_trade`` (0 = uncapped), never more than
+    the requested notional, never more than 98% of cash — and, when
+    ``target_risk_pct_per_trade`` > 0, never more than
+    (equity * target_risk_pct) / (atr * catastrophic_atr_multiple) * price,
+    exactly the ATR-risk bound the live loop applies. ``equity_cap_pct``
+    mirrors the live max_crypto_allocation_pct gate (positions may not
+    exceed that % of account equity).
     ``notional`` or 98% of available cash. With ``compound=False`` (default)
     position size stays fixed in dollars, exactly like live fixed-notional
     sizing; wins do NOT grow the next trade.
@@ -127,6 +134,8 @@ def simulate(bars, sma_fast, sma_slow, notional, taker_fee_pct=0.0, slippage_bps
     slow = df["close"].rolling(sma_slow).mean()
     stop_mult = max(0.0, float(catastrophic_atr_multiple or 0.0))
     stop_fallback_pct = max(0.0, float(fallback_stop_pct or 0.0))
+    target_risk_pct = max(0.0, float(target_risk_pct_per_trade or 0.0))
+    equity_cap_pct = max(0.0, float(equity_cap_pct or 0.0))
     stop_price = 0.0
     if atr_period > 0 and (stop_mult > 0 or stop_fallback_pct > 0) and "high" in df.columns and "low" in df.columns:
         tr = pd.concat([
@@ -192,6 +201,22 @@ def simulate(bars, sma_fast, sma_slow, notional, taker_fee_pct=0.0, slippage_bps
                 target_notional = min(target_notional, per_trade_cap)
             if not compound:
                 target_notional = min(target_notional, initial_capital * 0.98)
+            # ATR-risk sizing parity with bot.risk.size_for_atr: cap the
+            # notional so a stop hit loses at most target_risk_pct of equity
+            if target_risk_pct > 0 and stop_mult > 0 and atr_series is not None:
+                atr_val = atr_series.iloc[i]
+                if not math.isnan(atr_val) and atr_val > 0:
+                    equity_now = cash + position_qty * float(df["close"].iloc[i])
+                    risk_budget = equity_now * target_risk_pct / 100.0
+                    stop_distance = float(atr_val) * stop_mult
+                    target_notional = min(target_notional,
+                                          risk_budget / stop_distance * price)
+            # live allocation cap: position notional never exceeds
+            # equity_cap_pct of account equity
+            if equity_cap_pct > 0:
+                equity_now = cash + position_qty * float(df["close"].iloc[i])
+                cap = equity_now * equity_cap_pct / 100.0
+                target_notional = min(target_notional, cap)
             target_notional = min(target_notional, cash * 0.98)
             if target_notional <= 0:
                 continue
@@ -288,7 +313,9 @@ def run(days=30, timeframe_str=None, per_request_limit=500):
                          max_notional_per_trade=risk.get("max_notional_per_trade", 0),
                          atr_period=int(risk.get("atr_period", 0) or 0),
                          catastrophic_atr_multiple=risk.get("catastrophic_atr_multiple", 0),
-                         fallback_stop_pct=risk.get("fallback_stop_pct", 0))
+                         fallback_stop_pct=risk.get("fallback_stop_pct", 0),
+                         target_risk_pct_per_trade=risk.get("target_risk_pct_per_trade", 0),
+                         equity_cap_pct=risk.get("max_crypto_allocation_pct", 0))
         results[symbol] = stats
         combined_pnl += stats["pnl"]
         print(f"  bars: {len(df)}  range: {df.index.min()} -> {df.index.max()}")
@@ -299,6 +326,8 @@ def run(days=30, timeframe_str=None, per_request_limit=500):
         print(f"  exposure: {stats['exposure_pct']:.1f}%  turnover: ${stats['turnover']:.2f}  fees: ${stats['fees']:.2f}")
         print(f"  buy-and-hold benchmark: {stats['benchmark_return_pct']:+.2f}%")
     print(f"\n=== Combined P&L across {len(results)} symbols: ${combined_pnl:.2f} ===")
+    print("    (note: each symbol is simulated with an independent cash pool;")
+    print("     the live $100 ledger is shared across symbols with a 3-position cap)")
     return results
 
 

@@ -26,6 +26,18 @@ def _cfg_val(cfg, key, default):
     return float((getattr(cfg, "scanner", None) or {}).get(key, default))
 
 
+def _family_has_open_bet(journal, ev_family):
+    """True if any open bet's notes already carry this event family tag."""
+    try:
+        for b in journal.get_open_bets():
+            notes = b[9] or ""
+            if f"event={ev_family}" in notes:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _fetch_markets(limit=100, active_only=True, closed=False):
     params = {
         "limit": limit,
@@ -61,6 +73,8 @@ def _parse_market(m):
             "id": m.get("id"),
             "question": (m.get("question") or "")[:200],
             "slug": m.get("slug", ""),
+            "event_id": ((m.get("events") or [{}])[0] or {}).get("id"),
+            "event_slug": ((m.get("events") or [{}])[0] or {}).get("slug"),
             "outcomes": outcomes,
             "yes_price": float(prices[0]),
             "no_price": float(prices[1]),
@@ -129,13 +143,18 @@ def scan_llm_mispricing(cfg, markets=None, model=None, journal=None):
     journal = journal or TradeJournal()
     if model is None:
         model = ModelManager(journal=journal)
-    # pick liquid, non-trivial markets for estimation
+    # pick liquid, non-trivial markets for estimation. Liquidity floor:
+    # quoted prices on thin markets are not fillable, so their EV is
+    # fiction — require real liquidity AND at least min_market_volume.
     candidates = []
+    min_liq = _cfg_val(cfg, "min_market_liquidity", 10000)
     for m in markets:
         parsed = _parse_market(m)
         if parsed is None:
             continue
-        if parsed["volume_24h"] < _cfg_val(cfg, "min_market_volume", 50000) / 10:
+        if parsed["volume_24h"] < _cfg_val(cfg, "min_market_volume", 50000):
+            continue
+        if parsed["liquidity"] < min_liq:
             continue
         if parsed["end_ts"] is None:
             continue
@@ -145,10 +164,12 @@ def scan_llm_mispricing(cfg, markets=None, model=None, journal=None):
             break
     if not candidates:
         return []
-    lines = [f"- {c['question']} (current YES price: {c['yes_price']:.2f})" for c in candidates]
+    lines = [f"- {c['question']} (outcomes: {c['outcomes'][0]} or {c['outcomes'][1]}; "
+             f"current price of {c['outcomes'][0]}: {c['yes_price']:.2f})" for c in candidates]
     prompt = f"""You are a prediction-market analyst. For each market, estimate the
-true probability (0.00-1.00) of the FIRST outcome (YES) resolving true, using
-your world knowledge. Be calibrated and skeptical of hype.
+true probability (0.00-1.00) of the FIRST listed outcome resolving true, using
+your world knowledge. Be calibrated and skeptical of hype. The first outcome's
+name is given explicitly — judge THAT outcome, not a generic "yes".
 
 Markets:
 {chr(10).join(lines)}
@@ -193,6 +214,10 @@ def scan(cfg, journal=None, model=None):
     """Full scanner cycle: both strategies, paper-log and alert the best finds."""
     from bot.wallet import BettingWallet
     journal = journal or TradeJournal()
+    scanner_cfg = getattr(cfg, "scanner", None) or {}
+    if not scanner_cfg.get("enabled", True):
+        print("[scanner] disabled in config — skipping cycle")
+        return {"paper_finds": [], "watchlist": [], "bust": False}
     print(f"[{datetime.now()}] Scanner cycle starting (paper bets only)")
     wallet = BettingWallet(cfg, journal=journal)
     wallet_bust = wallet.is_bust()
@@ -210,15 +235,25 @@ def scan(cfg, journal=None, model=None):
     paper_finds = [f for f in finds if f.get("paper_bet_allowed")]
     if wallet_bust:
         print("[scanner] wallet BUST — scanning watchlist only, no new paper bets")
-        send_notification(
-            f"💀 Tier 3 Bets: out of money — no new bets until reset",
-            cfg,
-        )
+        # latch: alert once per bust, not every 6h cycle
+        latch = journal.get_meta("wallet_bust_alerted")
+        if latch != "on":
+            send_notification(
+                f"💀 Tier 3 Bets: out of money — no new bets until reset",
+                cfg,
+            )
+            journal.set_meta("wallet_bust_alerted", "on")
         paper_finds = []
     for f in paper_finds[:5]:
         try:
             market = f["slug"] or f["question"][:60]
             if journal.has_open_bet(market, f["side"]):
+                continue
+            # event-family dedupe: sibling markets of one event (e.g. the
+            # same tennis match under multiple tickers) are correlated bets;
+            # one open bet per event family caps the correlated exposure
+            ev_family = f.get("event_slug") or f.get("event_id") or ""
+            if ev_family and _family_has_open_bet(journal, ev_family):
                 continue
             fee = float(f.get("fee", 0.0))
             if journal.open_bet_exposure() + stake + fee > max_exposure:
@@ -233,7 +268,8 @@ def scan(cfg, journal=None, model=None):
                 stake=stake,
                 outcome="open",
                 notes=(f"strategy={f['strategy']} llm_prob={f.get('llm_prob')} "
-                       f"gap={f.get('gap')} ev_pct={f.get('expected_value_pct'):.2f}"),
+                       f"gap={f.get('gap')} ev_pct={f.get('expected_value_pct'):.2f}"
+                       + (f" event={ev_family}" if ev_family else "")),
                 fee=fee,
                 estimated_probability=f.get("estimated_probability"),
                 expected_value=f.get("expected_value"),

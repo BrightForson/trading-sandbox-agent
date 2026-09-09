@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read  # pain-meter: workflow-runs listing needs this scope on GITHUB_TOKEN
 
 jobs:
   report:

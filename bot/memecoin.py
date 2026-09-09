@@ -73,6 +73,9 @@ DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/search"
 # under the public cap so a 7-card cycle never trips 429s
 COINGECKO_MIN_INTERVAL_SECONDS = 12.0
 _last_coingecko_call = [0.0]
+# per-process ticker -> coingecko id resolution cache (refreshed daily)
+_TICKER_MAP_CACHE = {"map": {}, "fetched_at": 0.0}
+_TICKER_MAP_TTL_SECONDS = 86400
 
 
 def _pace_coingecko():
@@ -81,6 +84,37 @@ def _pace_coingecko():
     if wait > 0:
         time.sleep(wait)
     _last_coingecko_call[0] = time.monotonic()
+
+
+def _coingecko_ticker_map():
+    """ticker (e.g. WIF) -> coingecko id (e.g. dogwifhat), via /coins/list.
+
+    Cached in-process for a day; failures return the last good map (or an
+    empty map the first time) — resolution failing means spike cards are
+    skipped, never mis-priced.
+    """
+    now = time.monotonic()
+    if (_TICKER_MAP_CACHE["map"]
+            and now - _TICKER_MAP_CACHE["fetched_at"] < _TICKER_MAP_TTL_SECONDS):
+        return _TICKER_MAP_CACHE["map"]
+    try:
+        _pace_coingecko()
+        resp = requests.get(f"{COINGECKO_COIN_URL}/list", headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        m = {}
+        for row in resp.json():
+            sym = (row.get("symbol") or "").upper()
+            cid = row.get("id") or ""
+            if sym and cid:
+                # first entry wins; canonical ids sort before derivatives
+                m.setdefault(sym, cid)
+        if m:
+            _TICKER_MAP_CACHE["map"] = m
+            _TICKER_MAP_CACHE["fetched_at"] = now
+        return _TICKER_MAP_CACHE["map"]
+    except Exception as e:
+        print(f"[tier4] coingecko ticker map fetch failed: {e}")
+        return _TICKER_MAP_CACHE["map"]
 
 TIER4_TAG = "[tier4-memecoin]"
 KILL_META = "t4_kill"
@@ -207,42 +241,80 @@ class MemecoinLedger:
     # ---------------- prices ----------------
 
     def price_for(self, symbol):
-        """Best-effort mark: Binance public data first, CoinGecko fallback."""
+        """Best-effort mark: Binance public data first, CoinGecko fallback.
+
+        Per-process cache (60s) so one sweep hits each symbol once; the
+        CoinGecko fallback resolves tickers through the id map and is paced
+        like every other CG call."""
         symbol = str(symbol).replace("/USD", "").replace("-USD", "").upper()
+        now = time.monotonic()
+        cached = getattr(self, "_price_cache", None)
+        if cached is not None:
+            ts, val = cached.get(symbol, (0.0, None))
+            if now - ts < 60 and val is not None:
+                return val
+        px = None
         try:
             from bot.binance_data import BinanceDataClient
             px = BinanceDataClient(self.cfg).last_close(symbol)
             if px and float(px) > 0:
-                return float(px)
+                px = float(px)
+            else:
+                px = None
         except Exception:
-            pass
-        try:
-            resp = requests.get(
-                COINGECKO_PRICE_URL,
-                params={"ids": symbol.lower(), "vs_currencies": "usd"},
-                headers=HEADERS, timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if symbol.lower() in data and "usd" in data[symbol.lower()]:
-                px = float(data[symbol.lower()]["usd"])
-                if px > 0:
-                    return float(px)
-        except Exception:
-            pass
-        return None
+            px = None
+        if px is None:
+            coin_id = _coingecko_ticker_map().get(symbol) or symbol.lower()
+            try:
+                _pace_coingecko()
+                resp = requests.get(
+                    COINGECKO_PRICE_URL,
+                    params={"ids": coin_id, "vs_currencies": "usd"},
+                    headers=HEADERS, timeout=10,
+                )
+                if resp.status_code == 429:
+                    time.sleep(min(20, float(resp.headers.get("Retry-After", 5))))
+                    resp = requests.get(
+                        COINGECKO_PRICE_URL,
+                        params={"ids": coin_id, "vs_currencies": "usd"},
+                        headers=HEADERS, timeout=10,
+                    )
+                resp.raise_for_status()
+                data = resp.json()
+                if coin_id in data and "usd" in data[coin_id]:
+                    val = float(data[coin_id]["usd"])
+                    if val > 0:
+                        px = val
+            except Exception:
+                px = None
+        if px is not None:
+            if cached is None:
+                cached = self._price_cache = {}
+            cached[symbol] = (now, px)
+        return px
 
     # ---------------- valuation ----------------
 
     def valuation(self):
-        """Replay-derive equity: cash + marked positions."""
+        """Replay-derive equity: cash + marked positions.
+
+        A position with NO usable mark (both Binance and CoinGecko down) is
+        excluded from the value sum rather than marked at entry — marking at
+        entry during an outage makes the drawdown kill blind exactly when a
+        coin may have collapsed. The stale count is surfaced for the sweep
+        to alert on."""
         cash = self._cash()
         positions = self._positions()
         total = 0.0
+        stale = []
         for symbol, pos in positions.items():
-            mark = self.price_for(symbol) or float(pos["entry"])
+            mark = self.price_for(symbol)
+            if mark is None:
+                stale.append(symbol)
+                continue
             total += float(pos["qty"]) * mark
-        return {"cash": cash, "positions_value": total, "equity": cash + total}
+        return {"cash": cash, "positions_value": total, "equity": cash + total,
+                "stale_symbols": stale}
 
     def _update_peak(self, equity):
         peak = self._peak_equity_meta()
@@ -273,7 +345,10 @@ class MemecoinLedger:
         """Hard kill: flatten everything, block new entries for a cooldown.
         Automation makes kills self-healing: after auto_cooldown_hours the
         cycle re-arms automatically (the tier is a no-real-money test ledger;
-        kills remain permanent history for the scorecard)."""
+        kills remain permanent history for the scorecard). Escalation: after
+        2 kills the tier requires a MANUAL reset — a second kill inside the
+        same canary run is a failed edge per the keep/kill criteria, and
+        auto re-arming would bleed the ledger in -25% staircases."""
         count = self.kill_count() + 1
         self.journal.set_meta(KILL_META, "on")
         self.journal.set_meta(KILL_COUNT_META, str(count))
@@ -285,9 +360,17 @@ class MemecoinLedger:
             except Exception as e:
                 print(f"[tier4] kill flatten failed for {symbol}: {e}")
         self._add_cooldown("__kill__", self.auto_cooldown_hours)
+        if count >= 2:
+            self.journal.set_meta("t4_manual_reset_required", "true")
 
     def _auto_rearm_after_cooldown(self):
-        """If a kill is older than the auto cooldown, re-arm automatically."""
+        """If a kill is older than the auto cooldown, re-arm automatically.
+
+        Escalation gate: a second kill inside this canary run stays killed
+        until a human runs tools/tier4.py reset-kill (the documented
+        'double kill = failed edge' criterion)."""
+        if self.kill_count() >= 2:
+            return False
         kill_at = _parse_ts(self.journal.get_meta("t4_kill_at"))
         if kill_at is None:
             return False
@@ -302,10 +385,17 @@ class MemecoinLedger:
             return False, "no kill active"
         self.journal.set_meta(KILL_META, "off")
         self.journal.set_meta("t4_kill_reason", "")
+        self.journal.set_meta("t4_manual_reset_required", "false")
         v = self.valuation()
-        self._save(v["cash"], {})  # kill already flattened; safety clear
+        # credit any position the kill flatten failed to sell at its marked
+        # value instead of silently destroying it (a partial flatten leaves
+        # the ledger short otherwise). Positions dict is preserved as-is;
+        # only cash accounting is ensured consistent.
+        positions = self._positions()
+        self._save(v["cash"], positions)
         self.journal.set_meta("t4_peak_equity", str(round(v["equity"], 8)))
-        return True, f"kill reset; canary equity ${v['equity']:.2f}, peak re-armed"
+        return True, (f"kill reset; canary equity ${v['equity']:.2f}, peak re-armed"
+                      + (f" ({len(positions)} position(s) carried over from kill)" if positions else ""))
 
     # ---------------- entries (automated, gated) ----------------
 
@@ -703,9 +793,18 @@ Respond with ONLY a JSON object:
             return events
         v = self.valuation()
         peak = self._update_peak(v["equity"])
+        # stale-mark visibility: a position the feeds can't price is
+        # excluded from equity (never fictionally marked at entry) — surface
+        # it so the owner knows the kill math is temporarily blind there
+        stale_syms = v.get("stale_symbols") or []
+        if stale_syms:
+            events.append({"type": "stale_marks", "symbols": stale_syms,
+                           "reason": "no price feed for: " + ", ".join(stale_syms)})
         if self._drawdown_hit(v["equity"]):
             reason = (f"max drawdown {self.max_drawdown_pct:.0f}% hit "
-                      f"(equity ${v['equity']:.2f} vs peak ${peak:.2f})")
+                      f"(equity ${v['equity']:.2f} vs peak ${peak:.2f}"
+                      + (f"; {len(stale_syms)} stale-marked position(s) excluded" if stale_syms else "")
+                      + ")")
             self._trigger_kill(reason)
             events.append({"type": "kill", "reason": reason})
             return events
@@ -811,6 +910,7 @@ Respond with ONLY a JSON object:
         pairs = data.get("pairs") or data.get("data") or []
         if isinstance(pairs, dict):
             pairs = list(pairs.values())
+        ticker_map = _coingecko_ticker_map()
         for p in pairs[:30]:
             try:
                 base = (p.get("baseToken") or {}).get("symbol") or ""
@@ -823,9 +923,16 @@ Respond with ONLY a JSON object:
                 if vol24 < self.spike_min_volume_24h:
                     continue
                 if vol24 > 0 and (vol6 * 4) / vol24 >= self.spike_volume_multiple:
+                    # resolve the ticker to a CoinGecko id: the whole
+                    # downstream pipeline (dossier, price_for, dedupe) keys
+                    # on ids; an unresolved ticker can't be priced or
+                    # researched, so it is skipped rather than mis-keyed
+                    coin_id = ticker_map.get(base.upper())
+                    if not coin_id:
+                        continue
                     out.append({
                         "kind": "dexscreener_spike",
-                        "symbol": base,
+                        "symbol": coin_id,
                         "name": (p.get("baseToken") or {}).get("name") or base,
                         "detail": (f"6h volume ${vol6:,.0f} vs 24h ${vol24:,.0f} "
                                    f"({self.spike_volume_multiple:.0f}x multiple), "
@@ -887,6 +994,11 @@ Respond with ONLY a JSON object:
                     send_notification(
                         f"⛔ Tier 4 Coins: KILLED — {ev['reason']}. All sold; "
                         f"auto re-arms after {self.auto_cooldown_hours:.0f}h cooldown.",
+                        self.cfg)
+                elif ev["type"] == "stale_marks":
+                    send_notification(
+                        f"⚠️ Tier 4 Coins: price feeds down for {', '.join(ev['symbols'])} — "
+                        f"drawdown checks paused for those until feeds return.",
                         self.cfg)
                 elif ev["type"] == "auto_buy":
                     pass  # already alerted inside _auto_entries

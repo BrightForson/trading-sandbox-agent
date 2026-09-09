@@ -32,7 +32,11 @@ RSS_FEEDS = [
 
 SYMBOL_TO_NAME = {
     "BTC/USD": "bitcoin", "ETH/USD": "ethereum", "SOL/USD": "solana",
+    "XRP/USD": "ripple", "DOGE/USD": "dogecoin", "ADA/USD": "cardano",
+    "AVAX/USD": "avalanche-2", "LINK/USD": "chainlink",
     "bitcoin": "bitcoin", "ethereum": "ethereum", "solana": "solana",
+    "ripple": "ripple", "dogecoin": "dogecoin", "cardano": "cardano",
+    "avalanche-2": "avalanche-2", "chainlink": "chainlink",
 }
 
 _journal = None

@@ -65,9 +65,19 @@ def send_heartbeat(broker, journal):
         acct = broker.get_account()
         positions = list(broker.get_all_positions())
 
-        # Tier 1 money line: equity vs the paper start cash allocation
-        start_cash = float((getattr(config, "broker", None) or {})
-                           .get("paper", {}).get("start_cash", 100) or 100)
+        # Tier 1 money line: equity vs the epoch baseline (seed/reset marker,
+        # falling back to configured start cash)
+        start_cash = None
+        seeded_at = journal.get_meta("paper_seeded_at")
+        if seeded_at:
+            try:
+                # the ledger epoch baseline: cash recorded at the last seed
+                start_cash = float(journal.get_meta("paper_epoch_start_cash") or 0)
+            except Exception:
+                start_cash = None
+        if not start_cash:
+            start_cash = float((getattr(config, "broker", None) or {})
+                               .get("paper", {}).get("start_cash", 100) or 100)
         equity = float(acct.equity)
         delta = equity - start_cash
 
@@ -87,6 +97,17 @@ def send_heartbeat(broker, journal):
         msg = "\n".join(lines)
         send_notification(msg, config)
         journal.set_meta("last_heartbeat_hour", current_hour)
+        # Tier 1 equity snapshot (epoch 0 namespace in wallet_snapshots):
+        # feeds the kill/keep drawdown + losing-week criteria in gates.py
+        try:
+            equity_now = float(acct.equity)
+            cash_now = float(acct.cash)
+            positions_value = equity_now - cash_now
+            journal.log_wallet_snapshot(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                epoch=0, cash=cash_now, locked=positions_value, equity=equity_now)
+        except Exception as snap_err:
+            print(f"[{datetime.now()}] Tier 1 equity snapshot failed: {snap_err}")
         print(f"[{datetime.now()}] Heartbeat sent (hour {current_hour})")
     except Exception as e:
         print(f"[{datetime.now()}] Heartbeat failed (will retry next cycle): {e}")
@@ -121,6 +142,36 @@ def _save_position_states(journal, states):
     journal.set_meta(POSITION_STATE_KEY, _json.dumps(states))
 
 
+PENDING_EXITS_KEY = "pending_exit_symbols"
+
+
+def _pending_exits(journal):
+    raw = journal.get_meta(PENDING_EXITS_KEY)
+    if not raw:
+        return set()
+    try:
+        data = _json.loads(raw)
+        return set(data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def _add_pending_exit(journal, symbol):
+    """Record an intended-but-unexecuted exit. The intent persists until the
+    SELL actually fills, independent of SMA relation whipsaws (a golden→death
+    →golden flip mid-retry can no longer abandon the exit)."""
+    cur = _pending_exits(journal)
+    cur.add(symbol)
+    journal.set_meta(PENDING_EXITS_KEY, _json.dumps(sorted(cur)))
+
+
+def _clear_pending_exit(journal, symbol):
+    cur = _pending_exits(journal)
+    if symbol in cur:
+        cur.discard(symbol)
+        journal.set_meta(PENDING_EXITS_KEY, _json.dumps(sorted(cur)))
+
+
 def _client_order_id(symbol, action, reasoning, qty=0.0):
     """Deterministic idempotency key for one intended order.
 
@@ -131,9 +182,76 @@ def _client_order_id(symbol, action, reasoning, qty=0.0):
     exact intended order, making keys stable across retries but distinct
     between genuinely different intents (e.g. the same exit reason on a
     later, differently-sized position is NOT a duplicate).
+
+    Exits additionally fold in the UTC day + attempt counter, so a
+    constant-reasoning exit (daily-loss flatten, catch-up reasons) can
+    legitimately repeat on a later day or after a re-entry without being
+    suppressed as a duplicate of the first execution.
     """
-    raw = f"{symbol}|{action}|{reasoning}|{qty:.8f}"
+    nonce = ""
+    if action.upper() == "SELL":
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        attempts = _exit_attempts(journal_ref.get(), symbol)
+        nonce = f"|{day}|a{attempts}"
+    raw = f"{symbol}|{action}|{reasoning}|{qty:.8f}{nonce}"
     return _hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+import threading
+_journal_attempts_local = threading.local()
+
+
+class journal_ref:
+    """Late-bound journal handle for the exit-attempt counter (set per cycle)."""
+    _inst = None
+
+    @classmethod
+    def get(cls):
+        return cls._inst
+
+    @classmethod
+    def set(cls, j):
+        cls._inst = j
+
+
+def _exit_attempts(journal, symbol):
+    """Monotonic per-symbol attempt counter so retried exits get distinct
+    idempotency keys (a suppressed retry must not suppress the next one too)."""
+    if journal is None:
+        return 0
+    try:
+        raw = journal.get_meta("exit_attempt_counters")
+        data = _json.loads(raw) if raw else {}
+        return int(data.get(symbol, 0))
+    except Exception:
+        return 0
+
+
+def _bump_exit_attempt(journal, symbol):
+    if journal is None:
+        return
+    try:
+        raw = journal.get_meta("exit_attempt_counters")
+        data = _json.loads(raw) if raw else {}
+        if not isinstance(data, dict):
+            data = {}
+        data[symbol] = int(data.get(symbol, 0)) + 1
+        # bounded: keep newest 100 symbols
+        items = sorted(data.items(), key=lambda kv: kv[1], reverse=True)
+        journal.set_meta("exit_attempt_counters", _json.dumps(dict(items[:100])))
+    except Exception:
+        pass
+
+
+def _iso_age_minutes(iso_ts):
+    """Minutes elapsed since an ISO timestamp (aware or naive; naive = UTC)."""
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+    except Exception:
+        return 1e9  # unparseable -> treat as very old
 
 
 def _already_executed(journal, client_order_id):
@@ -268,12 +386,37 @@ def run_trading_cycle():
         return
 
     position_states = _load_position_states(journal)
+    pending_exits = _pending_exits(journal)
+    journal_ref.set(journal)
 
     for symbol, df in bars_by_symbol.items():
         symbol_cycle_ok = True
         relation = None
         try:
             print(f"[{datetime.now()}] Processing {symbol}...")
+
+            # ---- pending exit replay: an exit that previously failed must
+            # retry until executed, regardless of SMA-relation whipsaws.
+            # (relation-derived catch-up only reconciles the LAST transition;
+            # a persisted intent closes that hole.)
+            if symbol in pending_exits:
+                position = broker.get_position(symbol)
+                if position and float(getattr(position, "qty", 0) or 0) > 0:
+                    mark = float(df["close"].iloc[-1]) if df is not None and len(df) else 0.0
+                    executed = _execute_signal(broker, journal, risk_engine, symbol, df, {
+                        "action": "SELL",
+                        "reasoning": "pending exit replay (previously failed exit intent)",
+                    })
+                    if not executed:
+                        symbol_cycle_ok = False
+                    else:
+                        _clear_pending_exit(journal, symbol)
+                        pending_exits.discard(symbol)
+                else:
+                    # position gone (sold elsewhere/manual): intent satisfied
+                    _clear_pending_exit(journal, symbol)
+                    pending_exits.discard(symbol)
+
 
             # ---- persistent SMA relation: catch crosses missed by late/failed
             # cycles. A death cross visible for exactly one 15-min bar is no
@@ -307,7 +450,7 @@ def run_trading_cycle():
                         pass
                 # check the entry-fixed stop against the latest closed bar
                 # (live broker mark as fallback if bars are stale/unusable)
-                mark = float(df["close"].iloc[-1])
+                mark = float(df["close"].iloc[-1]) if df is not None and len(df) else 0.0
                 if mark <= 0:
                     mark = float(getattr(position, "current_price", 0) or 0)
                 triggered, reason = risk_engine.stop_triggered(symbol, mark)
@@ -467,14 +610,18 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
         return True  # desired end state already holds; nothing failed
 
     if qty > 0 and action == "BUY":
+        # fail-closed position/equity checks: an infra error reading the
+        # account must not degrade max_open_positions/max_notional caps
         try:
             positions = list(broker.get_all_positions())
             open_count = len(positions)
             crypto_notional = sum(abs(float(getattr(p, "market_value", 0) or 0)) for p in positions)
+        except Exception:
+            print(f"[{datetime.now()}] BUY {symbol}: cannot enumerate positions — failing closed")
+            return False
+        try:
             account_equity = float(broker.get_account().equity)
         except Exception:
-            open_count = 0
-            crypto_notional = 0.0
             account_equity = None
         allowed, reason = risk_engine.check(symbol, action, qty, price, open_count,
                                             current_crypto_notional=crypto_notional,
@@ -498,10 +645,18 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
               f"(client_order_id {client_order_id} already executed)")
         return True
     try:
-        send_notification(
-            f"🟡 Tier 1: {action} {symbol} @ ${price:,.2f} — placing order…",
-            config
-        )
+        # rate-limit identical pre-trade alerts: a persistently failing SELL
+        # retry would otherwise spam every 15 minutes. Same intent within
+        # 30 minutes = one alert.
+        alert_key = f"pretrade_alert_{client_order_id}"
+        last_alert = journal.get_meta(alert_key)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if last_alert is None or _iso_age_minutes(last_alert) > 30:
+            send_notification(
+                f"🟡 Tier 1: {action} {symbol} @ ${price:,.2f} — placing order…",
+                config
+            )
+            journal.set_meta(alert_key, now_iso)
     except Exception as notify_err:
         print(f"[{datetime.now()}] Pre-trade Discord alert failed (continuing trade): {notify_err}")
     try:
@@ -509,17 +664,28 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
         confirmed = broker.await_terminal_order(order.id)
     except BrokerError as e:
         print(f"[{datetime.now()}] Order submission/confirmation failed for {symbol}: {e}")
+        if action == "SELL":
+            # exit intent did NOT execute: persist it so it retries every
+            # cycle until filled, regardless of SMA-relation whipsaws
+            _add_pending_exit(journal, symbol)
+            _bump_exit_attempt(journal, symbol)
         return False
     raw_status = getattr(confirmed, "status", "")
     status = str(getattr(raw_status, "value", raw_status)).lower()
     if status == "filled":
         fill_qty = float(getattr(confirmed, "filled_qty", None) or qty)
         fill_price = float(getattr(confirmed, "filled_avg_price", None) or price)
-        fee_pct = float((getattr(config, "execution", None) or {}).get("taker_fee_pct", 0)) / 100.0
-        estimated_fee = fill_qty * fill_price * fee_pct
+        # journal the fee the broker ACTUALLY charged (paper broker returns
+        # it on the order). Estimated/config fees are backtest-only; the
+        # scorecard must reconcile with the ledger. Fall back to the
+        # configured estimate only for brokers that don't report fees.
+        actual_fee = getattr(confirmed, "fee", None)
+        if actual_fee is None or float(actual_fee) < 0:
+            fee_pct = float((getattr(config, "execution", None) or {}).get("taker_fee_pct", 0)) / 100.0
+            actual_fee = fill_qty * fill_price * fee_pct
         journal.log_trade(
-            timestamp=datetime.now().isoformat(), symbol=symbol, action=action,
-            qty=fill_qty, price=fill_price, reasoning=reasoning, fee=estimated_fee,
+            timestamp=datetime.now(timezone.utc).isoformat(), symbol=symbol, action=action,
+            qty=fill_qty, price=fill_price, reasoning=reasoning, fee=float(actual_fee),
             order_id=str(getattr(order, "id", "")), status="filled"
         )
         _mark_executed(journal, client_order_id,
@@ -538,6 +704,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
                 remaining = None
             if remaining is None or float(getattr(remaining, "qty", 0) or 0) <= 0:
                 risk_engine.clear_stop(symbol)
+                _clear_pending_exit(journal, symbol)  # exit intent satisfied
         print(f"[{datetime.now()}] Confirmed paper fill for {symbol}: {action} {fill_qty:.6f} @ {fill_price:.2f}")
         try:
             notional = fill_qty * fill_price
@@ -560,13 +727,16 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
         # journal non-fills so the audit trail matches the broker's order history
         filled_qty = float(getattr(confirmed, "filled_qty", None) or 0)
         journal.log_trade(
-            timestamp=datetime.now().isoformat(), symbol=symbol, action=action,
+            timestamp=datetime.now(timezone.utc).isoformat(), symbol=symbol, action=action,
             qty=filled_qty, price=float(getattr(confirmed, "filled_avg_price", None) or 0.0),
             reasoning=f"{reasoning} [order ended as {status or 'pending'}; no fill]",
             fee=0.0, order_id=str(getattr(order, "id", "")),
             status=status or "pending",
         )
         print(f"[{datetime.now()}] Order {getattr(order, 'id', 'unknown')} ended as {status or 'pending'}; journaled as non-fill")
+        if action == "SELL":
+            _add_pending_exit(journal, symbol)
+            _bump_exit_attempt(journal, symbol)
         return False
 
 

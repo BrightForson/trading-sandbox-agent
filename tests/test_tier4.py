@@ -245,11 +245,26 @@ def test_dexscreener_spike_filter(tmp_path, monkeypatch):
         def raise_for_status(self):
             pass
         def json(self):
+            # /coins/list for the ticker map; /latest/dex/search for pairs
+            if "params" in _Resp._last_kwargs and _Resp._last_kwargs.get("params") is None:
+                return {"pairs": pairs}
+            url = _Resp._last_url
+            if "/coins/list" in url:
+                return [{"symbol": "moon", "id": "mooncoin"}]
             return {"pairs": pairs}
 
-    monkeypatch.setattr("bot.memecoin.requests.get", lambda *a, **k: _Resp())
+    _Resp._last_url = ""
+    _Resp._last_kwargs = {}
+
+    def fake_get(url, *a, **k):
+        _Resp._last_url = url
+        _Resp._last_kwargs = k
+        return _Resp()
+
+    monkeypatch.setattr("bot.memecoin.requests.get", fake_get)
+    monkeypatch.setattr("bot.memecoin._pace_coingecko", lambda: None)
     cards = led.dexscreener_spike_cards()
-    assert [c["symbol"] for c in cards] == ["MOON"]
+    assert [c["symbol"] for c in cards] == ["mooncoin"]  # resolved CG id
     assert "multiple" in cards[0]["detail"]
 
 

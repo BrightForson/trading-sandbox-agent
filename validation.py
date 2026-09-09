@@ -46,13 +46,22 @@ def main():
     synthetic = pd.DataFrame({"close": [10.0] * 50 + [20.0]})
     sigs = sma_cross("BTC/USD", synthetic, config)
     assert sigs and sigs[0]["action"] == "BUY"
-    journal = TradeJournal()
-    risk = RiskEngine(config, broker, journal)
-    allowed, reason = risk.check("BTC/USD", "BUY", 0.001, 50, 0)
+
+    # risk-engine check runs on an ISOLATED journal: _daily_loss_blocked()
+    # records the day's baseline equity as a side effect, and doing that on
+    # the production journal would pin the real account's daily-loss baseline
+    # at validation-time equity (masking or faking losses for the live day).
+    import tempfile
+    import os as _os
+    with tempfile.TemporaryDirectory() as td:
+        iso = TradeJournal(db_path=_os.path.join(td, "validate.db"))
+        iso_risk = RiskEngine(config, broker, iso)
+        allowed_v, reason_v = iso_risk.check("BTC/USD", "BUY", 0.001, 50, 0)
     print(f"      strategies={[n for n, _ in strategies]}, synthetic signal=BUY, "
-          f"risk check small buy: {allowed} ({reason})")
+          f"isolated risk check small buy: {allowed_v} ({reason_v})")
 
     print("[5/8] journal (trades/proposals/bets tables)...")
+    journal = TradeJournal()
     n_trades = len(journal.get_trades(limit=1000))
     n_props = len(journal.get_proposals(limit=1000))
     n_bets = len(journal.get_open_bets())

@@ -5,8 +5,10 @@ from bot.errors import JournalError
 
 class TradeJournal:
     def __init__(self, db_path="data/trades.db"):
-        # Ensure data directory exists
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        # Ensure data directory exists (bare filenames have no dirname)
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self.db_path = db_path
         self._init_db()
     

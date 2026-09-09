@@ -38,6 +38,7 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_OWNER_IDS: ${{ vars.DISCORD_OWNER_IDS }}
         run: python run_chat.py
 
       - name: Commit journal (lossless merge on conflict)

@@ -96,6 +96,7 @@ scanner:
   near_resolution_days: 3
   near_resolution_min_price: 0.97
   min_market_volume: 50000
+  min_market_liquidity: 10000  # LLM candidates need real liquidity: quoted prices on thinner books are not fillable
   mispricing_threshold: 0.08
   max_llm_markets: 5
   friction_pct: 1.0

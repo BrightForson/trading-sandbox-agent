@@ -11,7 +11,7 @@ still be decommissioned, as happened with deepseek-v4-pro and kimi-k2.6).
 """
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import openai
 from dotenv import load_dotenv
@@ -94,7 +94,8 @@ class ModelManager:
 
     def _record_probe_time(self):
         if self.journal:
-            self.journal.set_meta(META_PROBED_KEY, datetime.utcnow().isoformat())
+            self.journal.set_meta(META_PROBED_KEY,
+                                  datetime.now(timezone.utc).isoformat())
 
     def _announce_switch(self, previous, new):
         """Discord alert on model switch (best effort, never fatal)."""
@@ -121,7 +122,9 @@ class ModelManager:
                 try:
                     from datetime import datetime as _dt
                     last_dt = _dt.fromisoformat(last)
-                    if (_dt.utcnow() - last_dt).total_seconds() < 20 * 3600:
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    if (_dt.now(timezone.utc) - last_dt).total_seconds() < 20 * 3600:
                         return self.active_model  # checked recently
                 except Exception:
                     pass

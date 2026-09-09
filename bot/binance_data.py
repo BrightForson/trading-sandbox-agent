@@ -34,7 +34,7 @@ def _interval_for(timeframe):
         if timeframe.endswith("Min"):
             return f"{int(timeframe[:-3])}m"
         if timeframe.endswith("Hour"):
-            return f"{int(timeframe[:-4]) * 60}m"
+            return f"{int(timeframe[:-4])}h"  # Binance wants 1h/2h, not 60m
         if timeframe in ("1Day", "Day", "1d", "d"):
             return "1d"
         return "15m"
@@ -90,6 +90,7 @@ def get_klines(symbol, interval="15m", limit=500, end_time=None):
             if r.status_code == 429 or r.status_code == 418:
                 retry = float(r.headers.get("retry-after", 2 ** attempt))
                 time.sleep(min(30, max(1, retry)))
+                last_err = f"rate limited (HTTP {r.status_code}) on attempt {attempt + 1}"
                 continue
             r.raise_for_status()
             rows = r.json()

@@ -29,6 +29,18 @@ WALLET_EPOCH_META = "wallet_epoch"
 _EPOCH_START_KEY = "wallet_epoch_started_{}"
 
 
+def _norm_ts(ts):
+    """Normalize an ISO-ish timestamp for comparison: space -> 'T', append
+    UTC offset if naive. Prevents lexicographic mis-ordering when writers
+    emit different (but equivalent) formats."""
+    if ts is None:
+        return None
+    s = str(ts).replace(" ", "T")
+    if s and "+" not in s and not s.endswith("Z"):
+        s += "+00:00"
+    return s
+
+
 class BettingWallet:
     def __init__(self, cfg, journal=None):
         self.cfg = cfg
@@ -57,6 +69,8 @@ class BettingWallet:
             _EPOCH_START_KEY.format(self.epoch),
             datetime.now(timezone.utc).isoformat(),
         )
+        # clear the bust-alert latch so a new bust alerts again
+        self.journal.set_meta("wallet_bust_alerted", "off")
         return self.epoch
 
     def _epoch_start_timestamp(self):
@@ -67,12 +81,13 @@ class BettingWallet:
 
     def valuation(self):
         """Replay this epoch's bets in placement order; return the wallet state."""
-        cutoff = self._epoch_start_timestamp()
+        cutoff = _norm_ts(self._epoch_start_timestamp())
         cash = self.start_cash
         locked = 0.0
         wins = losses = open_bets = 0
         for b in self.journal.get_all_bets():
-            if cutoff is not None and b[1] < cutoff:
+            bts = _norm_ts(b[1])
+            if cutoff is not None and (bts is None or bts < cutoff):
                 continue
             price = float(b[5] or 0)
             if not price > 0:

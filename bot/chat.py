@@ -23,8 +23,25 @@ from bot.notify import send_notification
 load_dotenv()
 
 API = "https://discord.com/api/v10"
-REPLY_COOLDOWN_SECONDS = 90  # don't reply to our own/old messages
 STATE_KEY = "discord_chat_last_seen"
+MAX_REPLIES_PER_CYCLE = 5  # defer the rest; they stay > last_seen and answer next cycle
+
+
+def _owner_ids():
+    """Comma-separated DISCORD_OWNER_IDS env; empty = answer no one (fail-closed)."""
+    raw = os.getenv("DISCORD_OWNER_IDS", "").strip()
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _advance_seen(journal, msg):
+    """Per-message checkpoint: persist the cursor up to this message's ts."""
+    try:
+        ts = datetime.fromisoformat(msg["timestamp"]).timestamp()
+    except Exception:
+        return
+    cur = float(journal.get_meta(STATE_KEY) or 0)
+    if ts > cur:
+        journal.set_meta(STATE_KEY, str(ts))
 
 
 def _headers():
@@ -75,15 +92,24 @@ def _get_messages(channel_id, limit=20):
 def _send_message(channel_id, content):
     chunks = [content[i:i + 1900] for i in range(0, len(content), 1900)]
     for chunk in chunks:
-        resp = requests.post(
-            f"{API}/channels/{channel_id}/messages",
-            headers={**_headers(), "Content-Type": "application/json"},
-            json={"content": chunk},
-            timeout=15,
-        )
-        if resp.status_code not in (200, 201):
+        for attempt in range(3):
+            resp = requests.post(
+                f"{API}/channels/{channel_id}/messages",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={"content": chunk},
+                timeout=15,
+            )
+            if resp.status_code in (200, 201):
+                break
+            if resp.status_code == 429:
+                try:
+                    time.sleep(min(10, float(resp.headers.get("Retry-After", 1))))
+                except (TypeError, ValueError):
+                    time.sleep(1)
+                continue
             print(f"[discord-chat] send failed {resp.status_code}: {resp.text[:200]}")
             time.sleep(1)
+            break
 
 
 def _is_our_bot(msg):
@@ -110,6 +136,10 @@ chatting with the system's owner in Discord. Answer concisely (under 1500 chars)
 plainly, no markdown headers. You cannot and will not execute any trades from
 chat — this is analysis only. If asked to buy/sell something, explain what you
 would propose and why, and note it's shadow mode (no execution).
+
+IMPORTANT: answer ONLY from the numbers in the live system context below.
+If a number is not in the context, say you don't have it rather than
+guessing. Never invent P&L, positions, or risk-gate states.
 
 Live system context:
 {context_block}
@@ -151,8 +181,21 @@ def _system_context(broker, cfg, journal):
         ) or "none yet"
     except Exception:
         prop_block = "unavailable"
+    try:
+        kill = journal.get_meta("kill_switch") == "on"
+        kill_reason = journal.get_meta("kill_switch_reason") or ""
+        if kill:
+            risk_block = "Tier 1 kill switch: ON (BUYs blocked"
+            if kill_reason:
+                risk_block += f", reason: {kill_reason}"
+            risk_block += ")"
+        else:
+            risk_block = "Tier 1 kill switch: off (BUYs allowed)"
+    except Exception:
+        risk_block = "risk-gate state unavailable"
     context = (
         f"Account: {acct_block}\nPositions: {pos_block}\n"
+        f"Risk gates: {risk_block}\n"
         f"Recent trades: {trade_block}\nRecent AI proposals: {prop_block}\n"
         f"Strategy: SMA{cfg.sma_fast}/{cfg.sma_slow} crossover on {', '.join(cfg.symbols)}, "
         f"shadow mode = AI proposes, never executes on the real account."
@@ -195,6 +238,21 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
 
     last_seen = float(journal.get_meta(STATE_KEY) or 0)
     now = time.time()
+    owners = _owner_ids()
+    if not owners:
+        # no owner configured: answer no one (fail-closed) but still advance
+        # the cursor past bot/ignored messages so they never backlog
+        newest = 0.0
+        for msg in msgs:
+            try:
+                ts = datetime.fromisoformat(msg["timestamp"]).timestamp()
+            except Exception:
+                ts = 0
+            newest = max(newest, ts)
+        if newest > last_seen:
+            journal.set_meta(STATE_KEY, str(newest))
+        return
+
     fresh = []
     for msg in msgs:
         try:
@@ -205,6 +263,9 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
             continue
         if _is_our_bot(msg):
             continue
+        author_id = msg.get("author", {}).get("id")
+        if author_id not in owners:
+            continue  # not the owner: never answered, never disclosed to
         fresh.append(msg)
 
     if not fresh:
@@ -214,13 +275,17 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
     if model is None:
         model = ModelManager(journal=journal)
 
-    newest_ts = max(
-        datetime.fromisoformat(m["timestamp"]).timestamp() for m in fresh
-    )
+    answered = 0
+    deferred = 0
     for msg in reversed(fresh):  # oldest first, natural conversation order
         question = (msg.get("content") or "").strip()
         if not question:
+            # advance past empty messages so they don't backlog
+            _advance_seen(journal, msg)
             continue
+        if answered >= MAX_REPLIES_PER_CYCLE:
+            deferred += 1
+            continue  # leave unseen; answered next cycle (per-message checkpoint)
         author = msg.get("author", {}).get("username", "user")
         try:
             context = _system_context(broker, cfg, journal)
@@ -231,7 +296,17 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
         except Exception as e:
             from bot.notify import _mask_secrets
             answer = f"(agent unavailable: {_mask_secrets(e)})"
-        _send_message(channel_id, answer[:1900])
+        try:
+            _send_message(channel_id, answer[:1900])
+            # checkpoint AFTER a successful send: failed sends stay unseen
+            # and retry next cycle instead of being silently dropped
+            _advance_seen(journal, msg)
+        except Exception as e:
+            from bot.notify import _mask_secrets
+            print(f"[discord-chat] reply send failed (will retry next cycle): {_mask_secrets(e)}")
+            break  # stop the burst; un-answered messages remain unseen
+        answered += 1
         print(f"[discord-chat] answered {author}: {question[:60]}...")
 
-    journal.set_meta(STATE_KEY, str(newest_ts))
+    if deferred:
+        print(f"[discord-chat] deferred {deferred} message(s) to next cycle (reply cap)")

@@ -40,7 +40,7 @@ class _Position:
 
 class _Order:
     def __init__(self, order_id, symbol, qty, side, status, filled_qty,
-                 filled_avg_price, submitted_at):
+                 filled_avg_price, submitted_at, fee=0.0):
         self.id = str(order_id)
         self.client_order_id = f"paper-{order_id}"
         self.symbol = symbol
@@ -51,6 +51,7 @@ class _Order:
         self.filled_avg_price = str(filled_avg_price)
         self.submitted_at = submitted_at
         self.created_at = submitted_at
+        self.fee = float(fee)  # actual fee charged by this fill
 
 
 class BinancePaperBroker:
@@ -162,7 +163,10 @@ class BinancePaperBroker:
                     "side": order.side, "status": order.status,
                     "filled_qty": float(order.filled_qty),
                     "filled_avg_price": float(order.filled_avg_price),
+                    "fee": float(getattr(order, "fee", 0.0)),
                     "submitted_at": order.submitted_at})
+        # bounded: keep the newest 500 entries (per-epoch fill log)
+        log = log[-500:]
         self.journal.set_meta("paper_trades", json.dumps(log))
 
     def place_order(self, symbol, qty, side):
@@ -198,7 +202,7 @@ class BinancePaperBroker:
             else:
                 positions[symbol] = {"qty": qty, "entry": price}
             self._save(cash - cost - fee, positions, next_id + 1)
-            order = _Order(next_id, symbol, qty, "BUY", "filled", qty, price, now)
+            order = _Order(next_id, symbol, qty, "BUY", "filled", qty, price, now, fee)
             self._log_order(order)
             return order
 
@@ -218,7 +222,7 @@ class BinancePaperBroker:
             else:
                 del positions[symbol]
             self._save(cash + proceeds - fee, positions, next_id + 1)
-            order = _Order(next_id, symbol, sell_qty, "SELL", "filled", sell_qty, price, now)
+            order = _Order(next_id, symbol, sell_qty, "SELL", "filled", sell_qty, price, now, fee)
             self._log_order(order)
             return order
 
@@ -233,7 +237,8 @@ class BinancePaperBroker:
                     if str(o.get("id")) == str(order_id):
                         return _Order(o["id"], o["symbol"], o["qty"], o["side"],
                                       o["status"], o["filled_qty"],
-                                      o["filled_avg_price"], o["submitted_at"])
+                                      o["filled_avg_price"], o["submitted_at"],
+                                      o.get("fee", 0.0))
             except Exception:
                 pass
         raise BrokerError(f"Paper order {order_id} not found in local log")
@@ -265,8 +270,10 @@ class BinancePaperBroker:
                   for sym, p in positions.items()}
         self._save(float(cash), ledger, self._next_order_id())
         self.journal.set_meta("paper_seeded_at", datetime.now(timezone.utc).isoformat())
+        self.journal.set_meta("paper_epoch_start_cash", str(float(cash)))
 
     def seed_fresh(self, cash):
         self._clear_all_stops()
         self._save(float(cash), {}, self._next_order_id())
         self.journal.set_meta("paper_seeded_at", datetime.now(timezone.utc).isoformat())
+        self.journal.set_meta("paper_epoch_start_cash", str(float(cash)))

@@ -62,6 +62,12 @@ class TradingAgent:
             fast = close.rolling(self.cfg.sma_fast).mean().iloc[-1]
             slow = close.rolling(self.cfg.sma_slow).mean().iloc[-1]
             recent = [float(x) for x in close.tail(24)]
+            # true 24h change: 96 fifteen-minute bars (24 bars is only 6h)
+            change_24h = None
+            if len(close) >= 96:
+                first = float(close.iloc[-96])
+                if first > 0:
+                    change_24h = (float(close.iloc[-1]) / first - 1) * 100
             return {
                 "symbol": symbol,
                 "last_close": float(close.iloc[-1]),
@@ -69,7 +75,8 @@ class TradingAgent:
                 "sma_slow": float(slow),
                 "sma_gap_pct": float((fast - slow) / slow * 100),
                 "recent_24_bars": recent,
-                "change_24b_pct": (recent[-1] / recent[0] - 1) * 100 if recent[0] else 0.0,
+                "change_6h_pct": (recent[-1] / recent[0] - 1) * 100 if recent[0] else 0.0,
+                "change_24h_pct": change_24h,
             }
         except Exception as e:
             print(f"[agent] price context failed for {symbol}: {e}")
@@ -110,7 +117,12 @@ class TradingAgent:
         if symbol is not None:
             symbol = self._normalize_symbol(str(symbol))
         universe = self.scout_symbols if kind == "scout" else self.symbols
-        if symbol and symbol not in universe:
+        if not symbol:
+            # a BUY/SELL without a symbol is not actionable: journaling it
+            # would create NULL-symbol proposal rows + misleading alerts
+            if action in ("BUY", "SELL"):
+                errors.append(f"{action} requires a symbol")
+        elif symbol not in universe:
             errors.append(f"symbol {symbol} not in whitelist")
         try:
             conf = float(proposal.get("confidence", 0))
@@ -333,7 +345,8 @@ Respond with ONLY a JSON object, max 60 words total:
             ctx = self._price_context(sym)
             if ctx:
                 price_ctxs.append({k: ctx[k] for k in
-                                   ("symbol", "last_close", "sma_gap_pct", "change_24b_pct")})
+                                   ("symbol", "last_close", "sma_gap_pct",
+                                    "change_6h_pct", "change_24h_pct")})
         # compact headline digests: at most 3 short titles per symbol
         per_sym_heads = {}
         for sym, data in bundle.get("per_symbol", {}).items():
@@ -342,7 +355,7 @@ Respond with ONLY a JSON object, max 60 words total:
         prompt = f"""You are a crypto trading analyst (paper trading, shadow mode).
 
 DATA (compact):
-- 24h moves & SMA gaps: {json.dumps(price_ctxs)}
+- 24h and 6h moves & SMA gaps (change_24h_pct = true 24h; change_6h_pct = last 6h): {json.dumps(price_ctxs)}
 - Trending coins: {json.dumps(bundle.get('trending', [])[:5])}
 - News headlines: {json.dumps(bundle.get('headlines', [])[:6])}
 - Whale/flow headlines per symbol: {json.dumps(per_sym_heads)}
@@ -363,6 +376,18 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
             print(f"[agent] scout proposal rejected: {errors}")
             return []
         if valid["action"] == "HOLD":
+            return []
+        # per-symbol proposal cooldown: while the shadow ledger already
+        # holds this symbol (or a recent proposal is still open), a new
+        # proposal would be a serially-correlated duplicate sample for the
+        # evaluation gate. One idea = one evaluated proposal.
+        if valid["symbol"] in self.shadow._positions():
+            print(f"[agent] scout proposal suppressed: already holding {valid['symbol']}")
+            return []
+        recent_open = [p for p in self.journal.get_open_proposals()
+                       if p[2] == valid["symbol"]]
+        if recent_open:
+            print(f"[agent] scout proposal suppressed: open proposal exists for {valid['symbol']}")
             return []
         if valid["confidence"] >= float(self.agent_cfg.get("min_confidence", 0.7)):
             self._log_and_alert(valid)
