@@ -98,7 +98,7 @@ the file fallback → `data/reports/` is gitignored and ephemeral on CI → chun
 workflow. Fix (P0c): bounded retry honoring `Retry-After`; CI fallback appends to
 `$GITHUB_STEP_SUMMARY`.
 
-## F8. Tier 4 ticker/coin-id identity chaos — MEDIUM — `bot/memecoin.py:575,577,580-581,209-233,823`
+## F8. [FIXED 2026-09-08, P2] Tier 4 ticker/coin-id identity chaos — MEDIUM — `bot/memecoin.py:575,577,580-581,209-233,823`
 
 - DexScreener spike cards use the base **ticker** as CoinGecko id (`/coins/WIF` →
   404, verified live): the whole spike leg is effectively dead code.
@@ -109,7 +109,7 @@ workflow. Fix (P0c): bounded retry honoring `Retry-After`; CI fallback appends t
 Fix: DEFERRED to P2 (needs a ticker→id resolution map; P0b adds the cheap
 case-normalization).
 
-## F9. Tier 4 unpriceable positions mark at ENTRY — MEDIUM — `bot/memecoin.py:243,659-661`
+## F9. [FIXED 2026-09-08, P2] Tier 4 unpriceable positions mark at ENTRY — MEDIUM — `bot/memecoin.py:243,659-661`
 
 `price_for() or entry` means a −90% coin marks at entry when both Binance and
 CoinGecko fail → drawdown kill blind during exactly the outages that matter; when
@@ -118,12 +118,12 @@ flatten realizes ~entry-price (understates true loss). Aggravated by F10 (unpace
 `/simple/price` calls guarantee the 429s). DEFERRED to P2 (stale-mark exclusion +
 per-cycle price cache + pacing).
 
-## F10. `price_for` CoinGecko call unpaced, no 429 handling — MEDIUM — `bot/memecoin.py:209-233` vs `_pace_coingecko` at 78-84 (guards only `/coins/{id}` and `/market_chart`)
+## F10. [FIXED 2026-09-08, P2] `price_for` CoinGecko call unpaced, no 429 handling — MEDIUM — `bot/memecoin.py:209-233` vs `_pace_coingecko` at 78-84 (guards only `/coins/{id}` and `/market_chart`)
 
 ~9 unpaced `/simple/price` calls per sweep share the same CoinGecko IP budget.
 DEFERRED to P2.
 
-## F11. Tier 4 misc (all fix-now cheap, P0b unless noted)
+## F11. [FIXED 2026-09-08] Tier 4 misc (batch dedupe + manual-buy cap in P0b; reset_kill position preservation in P2)
 
 - `reset_kill` destroys unsold positions' value without crediting cash
   (`memecoin.py:306`) — reachable when flatten failed mid-kill. LOW-MED. DEFERRED P2
@@ -134,49 +134,49 @@ DEFERRED to P2.
 - No memecoin-ness filter — trending includes Polkadot/Zcash/Pudgy Penguins;
   `categories` fetched but unused (`memecoin.py:767-790,394`). DEFERRED P2.
 
-## F12. Tier 1 missed-death-cross retry abandoned on whipsaw — MEDIUM — `bot/trader.py:328-337` + `_catchup_signal:191-207`
+## F12. [FIXED 2026-09-08, P1a] Tier 1 missed-death-cross retry abandoned on whipsaw — MEDIUM — `bot/trader.py:328-337` + `_catchup_signal:191-207`
 
 The retry is re-derived from the *current* SMA relation. If the relation flips back
 (golden → death → SELL fails twice → golden) the position is held through the
 whipsaw and the exit intent is permanently lost. Fix: persist a `pending_exit` flag
 acted on independently of the relation. DEFERRED to P1a.
 
-## F13. Constant-reasoning idempotency keys can suppress legitimate repeated exits — MEDIUM — `bot/trader.py:495-499,265,333-348`
+## F13. [FIXED 2026-09-08, P1a] Constant-reasoning idempotency keys can suppress legitimate repeated exits — MEDIUM — `bot/trader.py:495-499,265,333-348`
 
 Daily-loss flatten passes a constant reasoning string; exact same (symbol, action,
 reasoning, qty) recurrence later → SELL suppressed as "duplicate" while returning
 success → stuck position through the loss day. Fix: fold UTC-day/attempt nonce into
 exit idempotency keys. DEFERRED to P1a.
 
-## F14. `reset_day_zero.py` wipes the Tier 1 kill switch — MEDIUM — `tools/reset_day_zero.py:31-37`
+## F14. [FIXED 2026-09-08, P1a] `reset_day_zero.py` wipes the Tier 1 kill switch — MEDIUM — `tools/reset_day_zero.py:31-37`
 
 `kill_switch` (and `kill_switch_reason`) not in `PRESERVED_META` — a routine reset
 silently re-arms a manually killed bot. DEFERRED to P1a.
 
-## F15. Naive local timestamps in trades journal — LOW-MED — `bot/trader.py:521,563`
+## F15. [FIXED 2026-09-08, P1a] Naive local timestamps in trades journal — LOW-MED — `bot/trader.py:521,563`
 
 `datetime.now()` (no UTC) — benign on CI (UTC runners) but any local run journals
 local-time strings; `report.py` sorts on them and `merge_db` dedupes on
 (timestamp, ...) so mixed zones mis-order FIFO and defeat dedupe. DEFERRED to P1a.
 
-## F16. Journal fee (0.25%) ≠ broker fee (0.1%) ≠ backtest fee (0.25%) — MEDIUM — `bot/trader.py:518-519` vs `bot/binance_paper.py:71-72` vs `backtest.py:286`
+## F16. [FIXED 2026-09-08, P2] Journal fee (0.25%) ≠ broker fee (0.1%) ≠ backtest fee (0.25%) — MEDIUM — `bot/trader.py:518-519` vs `bot/binance_paper.py:71-72` vs `backtest.py:286`
 
 Three fee realities: scorecard P&L systematically disagrees with ledger equity
 deltas; backtest compares against neither. Fix: `place_order` returns actual fee;
 journal it; backtest reads the same key. DEFERRED to P2 "honest numbers".
 
-## F17. Live paper fills at signal-bar close; backtest fills next-bar open — MEDIUM — `bot/binance_paper.py:103-114` vs `backtest.py:189`
+## F17. [DEFERRED 2026-09-08] Live paper fills at signal-bar close; backtest fills next-bar open — MEDIUM (design decision needed: forming-candle live price vs next-open paper semantics) — `bot/binance_paper.py:103-114` vs `backtest.py:189`
 
 Systematic optimism bias in paper fills vs the strategy's own simulation. DEFERRED
 to P2 (needs a decision: forming-candle live price vs next-open semantics).
 
-## F18. Tier 1 risk-gate fail-open on infra errors — LOW — `bot/trader.py:474-478`
+## F18. [FIXED 2026-09-08, P1a] Tier 1 risk-gate fail-open on infra errors — LOW — `bot/trader.py:474-478`
 
 If `get_all_positions()`/`get_account()` throw during a BUY risk check,
 `open_count = 0` is assumed → max_open_positions/max_notional checks fail open.
 Wrong default for a risk gate (paper broker rarely throws, so latent). DEFERRED P1a.
 
-## F19. Tier 1 misc LOW items — DEFERRED P1a/P2 as noted
+## F19. [FIXED 2026-09-08, P1a] Tier 1 misc LOW items (heartbeat epoch baseline, pre-trade alert rate-limit, 1Hour interval, 429 last_err)
 
 - Heartbeat baseline hardcodes `paper.start_cash` (`trader.py:69-70`).
 - Pre-trade Discord alert fires on every attempt — no rate-limit during retries
@@ -190,7 +190,7 @@ Wrong default for a risk gate (paper broker rarely throws, so latent). DEFERRED 
 - BUY clip can strand −1e-8 dust cash (`binance_paper.py:188-192`). Info.
 - Chat context says "Alpaca" but backend is `binance_paper` (`chat.py:126`). P0c-adjacent.
 
-## F20. Tier 2 scout: BUY with missing symbol passes validation — MEDIUM-HIGH — `bot/agent.py:109-114,127-134` + `bot/models.py:204-206`
+## F20. [FIXED 2026-09-08, P2] Tier 2 scout: BUY with missing symbol passes validation — MEDIUM-HIGH — `bot/agent.py:109-114,127-134` + `bot/models.py:204-206`
 
 `symbol is None` skips the whitelist; regex salvage (Tier-1-only symbol pattern)
 yields action/confidence/notional with no symbol → validates → junk `symbol=NULL`
@@ -198,23 +198,23 @@ proposal row + a "market BUY" Discord alert; `shadow.take_buy(None)` fails. Fix:
 require symbol presence for BUY kind. DEFERRED to P2 (not in P0 scope) — but see
 F-note: severity is journal pollution, not ledger loss.
 
-## F21. Tier 2 scout re-proposes hourly while a shadow position is open — MEDIUM — `bot/agent.py:324-371`
+## F21. [FIXED 2026-09-08, P2] Tier 2 scout re-proposes hourly while a shadow position is open — MEDIUM — `bot/agent.py:324-371`
 
 One sustained thesis ⇒ up to ~72 evaluated proposals for one idea; serially
 correlated samples trivially satisfy the semi-auto gate's "≥20 evaluated"
 threshold. DEFERRED to P2.
 
-## F22. Scout prompt "24h moves" is actually 6h — MEDIUM — `bot/agent.py:64,72` vs `:345`
+## F22. [FIXED 2026-09-08, P2] Scout prompt "24h moves" is actually 6h — MEDIUM — `bot/agent.py:64,72` vs `:345`
 
 24×15-min bars = 6h; the real 24h change exists in `market_stats` but never enters
 the prompt. LLM reasons about wrong-magnitude momentum. DEFERRED to P2.
 
-## F23. Scout extra-universe symbols get zero news/whale research — MEDIUM — `bot/research.py:33-36,80-82,100-102`
+## F23. [FIXED 2026-09-08, P2] Scout extra-universe symbols get zero news/whale research — MEDIUM — `bot/research.py:33-36,80-82,100-102`
 
 `SYMBOL_TO_NAME` covers only BTC/ETH/SOL; XRP/DOGE/ADA/AVAX/LINK proposals are
 technicals-only despite the prompt claiming research. DEFERRED to P2.
 
-## F24. Tier 3 dead knobs + thin-market EV + correlated siblings — MEDIUM — `bot/polymarket.py:201-210,138,124-189,218-224`
+## F24. [FIXED 2026-09-08, P2] Tier 3 dead knobs + thin-market EV + correlated siblings — MEDIUM — `bot/polymarket.py:201-210,138,124-189,218-224`
 
 - `near_resolution_watchlist_only: false` does nothing (watchlist never merged into
   finds) — documented feature broken (currently fail-safe).
@@ -226,7 +226,7 @@ technicals-only despite the prompt claiming research. DEFERRED to P2.
 - Mispricing prompt labels the first outcome "(YES)" for non-Yes/No binaries.
 DEFERRED to P2.
 
-## F25. Chat: no owner authorization, no per-message checkpoint, no ops grounding — MEDIUM — `bot/chat.py:197-232,215-234,74-85,106-178`
+## F25. [FIXED 2026-09-08, P1b] Chat: no owner authorization, no per-message checkpoint, no ops grounding — MEDIUM (owner must set DISCORD_OWNER_IDS — see handoff) — `bot/chat.py:197-232,215-234,74-85,106-178`
 
 - Answers any human in the channel (no author allowlist) while the system prompt
   asserts "chatting with the owner" — live equity/positions/trades disclosed.
@@ -239,7 +239,7 @@ DEFERRED to P2.
   invalidated.
 Trading-safety verified intact (read-only paths only). DEFERRED to P1b.
 
-## F26. Kill/keep verdicts: only Tier 2's exists in code — MEDIUM — `bot/gates.py:37-97`, `bot/report.py:302-308`
+## F26. [FIXED 2026-09-08, P2] Kill/keep verdicts: only Tier 2's exists in code — MEDIUM — `bot/gates.py:37-97`, `bot/report.py:302-308`
 
 Tiers 1/3/4 criteria in PROJECT_SUMMARY are unimplemented; Tier 1 equity is never
 snapshotted (peak-to-trough drawdown not measurable); `agent_gate_history` stores
@@ -247,7 +247,7 @@ only last-run timestamp so "red 4 consecutive weeks" is unevaluable; "execution
 without journal record" detector (explicit any-tier kill criterion) has zero code.
 DEFERRED to P2.
 
-## F27. Backtest does not mirror live sizing; 3× overstatement via per-symbol cash pools — MEDIUM — `backtest.py:188-199,277-301` vs `bot/risk.py:65-80`
+## F27. [FIXED 2026-09-08, P2] Backtest does not mirror live sizing; 3× overstatement via per-symbol cash pools — MEDIUM (risk-sizing + allocation-cap parity added; per-symbol pools remain but are now labeled) — `backtest.py:188-199,277-301` vs `bot/risk.py:65-80`
 
 No `target_risk_pct_per_trade` ATR-risk sizing in the simulator; each symbol gets an
 independent full-$100 pool and P&L is summed — the Tier 1 graduation gate compares
@@ -263,14 +263,14 @@ two differently-sized strategies. DEFERRED to P2.
 - No CI workflow runs the tests at all.
 Fix (P0c): pin bounded, commit conftest, add test.yml.
 
-## F29. Report pain-meter structurally 403s without an undocumented PAT — MEDIUM (conditional) — `.github/workflows/report.yml:9-10,34` + `bot/report.py:250-264`
+## F29. [FIXED 2026-09-08, P2] Report pain-meter structurally 403s without an undocumented PAT — MEDIUM (actions: read added to report.yml) — `.github/workflows/report.yml:9-10,34` + `bot/report.py:250-264`
 
 `permissions: contents: read` sets unlisted scopes to none → `GITHUB_TOKEN` can't
 list workflow runs → every line "unavailable (403)" → header permanently
 "⚠ INVESTIGATE", masking real stalls (unless a `GITHUB_API_TOKEN` PAT secret
 exists). DEFERRED (needs owner decision on PAT).
 
-## F30. Journal infra LOW items — DEFERRED
+## F30. [PARTIALLY FIXED 2026-09-08] Journal infra LOW items (bare-path guard fixed; connection lifecycle + unbounded get_trades remain deferred)
 
 - Connections never closed (`sqlite3.connect` context manager commits but doesn't
   close; `_init_db` re-runs DDL per construction) — `bot/journal.py:16` et al.
@@ -287,7 +287,7 @@ exists). DEFERRED (needs owner decision on PAT).
   `5 * * * *` (actual `11 * * * *`; PROJECT_SUMMARY also references a nonexistent
   `trading-bot.yml`).
 
-## F31. Prompt-injection into the Tier 4 automated gate — LOW likelihood / real path — `bot/memecoin.py:505-512`
+## F31. [MITIGATED 2026-09-08] Prompt-injection into the Tier 4 automated gate (dossier framed as untrusted data; strict schema closes string-"true" variant) — `bot/memecoin.py:505-512`
 
 Attacker-influenced CoinGecko listing `name`/`symbol` enter the conviction prompt
 framed as "RESEARCH DOSSIER (deterministic data, verified)"; a name like
@@ -327,8 +327,9 @@ name flagging. DEFERRED the flagging to P2; prompt instruction added in P0b.
 | P0a | F1, F2 (safe_commit.sh, merge_db.py, workflows, tests) | FIXED 2026-09-08 |
 | P0b | F4, F5, F6, F11 (batch dedupe, manual-buy cap, prompt injection note) | FIXED 2026-09-08 |
 | P0c | F3, F7, F28, F32 (+ chat "Alpaca" label) | FIXED 2026-09-08 |
-| P1a | F12, F13, F14, F15, F18, F19 | DEFERRED |
-| P1b | F25 | DEFERRED |
-| P2 | F8-F10, F11 (reset_kill, meme filter), F16, F17, F20-F24, F26, F27, F29, F30, F31 flagging | DEFERRED |
+| P1a | F12, F13, F14, F15, F18, F19 | FIXED 2026-09-08 |
+| P1b | F25 | FIXED 2026-09-08 (needs DISCORD_OWNER_IDS set by owner) |
+| P2 | F8-F10, F11 (reset_kill), F16, F20-F24, F26, F27, F29, F31 | FIXED 2026-09-08 |
+| P2-remaining | F17 (fill semantics decision), F30 (journal conn lifecycle), meme-category filter | DEFERRED (needs owner input or low value) |
 
 Review log: 2026-09-08 full deep dive (this document). Baseline tests 127/127.
