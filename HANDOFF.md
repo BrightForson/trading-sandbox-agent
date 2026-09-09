@@ -49,11 +49,14 @@ no-touch test — monitoring, not building.
    `gh secret set DISCORD_WEBHOOK_URL`.
 2. Optionally eyeball the daily report pain-meter (report.yml uses
    GITHUB_TOKEN with actions:read — should work without GITHUB_API_TOKEN).
-3. VPS: retry Oracle Cloud free tier when convenient (card kept failing;
-   Always Free is $0 forever, card is verification only). GCP e2-micro
-   backup. Nothing needs paying now. If moved: copy
-   `~/.config/trading-pinger/` to the VPS + install crontab — solves the
-   asleep-laptop heartbeat gap permanently.
+3. ~~VPS~~ → **solved via cron-job.org 2026-09-09**: two always-on cloud jobs
+   dispatch trade+chat every 15 min (PAT: fine-grained, repo-only,
+   Actions:rw, 90d — **rotate by 2026-12-07 or the jobs 401**). Local
+   crontab pinger decommissioned (files kept at ~/.config/trading-pinger/
+   for rollback; native schedules remain as reduced-rate fallback).
+   Oracle card issue was the prepaid-card decline (OR_CCR_104) — needs a
+   real credit/debit card, region irrelevant. A VPS only matters again
+   on real-money day (Binance geo).
 
 ## Key context (settled decisions — do not re-derive)
 - Tier 5: $50 virtual, 10x, 15m candles + 1h trend confirm; 25% kill under
@@ -67,8 +70,10 @@ no-touch test — monitoring, not building.
   alone, "Decide now"/long user prompts (trigger narration), fragment-regex
   alone. nemotron-3-super JSON compliance degrades under load (503s).
 - Heartbeat: trade cycle posts hourly (dedupe by hour); agent cycle is the
-  fallback when trade cycles missed; local pinger checks agent+futures
-  freshness >100 min. All three paths now in place.
+  fallback when trade cycles missed. 15-min trade/chat delivery is now
+  guaranteed by the cron-job.org cloud pinger (laptop can sleep); the local
+  pinger's agent/futures staleness net was NOT replicated (blind POSTs) —
+  acceptable: GitHub delivers hourly schedules reliably.
 - Journal DB data/trades.db committed by safe_commit.sh; NEVER merge
   data/archive into it (pre-reset archives corrupted by design).
 - Audit: `./venv/bin/python tools/audit_ledgers.py`; tests:
@@ -82,5 +87,5 @@ no-touch test — monitoring, not building.
 - Tier 5: $49.90, 1 open (BTC/USD SHORT $10.24 margin @ conf 0.78), kills 0.
 - Active LLM model: rotates under load (kimi-k3 primary, chain walks down
   when it 503s — rotation now true next-in-chain).
-- Workflows live: trade/chat (15-min, pinger-backed), agent/memecoin/futures
-  (hourly), scanner (6h), report (daily 18:00 UTC), tests (on push).
+- Workflows live: trade/chat (15-min, cron-job.org cloud-pinged), agent/memecoin/futures
+  (hourly, native cron), scanner (6h), report (daily 18:00 UTC), tests (on push).
