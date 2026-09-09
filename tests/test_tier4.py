@@ -389,6 +389,7 @@ def _dossier(**over):
         "coin_id": "dogwifhat", "symbol": "WIF", "mcap_rank": 42,
         "liquidity_usd": 1_000_000, "volume_24h_usd": 2_500_000,
         "pair_age_days": 400, "price_usd": 3.0,
+        "categories": ["Meme", "Dog-Themed"],
     }
     base.update(over)
     return base
@@ -415,6 +416,24 @@ def test_rug_guard_blocks_rug_signals(tmp_path):
         assert all(expect not in r.lower() for r in reasons) is False  # reason mentions the failing check
 
 
+def test_rug_guard_blocks_non_meme_categories(tmp_path):
+    led, _ = _ledger(tmp_path)
+    # a major coin with no meme category never reaches the LLM
+    ok, reasons = led._rug_guard(_dossier(categories=["Layer 1", "Smart Contract Platform"]))
+    assert not ok
+    assert any("meme" in r.lower() for r in reasons)
+    # keyword match on partial category strings
+    ok2, _ = led._rug_guard(_dossier(categories=["Dog Memes"]))
+    assert ok2
+    # explicit meme keyword list disables the screen
+    class _NoFilterCfg:
+        memecoin = {**_T4Cfg.memecoin, "meme_category_keywords": []}
+    from bot.memecoin import MemecoinLedger as _ML
+    led2 = _ML(_NoFilterCfg, journal=led.journal)
+    ok3, reasons3 = led2._rug_guard(_dossier(categories=["Layer 1"]))
+    assert ok3 and reasons3 == []
+
+
 def test_rug_guard_reasons_are_specific(tmp_path):
     led, _ = _ledger(tmp_path)
     ok, reasons = led._rug_guard(_dossier(liquidity_usd=10))
@@ -428,7 +447,7 @@ class _FakeModel:
     def __init__(self, decision):
         self.decision = decision
 
-    def generate_json(self, prompt, max_tokens=800, temperature=0.2):
+    def generate_json(self, prompt, max_tokens=800, temperature=0.2, system=None):
         return self.decision
 
 

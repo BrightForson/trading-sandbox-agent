@@ -219,6 +219,13 @@ def _system_context(broker, cfg, journal):
         context += f"\nTier 3 Polymarket wallet (virtual ${wallet.start_cash:.0f}): {wallet.status_line()}"
     except Exception as e:
         context += f"\nTier 3 Polymarket wallet: unavailable ({e})"
+    try:
+        from bot.futures import FuturesLedger
+        fut = FuturesLedger(cfg, journal=journal)
+        context += (f"\nTier 5 futures canary (virtual ${fut.start_cash:.0f}, "
+                    f"{fut.leverage:.0f}x leverage): {fut.status_line()}")
+    except Exception as e:
+        context += f"\nTier 5 futures canary: unavailable ({e})"
     return context
 
 

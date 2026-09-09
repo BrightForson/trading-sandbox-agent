@@ -51,6 +51,7 @@ def _dossier(**over):
     base = {
         "coin_id": "doge", "mcap_rank": 50, "liquidity_usd": 500000,
         "volume_24h_usd": 600000, "pair_age_days": 30, "ath_distance_pct": -50,
+        "categories": ["Meme"],
     }
     base.update(over)
     return base
@@ -75,7 +76,7 @@ class _FakeModel:
     def __init__(self, payload):
         self.payload = payload
 
-    def generate_json(self, prompt, max_tokens=300):
+    def generate_json(self, prompt, max_tokens=300, temperature=0.2, system=None):
         return self.payload
 
 

@@ -41,6 +41,8 @@ def compute_pnl_and_winrate(trades):
                 continue  # virtual Tier-2 trades, not Tier-1 strategy fills
             if "[tier4-memecoin]" in (reasoning or ""):
                 continue  # virtual Tier-4 canary trades, isolated ledger
+            if "[tier5-futures]" in (reasoning or ""):
+                continue  # virtual Tier-5 futures trades, isolated ledger
             status = str(trade[9]) if len(trade) > 9 and trade[9] is not None else "filled"
             if status != "filled":
                 continue
@@ -200,7 +202,7 @@ def tier4_snapshot():
         lines = [f"Tier 4 Memecoin Canary (virtual ${ledger.start_cash:.0f}, "
                  f"human-gated entries only):",
                  f"- {ledger.status_line()}",
-                 f"- Net P&L: {'+' if net >= 0 else '-'}${abs(net):.2f}",
+                 f"- Net P&L: {'+' if net >= 0 else '-'}${abs(net):,.2f}",
                  f"- Fresh research cards: {len(cards)} (CoinGecko trending + "
                  f"DexScreener volume spikes; research only, never auto-executed)"]
         if ledger.kill_active():
@@ -210,6 +212,27 @@ def tier4_snapshot():
         return "\n".join(lines)
     except Exception as e:
         return f"Tier 4 canary snapshot unavailable: {e}"
+
+
+def tier5_snapshot():
+    """Tier 5 futures canary section (virtual leveraged ledger)."""
+    try:
+        from bot.config import config
+        from bot.futures import FuturesLedger
+        ledger = FuturesLedger(config)
+        v = ledger.valuation()
+        net = v["equity"] - ledger.start_cash
+        lines = [f"Tier 5 Futures Canary (virtual ${ledger.start_cash:.0f}, "
+                 f"{ledger.leverage:.0f}x leverage, long/short):",
+                 f"- {ledger.status_line()}",
+                 f"- Net P&L: {'+' if net >= 0 else '-'}${abs(net):,.2f}"]
+        if ledger.kill_active():
+            reason = ledger.journal.get_meta("t5_kill_reason") or "unknown"
+            lines.append(f"- KILL ACTIVE: {reason} — entries blocked until "
+                         f"manual reset (tools/tier5.py reset-kill)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Tier 5 futures snapshot unavailable: {e}"
 
 
 def experiment_scorecards():
@@ -236,6 +259,7 @@ WORKFLOW_SCHEDULES = {
     "agent": (60 * 60, 3),
     "scanner": (6 * 60 * 60, 12),
     "memecoin": (60 * 60, 3),
+    "futures": (60 * 60, 3),
     "report": (24 * 60 * 60, 30),
 }
 
@@ -328,6 +352,8 @@ def create_daily_report():
 
 {tier4_snapshot()}
 
+{tier5_snapshot()}
+
 {experiment_scorecards()}
 
 {actions_health()}
@@ -365,6 +391,8 @@ for SMA20/SMA50 crossovers and will act on the first signal.
 {tier3_wallet_snapshot()}
 
 {tier4_snapshot()}
+
+{tier5_snapshot()}
 
 {experiment_scorecards()}
 
