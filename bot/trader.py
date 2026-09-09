@@ -50,6 +50,17 @@ def _tier_one_liners(journal, broker):
                      + (f" | holding {', '.join(sorted(pos))}" if pos else " | nothing held"))
     except Exception:
         pass
+    # Tier 5 — futures canary
+    try:
+        from bot.futures import FuturesLedger
+        fl = FuturesLedger(config, journal=journal)
+        v = fl.valuation()
+        delta = v["equity"] - fl.start_cash
+        pos = fl._positions()
+        lines.append(f"{emoji_for(delta)} {money_line('Tier 5 Futures', v['equity'], fl.start_cash)}"
+                     + (f" | {len(pos)} open leveraged position(s)" if pos else " | flat"))
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -763,6 +774,14 @@ def run_agent_cycle():
     journal = TradeJournal()
     agent = TradingAgent(config, broker, journal=journal)
     agent.run_cycle()
+    # Heartbeat fallback: the trade cycle normally posts the hourly heartbeat,
+    # but GitHub's scheduler under-delivers 15-min workflows. The agent runs
+    # hourly on a native cron that delivers reliably — if no heartbeat landed
+    # this hour, post it here so the owner always gets one per hour.
+    try:
+        send_heartbeat(broker, journal)
+    except Exception as e:
+        print(f"[{datetime.now()}] Heartbeat fallback failed: {e}")
 
 
 def run_scanner_cycle():
