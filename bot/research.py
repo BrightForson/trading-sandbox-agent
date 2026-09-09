@@ -33,10 +33,11 @@ RSS_FEEDS = [
 SYMBOL_TO_NAME = {
     "BTC/USD": "bitcoin", "ETH/USD": "ethereum", "SOL/USD": "solana",
     "XRP/USD": "ripple", "DOGE/USD": "dogecoin", "ADA/USD": "cardano",
-    "AVAX/USD": "avalanche-2", "LINK/USD": "chainlink",
+    "AVAX/USD": "avalanche-2", "LINK/USD": "chainlink", "BNB/USD": "binancecoin",
     "bitcoin": "bitcoin", "ethereum": "ethereum", "solana": "solana",
     "ripple": "ripple", "dogecoin": "dogecoin", "cardano": "cardano",
     "avalanche-2": "avalanche-2", "chainlink": "chainlink",
+    "binancecoin": "binancecoin",
 }
 
 _journal = None
@@ -154,14 +155,14 @@ def _tavily_increment(journal, day, month):
     journal.set_meta(f"tavily_count_{month}", str(int(journal.get_meta(f"tavily_count_{month}") or "0") + 1))
 
 
-def tavily_search(query, cfg=None, max_results=5):
+def tavily_search(query, cfg=None, max_results=5, journal=None):
     """
     General web search via Tavily. Hard budget guardrails:
       - daily limit (config research.tavily_daily_limit, default 30)
-      - monthly limit (config research.tavily_monthly_limit, default 1000)
+      - monthly limit (config research.tavily_monthly_limit, default 1500)
     Returns [] when out of budget or on any failure (graceful degradation).
     """
-    journal = _get_journal()
+    journal = journal or _get_journal()
     api_key = os_getenv_tavily()
     if not api_key:
         return []
@@ -237,6 +238,57 @@ def whale_activity(symbol, cfg=None):
     if heads:
         return {"source": "rss", "items": [{"title": h, "url": "", "content": ""} for h in heads]}
     return {"source": "none", "items": []}
+
+
+# ---------------- news digest (LLM-gate input) ----------------
+
+def news_digest(symbol, cfg=None, limit=5, journal=None):
+    """Recent headlines for a symbol with recency, from RSS first.
+
+    Tavily web search is layered on top at most ONCE per symbol per day
+    (cached in journal meta, same discipline as whale_activity) so a
+    9-symbol futures cycle never burns more than ~9 credits/day. Tier
+    gates run hourly: the cache is what keeps the monthly budget intact.
+    Pass the CALLER's journal so caches land in the right DB (tests pass
+    tmp journals); falls back to the default journal for CLI callers.
+    Returns {"source": str, "items": [{"title", "url"}]}.
+    """
+    journal = journal or _get_journal()
+    day = _day_key()
+    safe_sym = str(symbol).replace("/", "_")
+    cache_key = f"news_digest_cache_{day}_{safe_sym}"
+    cached = journal.get_meta(cache_key)
+    if cached:
+        import json as _json
+        try:
+            payload = _json.loads(cached)
+            if isinstance(payload, dict) and payload.get("items") is not None:
+                return payload
+        except Exception:
+            pass
+    items = [{"title": h, "url": ""} for h in
+             headlines_for_symbol(symbol, limit=limit)]
+    source = "rss"
+    tav = tavily_search(f"{SYMBOL_TO_NAME.get(symbol, symbol)} crypto news today",
+                        cfg, max_results=3, journal=journal)
+    if tav:
+        for r in tav[:3]:
+            title = str(r.get("title") or "").strip()
+            if title and title not in [i["title"] for i in items]:
+                items.append({"title": title, "url": str(r.get("url") or "")})
+        source = "rss+tavily"
+    items = items[:limit]
+    payload = {"source": source, "items": items}
+    try:
+        import json as _json
+        journal.set_meta(cache_key, _json.dumps(payload))
+        # keep only today's cache rows: drop yesterday's bulky payload
+        from datetime import timedelta as _td
+        yesterday = ((datetime.now(timezone.utc) - _td(days=1)).date()).strftime("%Y-%m-%d")
+        journal.set_meta(f"news_digest_cache_{yesterday}_{safe_sym}", "")
+    except Exception:
+        pass
+    return payload
 
 
 # ---------------- convenience bundle ----------------

@@ -10,6 +10,9 @@ def _no_external_notifications(monkeypatch):
     passing auto-entry test would fire a live webhook.
     """
     monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    # same discipline for paid/limited research APIs: tests must never
+    # burn real Tavily credits (news_digest/tavily_search read this env)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     no_op = lambda *a, **k: None
     monkeypatch.setattr("bot.notify.send_notification", no_op)
     # modules that did `from bot.notify import send_notification` at import

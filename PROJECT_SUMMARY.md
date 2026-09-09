@@ -77,7 +77,7 @@ data/trades.db        # committed to repo: cross-run state for GitHub Actions
 - `research:` — headlines per symbol, Tavily daily (30) / monthly (1000) caps
 - `scanner:` — stake (20), near-resolution watchlist, min_market_volume, mispricing threshold, minimum expected value, total-open-exposure cap, and the betting wallet (`wallet_start_cash: 60`, `wallet_stake: 12`; epoch reset via `bot.wallet.BettingWallet.start_new_epoch()`)
 - `memecoin:` — Tier 4 canary: start_cash (40), max_stake (12), entry-fixed stop_loss_pct (25) / take_profit_pct (50) / time_stop_hours (72), trailing stop (20% trail armed at +25%), partial TP (half at +80%), max_drawdown_pct (25) hard kill w/ 24h auto re-arm, DEX-style fee/slippage (1% / 100bps), research-card TTL + spike filters, meme-category screen (`meme_category_keywords`, empty list disables); automation block: auto_entry, min_llm_confidence (0.75), base_stake (6), max_open_positions (3), rug-guard floors (liquidity 250k / volume 500k / age 7d / mcap rank 300), entry_cooldown_hours (168)
-- `futures:` — Tier 5 futures canary: start_cash (50), leverage (10), base_margin (8) / max_margin (15), stop_atr_mult (1.5) / tp_atr_mult (2.25), max_hold_hours (12), max_drawdown_pct (25) kill w/ manual-only second re-arm, taker_fee_pct (0.05) / slippage_bps (5) / funding_rate_pct_8h (0.01), universe (BTC/ETH/SOL/DOGE/XRP); signal knobs: trend_ema_period (50), momentum_bars (3), momentum_pct (0.5), volume_surge_mult (1.5), ATR band 0.15-3%; automation: auto_entry, min_llm_confidence (0.70), max_open_positions (2), cooldown_hours (24), min_cash_fraction (0.15)
+- `futures:` — Tier 5 futures canary: start_cash (50), leverage (10), base_margin (8) / max_margin (15), stop_atr_mult (1.5) / tp_atr_mult (2.25), trailing_atr_mult (1.0) / trailing_activate_r (1.0) profit-protection trail, max_hold_hours (12), max_drawdown_pct (25) kill w/ manual-only second re-arm, taker_fee_pct (0.05) / slippage_bps (5) / funding_rate_pct_8h (0.01), universe (BTC/ETH/SOL/BNB/XRP/DOGE/ADA/AVAX/LINK USDT perps); signal knobs: trend_ema_period (50), momentum_bars (3), momentum_pct (0.5), volume_surge_mult (1.5), ATR band 0.15-3%; automation: auto_entry, min_llm_confidence (0.70), best_pick (true — one batch LLM call ranks every signal and enters the single highest-potential, not list order), max_open_positions (2), cooldown_hours (24), min_cash_fraction (0.15)
 
 ## Hosting (GitHub Actions, free)
 
@@ -253,3 +253,19 @@ Switch broker back to Alpaca paper: set `broker.name: alpaca` in config.yaml and
 
 1. Set the `DISCORD_OWNER_IDS` Actions **variable** (repo Settings → Secrets and variables → Variables) — until then Bright Bot answers nobody (fail-closed chat gate).
 2. Rotate the Discord webhook (secret) — old public CI logs may contain the token from before masking was added.
+
+## Algorithm upgrades (2026-09-09, owner-directed)
+
+Entry-side (what the LLM sees before a trade):
+- **Tier 5 best-pick gate**: one batch LLM call scores EVERY deterministic signal (trend quality, momentum freshness, volume character, ATR band, RSI-14, news) and enters the single highest-potential trade from the 9-symbol universe — any liquid perp, not just the big 3 or list order. Declined candidates are journaled as shadow proposals for calibration.
+- **Signal dossier enrichment**: RSI-14 + trend distance from the 1h EMA ride the gate dossier (futures); RSI-14 + realized vol from 30d closes + a day-cached news digest ride the memecoin gate.
+- **Tier 3 mispricing prompt** now shows volume, liquidity, and days-to-close per market (naive `endDate` timestamps fixed to UTC-aware).
+- **News budget discipline**: `news_digest()` = RSS floor + Tavily layered at most once per symbol per day (journal-meta cache); tests strip `TAVILY_API_KEY` (conftest) so CI never burns credits. Free plan 1500/mo, 85 used.
+
+Sell-side (deterministic, never LLM-delegated):
+- **Tier 5 trailing stop**: arms at +1R, trails at 1× entry-ATR, ratchets toward profit only, fills at the touch. Closes the no-protection gap between SL and TP.
+- **Tier 4 wick exits** (`wick_exits: true`): the sweep now reads the CoinGecko 5m window since the last sweep — a stop/TP/trailing touched between hourly marks fills at the touch price instead of being missed entirely.
+
+Ledger reset (owner decision: all-loss history retired):
+- `tools/reset_all_but_tier3.py` archived the journal and reset Tiers 1/2/4/5 to day-zero while preserving all Tier 3 bets, the betting wallet epochs, the Tavily budget counters, and operational meta (model chain, chat state, kill counts).
+- `tools/tier3_review.py` ran an advisory LLM review of the 4 open bets: all HOLD (LLM fair-prob estimates above market price on each).

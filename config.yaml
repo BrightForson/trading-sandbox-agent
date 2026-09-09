@@ -88,7 +88,7 @@ agent:
 research:
   headlines_per_symbol: 5
   tavily_daily_limit: 30
-  tavily_monthly_limit: 1000
+  tavily_monthly_limit: 1500  # free-plan cap (85/1500 used as of 2026-09-09)
 
 # Polymarket scanner (Tier 3) — read-only API, paper bets only
 scanner:
@@ -139,6 +139,10 @@ memecoin:
   max_mcap_rank: 300           # rug-guard: no micro-cap obscurities
   trailing_stop_pct: 20        # trail distance once activated
   trailing_activate_pct: 25    # arm the trail after +25%
+  wick_exits: true             # check the 5m window since last sweep: stops
+                               # touched between hourly marks fill at the touch
+  news_in_gate: true           # LLM conviction gate sees a day-cached news
+                               # digest (RSS + Tavily, 1 call/symbol/day)
   partial_tp_pct: 80           # bank half at +80%
   partial_tp_sell_frac: 0.5    # fraction sold at the partial TP
   entry_cooldown_hours: 168    # no re-entry into a symbol for 7 days after any exit
@@ -163,17 +167,26 @@ memecoin:
 # manual-reset escalation after a second kill).
 futures:
   start_cash: 50           # virtual futures ledger (owner allocation)
-  universe:                # liquid USDT perps only: tight spreads, deep books
+  universe:                # liquid USDT perps: the LLM best-pick gate may
+                           # trade ANY of these — it ranks every signal and
+                           # takes the single highest-potential at that
+                           # instance (owner decision 2026-09-09)
     - BTC/USD
     - ETH/USD
     - SOL/USD
-    - DOGE/USD
+    - BNB/USD
     - XRP/USD
+    - DOGE/USD
+    - ADA/USD
+    - AVAX/USD
+    - LINK/USD
   leverage: 10             # mildly extreme (owner: "not like the memecoin")
   max_margin: 15          # per-position margin cap ($ of the $50)
   base_margin: 8           # margin at the LLM confidence threshold
   stop_atr_mult: 1.5        # stop distance = 1.5 * 15m ATR
   tp_atr_mult: 2.25        # target = 2.25 * ATR (1.5 R:R)
+  trailing_atr_mult: 1.0    # trail distance = 1.0 * entry-ATR once armed
+  trailing_activate_r: 1.0  # arm the trail at +1R unrealized
   max_hold_hours: 12        # a 15m momentum thesis is dead by 12h
   max_drawdown_pct: 25      # hard kill: flatten + cooldown (kept under the
                             # ~29.9% worst-case single-liquidation floor: one
@@ -184,6 +197,8 @@ futures:
   auto_entry: true
   auto_cooldown_hours: 24    # kill cooldown before entries auto-resume
   min_llm_confidence: 0.70
+  best_pick: true            # LLM scores ALL signals in one call, enters the
+                             # single highest-potential trade (not list order)
   max_open_positions: 2
   cooldown_hours: 24         # per-symbol cooldown after any exit
   min_cash_fraction: 0.15    # keep >= 15% of equity as free cash

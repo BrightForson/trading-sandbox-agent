@@ -36,6 +36,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
         run: python tools/tier4.py cycle
 
       - name: Commit journal (lossless merge on conflict)

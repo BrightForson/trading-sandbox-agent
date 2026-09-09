@@ -67,6 +67,8 @@ def _parse_market(m):
         if end:
             try:
                 end_ts = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                if end_ts.tzinfo is None:
+                    end_ts = end_ts.replace(tzinfo=timezone.utc)
             except Exception:
                 end_ts = None
         return {
@@ -164,12 +166,23 @@ def scan_llm_mispricing(cfg, markets=None, model=None, journal=None):
             break
     if not candidates:
         return []
-    lines = [f"- {c['question']} (outcomes: {c['outcomes'][0]} or {c['outcomes'][1]}; "
-             f"current price of {c['outcomes'][0]}: {c['yes_price']:.2f})" for c in candidates]
+    now = datetime.now(timezone.utc)
+    lines = []
+    for c in candidates:
+        days_left = ((c["end_ts"] - now).total_seconds() / 86400
+                     if c["end_ts"] else None)
+        lines.append(
+            f"- {c['question']} (outcomes: {c['outcomes'][0]} or {c['outcomes'][1]}; "
+            f"current price of {c['outcomes'][0]}: {c['yes_price']:.2f}; "
+            f"24h volume ${c['volume_24h']:,.0f}, total volume ${c['volume_total']:,.0f}, "
+            f"liquidity ${c['liquidity']:,.0f}"
+            + (f"; {days_left:.1f} days to close" if days_left is not None else "") + ")")
     prompt = f"""You are a prediction-market analyst. For each market, estimate the
 true probability (0.00-1.00) of the FIRST listed outcome resolving true, using
-your world knowledge. Be calibrated and skeptical of hype. The first outcome's
-name is given explicitly — judge THAT outcome, not a generic "yes".
+your world knowledge plus the market context given (volume/liquidity signal
+market confidence; days-to-close affects resolution risk). Be calibrated and
+skeptical of hype. The first outcome's name is given explicitly — judge
+THAT outcome, not a generic "yes".
 
 Markets:
 {chr(10).join(lines)}
