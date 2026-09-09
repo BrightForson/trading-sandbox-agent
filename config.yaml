@@ -141,3 +141,55 @@ memecoin:
   partial_tp_pct: 80           # bank half at +80%
   partial_tp_sell_frac: 0.5    # fraction sold at the partial TP
   entry_cooldown_hours: 168    # no re-entry into a symbol for 7 days after any exit
+  # meme-category screen: only actual meme-narrative coins enter; majors like
+  # bitcoin/polkadot/zcash waste LLM calls and aren't the tier's thesis.
+  # Empty list disables the filter.
+  meme_category_keywords:
+    - meme
+    - dog
+    - cat
+    - pepe
+    - shiba
+    - frog
+    - inu
+    - wif
+
+# Tier 5 futures canary — the last tier (owner decision 2026-09-09). Virtual
+# $50 leveraged ledger: LONG and SHORT on liquid Binance USDT pairs. Entries
+# gated by a deterministic 1h-trend + 15m-momentum + volume-surge signal and
+# an LLM conviction check; exits are fully deterministic (ATR stop/target,
+# 12h time stop, funding accrual, liquidation sim, 30% drawdown kill with
+# manual-reset escalation after a second kill).
+futures:
+  start_cash: 50           # virtual futures ledger (owner allocation)
+  universe:                # liquid USDT perps only: tight spreads, deep books
+    - BTC/USD
+    - ETH/USD
+    - SOL/USD
+    - DOGE/USD
+    - XRP/USD
+  leverage: 10             # mildly extreme (owner: "not like the memecoin")
+  max_margin: 15          # per-position margin cap ($ of the $50)
+  base_margin: 8           # margin at the LLM confidence threshold
+  stop_atr_mult: 1.5        # stop distance = 1.5 * 15m ATR
+  tp_atr_mult: 2.25        # target = 2.25 * ATR (1.5 R:R)
+  max_hold_hours: 12        # a 15m momentum thesis is dead by 12h
+  max_drawdown_pct: 25      # hard kill: flatten + cooldown (kept under the
+                            # ~29.9% worst-case single-liquidation floor: one
+                            # bad trade never kills, two always do)
+  taker_fee_pct: 0.05       # Binance perp taker fee
+  slippage_bps: 5           # liquid-book adverse slippage per fill
+  funding_rate_pct_8h: 0.01  # longs pay/shorts receive, accrued at 8h marks
+  auto_entry: true
+  auto_cooldown_hours: 24    # kill cooldown before entries auto-resume
+  min_llm_confidence: 0.70
+  max_open_positions: 2
+  cooldown_hours: 24         # per-symbol cooldown after any exit
+  min_cash_fraction: 0.15    # keep >= 15% of equity as free cash
+  trend_ema_period: 50       # 1h trend regime filter
+  momentum_bars: 3           # 15m momentum lookback (45 min)
+  momentum_pct: 0.5          # required move for a signal
+  volume_surge_mult: 1.5     # signal bar volume vs 20-bar mean
+  min_atr_pct: 0.15          # dead-tape floor (% of price)
+  max_atr_pct: 3.0           # news-spike ceiling (% of price)
+  trend_filter_1h: true

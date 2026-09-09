@@ -96,6 +96,7 @@ def _tier1_losing_week_streak(journal):
         trades = [t for t in journal.get_trades()
                   if t[1] and "[shadow-account]" not in (t[6] or "")
                   and "[tier4-memecoin]" not in (t[6] or "")
+                  and "[tier5-futures]" not in (t[6] or "")
                   and (t[7] == "filled" if len(t) > 7 else True)]
     except Exception:
         return 0
@@ -247,6 +248,60 @@ def tier4_gate(journal=None):
     return GateResult("Tier 4 (memecoin)", True, "no kill criterion hit after >= 4 weeks", details)
 
 
+def tier5_gate(journal=None):
+    """Tier 5 KEEP/KILL: net P&L floor + kill/liquidation discipline history."""
+    journal = journal or TradeJournal()
+    start_cash = 50.0
+    pnl = 0.0
+    TIER5_TAG = "[tier5-futures]"
+    try:
+        from bot.config import config
+        from bot.futures import FuturesLedger
+        led = FuturesLedger(config, journal=journal)
+        v = led.valuation()
+        start_cash = led.start_cash
+        pnl = v["equity"] - start_cash
+    except Exception:
+        try:
+            total = 0.0
+            for t in journal.get_trades():
+                if TIER5_TAG in (t[6] or ""):
+                    total += float(t[4]) * float(t[5])
+            pnl = total
+        except Exception:
+            pnl = 0.0
+    kills = 0
+    try:
+        kills = int(journal.get_meta("t5_kill_count") or 0)
+    except Exception:
+        pass
+    liquidations = 0
+    try:
+        for t in journal.get_trades():
+            if TIER5_TAG in (t[6] or "") and "liquidation" in (t[6] or ""):
+                liquidations += 1
+    except Exception:
+        pass
+    weeks = _weeks_since_day_zero(journal)
+    pnl_pct = (pnl / start_cash * 100) if start_cash else 0.0
+
+    reasons = []
+    if weeks >= 4 and pnl_pct < -50:
+        reasons.append(f"net P&L {pnl_pct:+.1f}% < -50% over >= 4 weeks")
+    if kills >= 2:
+        reasons.append(f"{kills} drawdown kills (second kill = failed edge, manual reset required)")
+    if liquidations >= 3:
+        reasons.append(f"{liquidations} liquidations (stop discipline failed repeatedly)")
+    details = (f"P&L ${pnl:+.2f} ({pnl_pct:+.1f}% of ${start_cash:.0f}) | "
+               f"kills {kills} | liquidations {liquidations} | {weeks:.1f} weeks since day-zero")
+    if reasons:
+        return GateResult("Tier 5 (futures)", False, "; ".join(reasons), details)
+    if weeks < 4:
+        return GateResult("Tier 5 (futures)", True,
+                          f"PENDING (only {weeks:.1f}/4 weeks; no kill criterion hit)", details)
+    return GateResult("Tier 5 (futures)", True, "no kill criterion hit after >= 4 weeks", details)
+
+
 def agent_alpha_gate(journal=None):
     """Tier 2 semi-auto readiness: is the AI agent actually adding alpha?
 
@@ -346,7 +401,7 @@ def evaluate_gates(journal=None):
     journal = journal or TradeJournal()
     results = [tier1_gate(journal), agent_alpha_gate(journal),
                tier3_gate(journal), tier4_gate(journal),
-               reconciliation_gate(journal)]
+               tier5_gate(journal), reconciliation_gate(journal)]
     lines = ["Graduation Gates (recommend-only, never auto-promote):"]
     for r in results:
         verdict = "GREEN" if r.passed else "RED"
