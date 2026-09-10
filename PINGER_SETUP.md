@@ -1,9 +1,14 @@
 # Actions Pinger — fix GitHub scheduler under-delivery (15-min workflows)
 
-**Status: MIGRATED to cron-job.org 2026-09-09** (cloud pinger, always-on —
-the local crontab pinger was decommissioned the same day after cloud
-dispatches were verified landing every 15 min. Local pinger files remain
-at `~/.config/trading-pinger/` for reference/rollback.)
+**Status: ROLLED BACK to local crontab 2026-09-10** — the cron-job.org
+cloud pinger delivered ZERO dispatches from 17:00 (2026-09-09, local
+decommission) until 00:04 (2026-09-10, rollback): no workflow_dispatch
+runs exist in that 7-hour window, the hourly heartbeat went silent, and
+no failure alerts arrived (silent free-tier failure — suspected suspended
+jobs or rejected auth). The LOCAL crontab pinger below is re-installed
+and verified dispatching (204s). The cron-job.org jobs should be deleted
+or repaired from the dashboard at console.cron-job.org; keep the local
+pinger as the primary until a cloud alternative is actually verified.
 
 ## Problem (measured, STATUS_REPORT.md §16)
 
@@ -12,12 +17,12 @@ of requested runs: median chat reply ~92 min late, 183-min average gaps
 between runs. Queue time 0s, failures 0 — scheduled runs simply never
 get created. Chronic, not episodic.
 
-## Implemented fix: local crontab pinger
+## Implemented fix: local crontab pinger (REINSTALLED 2026-09-10)
 
 This machine's cron fires authenticated `workflow_dispatch` POSTs every
 15 minutes for `chat` and `trade`. Dispatch-created runs bypass the
-broken scheduler entirely. First pings verified: `HTTP 204` → runs
-created → `completed/success`.
+broken scheduler entirely. Verified again on rollback: `HTTP 204` →
+runs created → `completed/success`, heartbeat resumed within minutes.
 
 ### Components (all under `~/.config/trading-pinger/`)
 
@@ -27,38 +32,28 @@ created → `completed/success`.
 | `refresh_token.sh` | weekly re-cache of the gh CLI token (Sundays 04:00) |
 | `gh_token` | cached gh OAuth token (mode 600; gh itself refreshes on use) |
 
-### Crontab (DECOMMISSIONED 2026-09-09)
+### Crontab (REINSTALLED 2026-09-10)
 
-The local crontab lines were removed when the cloud pinger took over.
-Files kept at `~/.config/trading-pinger/` (pinger.sh with the
-agent+futures staleness net, refresh_token.sh, gh_token) for rollback.
+Active again after the cron-job.org failure. Verify any time:
+`crontab -l` — expect the two lines under Rollback below.
 
-## Current setup: cron-job.org cloud pinger (since 2026-09-09)
+## Current setup: LOCAL crontab pinger (since 2026-09-10 rollback)
 
-Two always-on POST jobs at console.cron-job.org, every 15 min:
+`*/15 * * * *` fires `pinger.sh`, which POSTs dispatches for chat +
+trade and freshness-checks agent + futures workflows (>100 min stale →
+dispatch), logging HTTP codes to `pinger.log`. Auth: the cached gh OAuth
+token (`gh_token`, mode 600, refreshed weekly by `refresh_token.sh`).
 
-| Job | URL |
-|---|---|
-| `ping-trade` | `https://api.github.com/repos/BrightForson/trading-sandbox-agent/actions/workflows/trade.yml/dispatches` |
-| `ping-chat` | `https://api.github.com/repos/BrightForson/trading-sandbox-agent/actions/workflows/chat.yml/dispatches` |
+The cron-job.org experiment (2026-09-09 → 2026-09-10) failed silently:
+zero dispatches in 7 hours, no failure alerts. Delete or repair those
+jobs at console.cron-job.org if you want a cloud backup later — until
+one is VERIFIED delivering, the local pinger is the sole reliable
+dispatch source.
 
-Headers: `Authorization: Bearer <fine-grained PAT>`,
-`Accept: application/vnd.github+json`; body `{"ref":"main"}` as
-application/json; 30s timeout; failure alerts ON. The PAT is fine-grained,
-repo-scoped to this repo only, Actions: Read and write only, 90-day
-expiry (**rotate ~2026-09-08 + 90d = 2026-12-07** — the jobs will 401
-silently after expiry; cron-job.org failure alerts catch it).
-
-Verified working 2026-09-09: dispatches land every 15 min, all runs
-`workflow_dispatch` + `completed/success`.
-
-Trade-offs accepted vs the local pinger:
-- cron-job.org does dumb blind POSTs — the agent/futures staleness net
-  (dispatch only if >100 min stale) is NOT replicated. That's OK:
-  GitHub delivers hourly schedules reliably, and the agent-cycle
-  heartbeat fallback (bot/trader.py) already covers missed heartbeats.
-- The PAT lives in a third-party dashboard; blast radius is capped by
-  fine-grained scoping (one repo, Actions only, 90d).
+**Host dependency:** this machine must stay on for the pinger to fire.
+If it sleeps/shuts down, 15-min workflows degrade to GitHub's native
+scheduler (~6-8% delivery) and the hourly heartbeat falls back to the
+agent workflow's native hourly cron (usually reliable).
 
 ### How it interacts with native schedules
 
@@ -96,15 +91,15 @@ failure-alert emails; if they ever stop arriving, check the dashboard.
 The repo's own native schedules remain as a reduced-rate fallback, and
 the rollback below restores the local pinger in minutes.
 
-## Rollback
+## Rollback (currently ACTIVE — this IS the live setup)
 
-`crontab -e`, re-add the two lines from `~/.config/trading-pinger/`:
+`crontab -l` should show:
 ```
 */15 * * * * /home/brightkwame/.config/trading-pinger/pinger.sh
 0 4 * * 0   /home/brightkwame/.config/trading-pinger/refresh_token.sh
 ```
-Then disable both cron-job.org jobs. Nothing in the repo depends on
-either pinger; native schedules continue at their reduced rate either way.
+Nothing in the repo depends on the pinger; native schedules continue
+at their reduced rate either way.
 
 ## Future note (real-money day)
 
