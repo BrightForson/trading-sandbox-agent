@@ -20,6 +20,13 @@ symbols:
   - BTC/USD
   - ETH/USD
   - SOL/USD
+  - XRP/USD
+  - BNB/USD
+  - DOGE/USD
+  - ADA/USD
+  - TRX/USD
+  - LTC/USD
+  - XLM/USD
 
 # Strategy parameters
 sma_fast: 20
@@ -78,16 +85,25 @@ agent:
   # Tier 1 execution stays hard-scoped to `symbols:`; this widens the AI's
   # idea net only. Babysitter stays scoped to held positions.
   scout_extra_universe:
-    - XRP/USD
-    - DOGE/USD
-    - ADA/USD
     - AVAX/USD
     - LINK/USD
+    - DOT/USD
+    - UNI/USD
+    - ATOM/USD
+    - NEAR/USD
+    - ZEC/USD
+    - SHIB/USD
+    - ETC/USD
+    - AAVE/USD
+    - ALGO/USD
+    - GRT/USD
 
 # Research tools for the agent (all free tiers)
 research:
   headlines_per_symbol: 5
-  tavily_daily_limit: 30
+  tavily_daily_limit: 60     # futures universe (22) + memecoin dossiers fit
+                            # under this; per-symbol-per-day caches keep the
+                            # real daily burn well below it
   tavily_monthly_limit: 1500  # free-plan cap (85/1500 used as of 2026-09-09)
 
 # Polymarket scanner (Tier 3) — read-only API, paper bets only
@@ -180,6 +196,19 @@ futures:
     - ADA/USD
     - AVAX/USD
     - LINK/USD
+    - TRX/USD
+    - XLM/USD
+    - LTC/USD
+    - DOT/USD
+    - UNI/USD
+    - ATOM/USD
+    - NEAR/USD
+    - ZEC/USD
+    - SHIB/USD
+    - ETC/USD
+    - AAVE/USD
+    - ALGO/USD
+    - GRT/USD
   leverage: 10             # mildly extreme (owner: "not like the memecoin")
   max_margin: 15          # per-position margin cap ($ of the $50)
   base_margin: 8           # margin at the LLM confidence threshold
