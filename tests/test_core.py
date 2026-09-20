@@ -1166,6 +1166,83 @@ def test_is_our_bot_decodes_token_id(monkeypatch):
     assert _is_our_bot({"author": {"id": "x", "bot": True}}) is True
 
 
+# ---------------- chat: open bets in system context ----------------
+
+class _FlatBroker:
+    class _Acct:
+        equity = 100.0
+        cash = 100.0
+    def get_account(self):
+        return self._Acct()
+    def get_all_positions(self):
+        return []
+
+
+def _chat_cfg():
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        sma_fast=9, sma_slow=21, symbols=["BTC/USD"],
+        scanner={"wallet_start_cash": 10, "wallet_stake": 2},
+    )
+
+
+def test_system_context_lists_open_bets(tmp_path):
+    from bot.chat import _system_context
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    j.log_bet("2026-09-08T16:42:43+00:00", "cs2-g2-ast", "G2 vs Astralis?",
+              "Astralis", 0.325, 20, estimated_probability=0.45)
+    ctx = _system_context(_FlatBroker(), _chat_cfg(), j)
+    assert "Tier 3 open bets:" in ctx
+    assert "Astralis" in ctx and "G2 vs Astralis?" in ctx
+    assert "0.33" in ctx  # price visible so the bot can answer "which bets"
+
+
+def test_system_context_no_open_bets(tmp_path):
+    from bot.chat import _system_context
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    ctx = _system_context(_FlatBroker(), _chat_cfg(), j)
+    assert "Tier 3 open bets: none" in ctx
+
+
+def test_mentions_bot_detection():
+    from bot.chat import _mentions_bot
+    msg = {"mentions": [{"id": "111", "username": "Bright Bot"}]}
+    assert _mentions_bot(msg, "111") is True
+    assert _mentions_bot(msg, "999") is False
+    assert _mentions_bot({"mentions": []}, "111") is False
+    assert _mentions_bot(msg, None) is False
+
+
+def test_chat_answers_only_on_mention(tmp_path, monkeypatch):
+    import base64
+    from datetime import datetime, timezone
+    import bot.chat as chat
+    bot_id = "111"
+    token = base64.b64encode(bot_id.encode()).decode().rstrip("=") + ".x.y"
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", token)
+    monkeypatch.setenv("DISCORD_OWNER_IDS", "222")
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    j.set_meta("discord_chat_channel_id", "999")
+    now = datetime.now(timezone.utc).isoformat()
+    msgs = [
+        {"id": "a", "timestamp": now, "content": "hello everyone",
+         "author": {"id": "222", "username": "owner"}, "mentions": []},
+        {"id": "b", "timestamp": now, "content": "<@111> tier 3 pnl?",
+         "author": {"id": "222", "username": "owner"},
+         "mentions": [{"id": "111", "username": "Bright Bot"}]},
+    ]
+    monkeypatch.setattr(chat, "_get_messages", lambda cid, limit=20: msgs)
+    sent = []
+    monkeypatch.setattr(chat, "_send_message", lambda cid, content: sent.append(content))
+
+    class _M:
+        def generate_text(self, prompt, max_tokens=600, temperature=0.5):
+            return "answer"
+
+    chat.run_chat_cycle(_chat_cfg(), _FlatBroker(), journal=j, model=_M())
+    assert sent == ["answer"]
+
+
 # ---------------- polymarket settlement ambiguity ----------------
 
 def test_settlement_requires_unambiguous_prices(tmp_path, monkeypatch):
@@ -1202,6 +1279,44 @@ def test_settlement_requires_unambiguous_prices(tmp_path, monkeypatch):
             }]
 
     monkeypatch.setattr(pm.requests, "get", lambda *a, **k: _Resp2())
+    settled = pm.settle_open_bets(_WalletCfg, journal=j)
+    assert len(settled) == 1 and settled[0][1] is True
+    assert j.get_open_bets() == []
+
+
+def test_settlement_finds_closed_markets(tmp_path, monkeypatch):
+    """Resolved markets vanish from Gamma's default listing; settle must
+    refetch with closed=true or phantom 'open' bets clog the exposure cap."""
+    from bot import polymarket as pm
+
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    j.log_bet("2026-09-08T10:00", "cs2-old", "old match?", "Yes", 0.5, 20)
+
+    class _Empty:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return []
+
+    class _Closed:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return [{
+                "slug": "cs2-old", "closed": True,
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '[1, 0]',
+            }]
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        assert url == pm.GAMMA_MARKETS_URL
+        if (params or {}).get("closed") == "true":
+            return _Closed()
+        return _Empty()
+
+    monkeypatch.setattr(pm.requests, "get", fake_get)
     settled = pm.settle_open_bets(_WalletCfg, journal=j)
     assert len(settled) == 1 and settled[0][1] is True
     assert j.get_open_bets() == []

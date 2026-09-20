@@ -117,17 +117,40 @@ def _is_our_bot(msg):
     author = msg.get("author", {})
     if author.get("bot"):
         return True
+    bot_id = _bot_user_id()
+    return bool(bot_id) and author.get("id") == bot_id
+
+
+def _bot_user_id():
+    """Resolve Bright Bot's own user id (for mention detection).
+
+    Prefer the token's first segment (no network); fall back to /users/@me.
+    None when unresolvable — callers must then treat every message as
+    NOT mentioning us (fail-closed: never reply-all by accident).
+    """
     token = os.getenv("DISCORD_BOT_TOKEN", "")
     first = token.split(".")[0] if token else ""
-    if not first:
-        return False
+    if first:
+        try:
+            padded = first + "=" * (-len(first) % 4)
+            decoded = base64.b64decode(padded).decode("utf-8", "ignore")
+            if decoded:
+                return decoded
+        except Exception:
+            pass
     try:
-        # the token's first segment is the base64-encoded bot user id
-        padded = first + "=" * (-len(first) % 4)
-        bot_id = base64.b64decode(padded).decode("utf-8", "ignore")
-        return author.get("id") == bot_id
+        resp = requests.get(f"{API}/users/@me", headers=_headers(), timeout=15)
+        resp.raise_for_status()
+        return resp.json().get("id")
     except Exception:
+        return None
+
+
+def _mentions_bot(msg, bot_id):
+    """True only when the message explicitly tags Bright Bot."""
+    if not bot_id:
         return False
+    return any(m.get("id") == bot_id for m in msg.get("mentions", []) or [])
 
 
 def _answer_prompt(question, context_block):
@@ -220,6 +243,21 @@ def _system_context(broker, cfg, journal):
     except Exception as e:
         context += f"\nTier 3 Polymarket wallet: unavailable ({e})"
     try:
+        open_bets = journal.get_open_bets()
+        if open_bets:
+            lines = []
+            for b in open_bets[-10:]:
+                entry_prob = b[11] if b[11] is not None else "?"
+                lines.append(
+                    f"#{b[0]} {b[4]} @ {b[5]:.2f} on \"{(b[3] or b[2])[:70]}\" "
+                    f"(${b[6]:.0f} stake, placed {str(b[1])[:10]}, entry prob {entry_prob})"
+                )
+            context += "\nTier 3 open bets: " + "; ".join(lines)
+        else:
+            context += "\nTier 3 open bets: none"
+    except Exception as e:
+        context += f"\nTier 3 open bets: unavailable ({e})"
+    try:
         from bot.futures import FuturesLedger
         fut = FuturesLedger(cfg, journal=journal)
         context += (f"\nTier 5 futures canary (virtual ${fut.start_cash:.0f}, "
@@ -284,10 +322,16 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
 
     answered = 0
     deferred = 0
+    bot_id = _bot_user_id()
     for msg in reversed(fresh):  # oldest first, natural conversation order
         question = (msg.get("content") or "").strip()
         if not question:
             # advance past empty messages so they don't backlog
+            _advance_seen(journal, msg)
+            continue
+        if not _mentions_bot(msg, bot_id):
+            # owner chatter without a tag is not for us: advance past it so
+            # it never backlogs, but never answer it
             _advance_seen(journal, msg)
             continue
         if answered >= MAX_REPLIES_PER_CYCLE:

@@ -315,6 +315,14 @@ def settle_open_bets(cfg, journal=None):
             resp.raise_for_status()
             data = resp.json()
             if not data:
+                # resolved/closed markets drop out of the default listing;
+                # without this fallback they stay 'open' forever and their
+                # phantom stake keeps clogging the exposure cap for new bets
+                resp = requests.get(GAMMA_MARKETS_URL, params={"slug": slug, "closed": "true"},
+                                    headers=HEADERS, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            if not data:
                 continue
             m = data[0]
             if not m.get("closed"):
