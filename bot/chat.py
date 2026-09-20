@@ -25,6 +25,8 @@ load_dotenv()
 API = "https://discord.com/api/v10"
 STATE_KEY = "discord_chat_last_seen"
 MAX_REPLIES_PER_CYCLE = 5  # defer the rest; they stay > last_seen and answer next cycle
+HINT_KEY = "discord_chat_mention_hint_at"
+HINT_COOLDOWN_S = 3600  # at most one tagging hint per hour (never spam the channel)
 
 
 def _owner_ids():
@@ -153,6 +155,38 @@ def _mentions_bot(msg, bot_id):
     return any(m.get("id") == bot_id for m in msg.get("mentions", []) or [])
 
 
+def _looks_addressed_to_bot(question):
+    """Heuristic for a tagging miss: the owner tried to reach the bot but
+    tagged something else (e.g. a role `<@&...>` populates mention_roles,
+    never `mentions`) or just typed its name. Any `<@` syntax or the bot's
+    name counts — the reply is only ever a tagging hint, never data."""
+    q = question or ""
+    return "<@" in q or "bright bot" in q.lower()
+
+
+MENTION_HINT = (
+    "I only reply when you @-mention me directly — pick @Bright Bot "
+    "(the one with the BOT tag). Tagging a role doesn't reach me. "
+    "Ask again with a real mention and I'll answer."
+)
+
+
+def _maybe_send_mention_hint(channel_id, journal):
+    """Rate-limited tagging hint. Returns True when a hint was sent."""
+    try:
+        last = float(journal.get_meta(HINT_KEY) or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if time.time() - last < HINT_COOLDOWN_S:
+        return False
+    try:
+        _send_message(channel_id, MENTION_HINT)
+    except Exception:
+        return False
+    journal.set_meta(HINT_KEY, str(time.time()))
+    return True
+
+
 def _answer_prompt(question, context_block):
     return f"""You are the AI assistant for a crypto paper-trading system. You are
 chatting with the system's owner in Discord. Answer concisely (under 1500 chars),
@@ -233,7 +267,7 @@ def _system_context(broker, cfg, journal):
             for sym, p in pos.items():
                 lines.append(f"{sym} qty {p['qty']:.6f} entry ${p['entry']:,.2f}")
             acct_line += " | open: " + "; ".join(lines)
-        context += f"\nAI shadow account (virtual $20): {acct_line}"
+        context += f"\nAI shadow account (virtual ${shadow.start_cash:.0f}): {acct_line}"
     except Exception as e:
         context += f"\nAI shadow account: unavailable ({e})"
     try:
@@ -264,6 +298,13 @@ def _system_context(broker, cfg, journal):
                     f"{fut.leverage:.0f}x leverage): {fut.status_line()}")
     except Exception as e:
         context += f"\nTier 5 futures canary: unavailable ({e})"
+    try:
+        from bot.memecoin import MemecoinLedger
+        meme = MemecoinLedger(cfg, journal=journal)
+        context += (f"\nTier 4 memecoin canary (virtual ${meme.start_cash:.0f}): "
+                    f"{meme.status_line()}")
+    except Exception as e:
+        context += f"\nTier 4 memecoin canary: unavailable ({e})"
     return context
 
 
@@ -330,8 +371,12 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
             _advance_seen(journal, msg)
             continue
         if not _mentions_bot(msg, bot_id):
-            # owner chatter without a tag is not for us: advance past it so
-            # it never backlogs, but never answer it
+            # Owner chatter without a tag is not for us — but if it LOOKS
+            # like a tagging miss (role mention, bot name), say so once in
+            # a while instead of staying mysteriously silent. Either way
+            # advance past it so it never backlogs.
+            if _looks_addressed_to_bot(question):
+                _maybe_send_mention_hint(channel_id, journal)
             _advance_seen(journal, msg)
             continue
         if answered >= MAX_REPLIES_PER_CYCLE:

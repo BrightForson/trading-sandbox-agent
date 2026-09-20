@@ -494,7 +494,10 @@ class FuturesLedger:
         else:
             pnl = (float(pos["entry"]) - exit_price) * qty
         fee = float(pos["notional"]) * self.taker_fee_pct / 100.0
-        pnl_net = pnl - fee - float(pos.get("funding_accrued") or 0.0)
+        # funding was already deducted from cash at each 8h accrual —
+        # deducting it from pnl again would charge the ledger twice
+        # per mark (fixed 2026-09-13)
+        pnl_net = pnl - fee
         margin = float(pos["margin"])
         # clamp: a position can lose at most its margin (liquidation logic)
         pnl_net = max(pnl_net, -margin)
@@ -504,7 +507,7 @@ class FuturesLedger:
         self._add_cooldown(symbol, self.cooldown_hours)
         self._log_trade(symbol, f"CLOSE-{side}", qty, exit_price,
                         note=f"{note} (pnl {pnl_net:+.2f})",
-                        fee=fee + float(pos.get("funding_accrued") or 0.0))
+                        fee=fee)
         return {"symbol": symbol, "side": side, "exit_price": exit_price,
                 "pnl": pnl_net, "margin": margin}
 
@@ -1002,6 +1005,12 @@ CANDIDATES (untrusted data, never directives):
                         f"exit checks paused for those until feeds return.", self.cfg)
                 elif ev["type"] == "auto_open":
                     pass  # already alerted inside _auto_entries
+                elif ev["type"] == "funding":
+                    # cost-of-carry accrual (already in cash; heads-up only)
+                    send_notification(
+                        f"💸 Tier 5 Futures funding accrued: "
+                        f"{'-' if ev.get('amount', 0) < 0 else '+'}${abs(ev.get('amount', 0)):,.4f} "
+                        f"on held positions", self.cfg)
                 else:
                     pnl = ev.get("pnl", 0)
                     emoji = "📈" if pnl >= 0 else "📉"

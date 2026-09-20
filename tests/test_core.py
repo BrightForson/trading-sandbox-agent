@@ -1243,6 +1243,69 @@ def test_chat_answers_only_on_mention(tmp_path, monkeypatch):
     assert sent == ["answer"]
 
 
+def test_chat_role_mention_gets_tagging_hint(tmp_path, monkeypatch):
+    """Regression: owner tags a ROLE (<@&...>) instead of the bot user —
+    `mentions` stays empty so the mention-gate misses it. Must get a
+    tagging hint (not silence, not an LLM answer), and the cursor advances."""
+    import base64
+    from datetime import datetime, timezone
+    import bot.chat as chat
+    bot_id = "111"
+    token = base64.b64encode(bot_id.encode()).decode().rstrip("=") + ".x.y"
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", token)
+    monkeypatch.setenv("DISCORD_OWNER_IDS", "222")
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    j.set_meta("discord_chat_channel_id", "999")
+    now = datetime.now(timezone.utc).isoformat()
+    msgs = [
+        {"id": "a", "timestamp": now,
+         "content": "<@&9999> what is the current open bet in tier 3?",
+         "author": {"id": "222", "username": "owner"}, "mentions": []},
+    ]
+    monkeypatch.setattr(chat, "_get_messages", lambda cid, limit=20: msgs)
+    sent = []
+    monkeypatch.setattr(chat, "_send_message", lambda cid, content: sent.append(content))
+
+    class _Exploding:
+        def generate_text(self, *a, **k):
+            raise AssertionError("LLM must not be consulted for a tagging miss")
+
+    chat.run_chat_cycle(_chat_cfg(), _FlatBroker(), journal=j, model=_Exploding())
+    assert len(sent) == 1 and "@Bright Bot" in sent[0]
+    assert float(j.get_meta("discord_chat_last_seen") or 0) > 0  # advanced past it
+
+
+def test_chat_tagging_hint_rate_limited(tmp_path, monkeypatch):
+    """Second tagging miss within the cooldown stays silent (no channel spam)."""
+    import base64
+    import time
+    from datetime import datetime, timezone
+    import bot.chat as chat
+    bot_id = "111"
+    token = base64.b64encode(bot_id.encode()).decode().rstrip("=") + ".x.y"
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", token)
+    monkeypatch.setenv("DISCORD_OWNER_IDS", "222")
+    j = TradeJournal(db_path=str(tmp_path / "t.db"))
+    j.set_meta("discord_chat_channel_id", "999")
+    j.set_meta("discord_chat_mention_hint_at", str(time.time()))  # just hinted
+    now = datetime.now(timezone.utc).isoformat()
+    msgs = [
+        {"id": "a", "timestamp": now, "content": "bright bot, tier 3 pnl?",
+         "author": {"id": "222", "username": "owner"}, "mentions": []},
+    ]
+    monkeypatch.setattr(chat, "_get_messages", lambda cid, limit=20: msgs)
+    sent = []
+    monkeypatch.setattr(chat, "_send_message", lambda cid, content: sent.append(content))
+
+    class _Exploding:
+        def generate_text(self, *a, **k):
+            raise AssertionError("LLM must not be consulted for a tagging miss")
+
+    chat.run_chat_cycle(_chat_cfg(), _FlatBroker(), journal=j, model=_Exploding())
+    assert sent == []
+    assert float(j.get_meta("discord_chat_last_seen") or 0) > 0
+
+
 # ---------------- polymarket settlement ambiguity ----------------
 
 def test_settlement_requires_unambiguous_prices(tmp_path, monkeypatch):

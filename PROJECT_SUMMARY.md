@@ -20,7 +20,7 @@ run_chat.py           # two-way Discord chat cycle
 run_report.py         # daily report
 backtest.py           # SMA strategy backtest (--days N, --timeframe 1Day)
 validation.py         # end-to-end stack sanity check (no orders placed)
-tests/                # pytest suite (199 tests)
+tests/                # pytest suite (222 tests)
 config.yaml           # symbols, strategy params, risk caps, agent/scanner/memecoin settings
 bot/
   config.py           # yaml + env config (lazy credential checks)
@@ -232,6 +232,25 @@ Switch broker back to Alpaca paper: set `broker.name: alpaca` in config.yaml and
 - **Tier 4 rug-guard failed open**: missing pair age skipped the 7-day gate; `bool("false")` accepted a string verdict as a buy. Age unknown now rejects; the LLM gate requires a real JSON boolean `buy` and numeric `confidence`.
 - **Tier 4 misc**: workflow timeout 15→30 min (worst-case cycle was ~16+ min; timeout rolled back every write including executed entries); manual `buy()` enforces `max_open_positions`; research cards dedupe within a batch (live responses contained 7 identical pairs); position/cooldown prechecks case-normalized; conviction prompt treats dossier text as data, never directives.
 - **Hygiene**: requirements pinned (bounded ranges + pytest); `tests/conftest.py` (the fixture preventing tests from posting to the real webhook) committed; new `tests.yml` CI workflow runs the 150-test suite on push/PR; chat context no longer says "Alpaca" (backend is binance_paper); local `.env` chmod 600.
+
+## Bug log (fixed 2026-09-13, Tier 5 funding)
+
+- **Funding double-charged on close**: `_accrue_funding` deducts each 8h
+  funding mark from cash at accrual, and `_close_position` then
+  subtracted `funding_accrued` again from close P&L (and folded it into
+  the journaled exit fee) — every position held past one funding mark
+  paid it twice, silently skewing equity/P&L toward losses and polluting
+  the trades fee column. Fixed: close P&L = price P&L − exit fee only;
+  funding is settled exactly once, at accrual. Regression tests:
+  `test_funding_charged_exactly_once_full_lifecycle` (exact cash
+  conservation), `test_close_journals_exit_fee_and_funding` (fee column
+  = exit fee only). Production journal had zero Tier 5 fills when fixed,
+  so no historical correction was needed.
+- **Funding events lost their notification**: the `funding` event dict
+  has no `symbol` key, so `run_cycle`'s notify loop fell into the
+  generic exit branch and raised KeyError (swallowed by the try/except —
+  notification silently dropped). Added an explicit `funding` branch. Covered by
+  `test_funding_event_notifies_without_symbol`.
 
 ## Bug log (fixed 2026-09-08/09, deep-dive P1/P2 — full detail in DEEP_DIVE_FINDINGS.md)
 

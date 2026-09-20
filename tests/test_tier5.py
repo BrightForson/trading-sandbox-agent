@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -510,12 +511,71 @@ def test_close_journals_exit_fee_and_funding(tmp_path):
     ok, msg = led.open("BTC/USD", "LONG", margin=10, reason="test",
                        confidence=0.8)
     assert ok, msg
-    # simulate funding accrued on the open position
+    # simulate funding accrued on the open position (already PAID from
+    # cash at accrual time — the field is bookkeeping for reporting)
     pos = led._positions()["BTC/USD"]
     pos["funding_accrued"] = 0.02
     led._save(led._cash(), {**led._positions(), "BTC/USD": pos})
     r = led._close_position("BTC/USD", mark=100.0, note="test close")
     assert r is not None
     close_row = next(t for t in j.get_trades() if t[3] == "CLOSE-LONG")
-    # CLOSE row fee = exit fee (0.05) + funding (0.02)
-    assert close_row[7] == pytest.approx(0.07, abs=1e-9)
+    # CLOSE row fee = the exit fee ONLY (0.05): funding is settled at
+    # accrual, never re-charged or journaled twice (2026-09-13 fix)
+    assert close_row[7] == pytest.approx(0.05, abs=1e-9)
+    # close pnl = price pnl (with exit slippage) - exit fee; funding is
+    # NOT part of it — already paid once at accrual
+    price_pnl = (r["exit_price"] - pos["entry"]) * pos["qty"]
+    assert r["pnl"] == pytest.approx(price_pnl - 0.05, rel=1e-9)
+
+
+def test_funding_charged_exactly_once_full_lifecycle(tmp_path):
+    """Regression (2026-09-13): funding used to be deducted from cash at
+    each 8h accrual AND subtracted again inside close P&L — two charges
+    per mark. The ledger must conserve: final cash = start - margin -
+    entry fee - funding - exit fee + price pnl."""
+    bars15, bars1h = _mk_bars(price=100.0, atr=1.0)
+    led, j = _ledger(tmp_path, prices={"BTC/USD": 100.0},
+                     bars={"BTC/USD": (bars15, bars1h)})
+    led.open("BTC/USD", "LONG", margin=10, reason="test")
+    pos = led._positions()["BTC/USD"]
+    notional = pos["notional"]
+    entry_fee = notional * 0.05 / 100
+    exit_fee = notional * 0.05 / 100
+    # age past one 8h boundary -> exactly one funding mark
+    positions = led._positions()
+    positions["BTC/USD"]["opened"] = (datetime.now(timezone.utc)
+                                     - timedelta(hours=9)).isoformat()
+    j.set_meta("t5_positions", json.dumps(positions))
+    funding = notional * 0.01 / 100
+    assert led._accrue_funding()[0]["amount"] == pytest.approx(-funding, abs=1e-9)
+    # close at a +1 price move: price pnl known exactly
+    r = led._close_position("BTC/USD", mark=101.0, note="lifecycle")
+    price_pnl = (r["exit_price"] - pos["entry"]) * pos["qty"]
+    # margin is RETURNED at close — final cash = start - entry fee -
+    # funding - exit fee + price pnl, and nothing else
+    expected_final = 50 - entry_fee - funding - exit_fee + price_pnl
+    assert led._cash() == pytest.approx(expected_final, rel=1e-6)
+    # and the old bug's signature (funding subtracted a second time at
+    # close) is gone:
+    double_charged_final = expected_final - funding
+    assert led._cash() != pytest.approx(double_charged_final, abs=1e-6)
+
+
+def test_funding_event_notifies_without_symbol(tmp_path, monkeypatch):
+    """The funding event has no 'symbol' key — the notification loop used
+    to fall into the generic branch and KeyError (notification lost)."""
+    bars15, bars1h = _mk_bars(price=100.0, atr=1.0)
+    led, j = _ledger(tmp_path, prices={"BTC/USD": 100.0},
+                     bars={"BTC/USD": (bars15, bars1h)})
+    led.open("BTC/USD", "LONG", margin=10)
+    positions = led._positions()
+    positions["BTC/USD"]["opened"] = (datetime.now(timezone.utc)
+                                     - timedelta(hours=9)).isoformat()
+    j.set_meta("t5_positions", json.dumps(positions))
+    sent = []
+    import bot.notify
+    monkeypatch.setattr(bot.notify, "send_notification",
+                        lambda msg, cfg=None: sent.append(msg))
+    led.run_cycle()
+    assert any("funding" in m for m in sent)
+    assert not any("KeyError" in m for m in sent)
