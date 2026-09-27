@@ -531,28 +531,42 @@ class FuturesLedger:
     def sweep(self):
         """Deterministic exit enforcement. Returns list of events."""
         events = []
-        if self.kill_active():
-            return events
+        # A live kill does NOT suspend exit enforcement. _trigger_kill
+        # flattens symbol by symbol and keeps going when one fails, so
+        # positions can outlive the kill; returning early here left those
+        # survivors with no stop-loss, take-profit, trailing stop, funding or
+        # time-stop for the whole cooldown -- and indefinitely on the second
+        # kill, which latches MANUAL_RESET.
+        killed = self.kill_active()
+        if killed:
+            # give any survivor one more flatten attempt before normal
+            # enforcement, so a transient failure does not persist
+            for symbol in list(self._positions()):
+                try:
+                    self._close_position(symbol, note="kill flatten")
+                except Exception as e:
+                    print(f"[tier5] kill flatten failed for {symbol}: {e}")
         marks = {s: self.price_for(s) for s in self._positions()}
         v = self.valuation(marks=marks)
-        peak = self._update_peak(v["equity"])
-        stale_syms = v.get("stale_symbols") or []
-        if stale_syms:
-            events.append({"type": "stale_marks", "symbols": stale_syms,
-                           "reason": "no price feed for: " + ", ".join(stale_syms)})
-        if self._drawdown_hit(v["equity"]):
-            reason = (f"max drawdown {self.max_drawdown_pct:.0f}% hit "
-                      f"(equity ${v['equity']:.2f} vs peak ${peak:.2f})")
-            self._trigger_kill(reason)
-            events.append({"type": "kill", "reason": reason})
-            return events
-        # 1) funding accrual at 8h boundaries since each position's open
-        try:
-            events_f = self._accrue_funding()
-            if events_f:
-                events.extend(events_f)
-        except Exception as e:
-            print(f"[tier5] funding accrual failed: {e}")
+        if not killed:
+            peak = self._update_peak(v["equity"])
+            stale_syms = v.get("stale_symbols") or []
+            if stale_syms:
+                events.append({"type": "stale_marks", "symbols": stale_syms,
+                               "reason": "no price feed for: " + ", ".join(stale_syms)})
+            if self._drawdown_hit(v["equity"]):
+                reason = (f"max drawdown {self.max_drawdown_pct:.0f}% hit "
+                          f"(equity ${v['equity']:.2f} vs peak ${peak:.2f})")
+                self._trigger_kill(reason)
+                events.append({"type": "kill", "reason": reason})
+                return events
+            # 1) funding accrual at 8h boundaries since each position's open
+            try:
+                events_f = self._accrue_funding()
+                if events_f:
+                    events.extend(events_f)
+            except Exception as e:
+                print(f"[tier5] funding accrual failed: {e}")
         for symbol, pos in list(self._positions().items()):
             mark = (marks or {}).get(symbol)
             if mark is None:
@@ -612,20 +626,37 @@ class FuturesLedger:
                     if better:
                         positions = self._positions()
                         positions[symbol]["trailing_stop"] = new_trail
+                        # the trail is only meaningful from the moment its
+                        # CURRENT level was set. Bar history predating that
+                        # is not a valid trigger: this level did not exist
+                        # then, and a dip under an older, looser trail says
+                        # nothing about whether this one was hit.
+                        positions[symbol]["trailing_stop_armed_at"] = _now_iso()
                         self._save(self._cash(), positions)
                         ts = new_trail
+                        pos = positions[symbol]
                 # an ARMED trail fires regardless of current gain: the
                 # pullback itself drops the mark below the trail
                 if ts is not None:
                     crossed = ((mark <= float(ts)) if side == "LONG"
                                else (mark >= float(ts)))
-                    if not crossed and m15 is not None and since is not None:
-                        bars = m15[m15.index >= since]
-                        if not bars.empty:
-                            if side == "LONG":
-                                crossed = float(bars["low"].min()) <= float(ts)
-                            else:
-                                crossed = float(bars["high"].max()) >= float(ts)
+                    if not crossed and m15 is not None:
+                        # window = since this trail level was established,
+                        # NOT since the position opened. Using the position
+                        # age tested the freshly armed trail against lows
+                        # from hours earlier, closing a healthy position on
+                        # the same sweep that armed its trail.
+                        armed_at = _parse_ts(pos.get("trailing_stop_armed_at"))
+                        if armed_at is not None:
+                            tbars = m15[m15.index >= armed_at]
+                            if not tbars.empty:
+                                if side == "LONG":
+                                    crossed = float(tbars["low"].min()) <= float(ts)
+                                else:
+                                    crossed = float(tbars["high"].max()) >= float(ts)
+                        # a trail with no recorded arm time (position opened
+                        # before this was tracked) is judged on the current
+                        # mark only -- never on unverifiable history
                     if crossed:
                         r = self._close_position(symbol, note="trailing stop",
                                                  mark=float(ts))

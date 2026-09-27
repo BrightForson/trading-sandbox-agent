@@ -28,16 +28,24 @@ def test_rsi_known_values():
 
 
 def test_realized_volatility_pct():
+    from bot.indicators import PERIODS_PER_YEAR
+    daily = PERIODS_PER_YEAR["1d"]
     # 1% alternating moves -> clearly positive vol
     vals = [100 * (1.01 ** (i % 2)) for i in range(20)]
-    vol = realized_volatility_pct(vals)
+    vol = realized_volatility_pct(vals, periods_per_year=daily)
     assert vol is not None and vol > 0
     # flat series -> zero vol
-    assert realized_volatility_pct([50.0] * 10) == pytest.approx(0.0)
+    assert realized_volatility_pct([50.0] * 10,
+                                    periods_per_year=daily) == pytest.approx(0.0)
     # insufficient / invalid -> None
-    assert realized_volatility_pct([1.0, 2.0]) is None
-    assert realized_volatility_pct(None) is None
-    assert realized_volatility_pct([1.0, -2.0, 3.0]) is None
+    assert realized_volatility_pct([1.0, 2.0], periods_per_year=daily) is None
+    assert realized_volatility_pct(None, periods_per_year=daily) is None
+    assert realized_volatility_pct([1.0, -2.0, 3.0], periods_per_year=daily) is None
+    # a sampling rate is mandatory: the result is meaningless without it, and
+    # the same series means different things at different sampling rates
+    assert realized_volatility_pct(vals) is None
+    assert (realized_volatility_pct(vals, periods_per_year=PERIODS_PER_YEAR["15m"])
+            > realized_volatility_pct(vals, periods_per_year=daily))
 
 
 # ---------------- futures: best-pick gate ----------------
