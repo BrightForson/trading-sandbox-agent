@@ -177,12 +177,25 @@ class RiskEngine:
         entry_price, stop_price = self.get_stop(symbol)
         if stop_price is None:
             return False, "no stop recorded"
-        if entry_price and float(entry_price) > 0 and current_price >= float(entry_price) * 50:
-            # broker marks can glitch to absurd values; never stop out on bad data
-            return False, "suspect mark; skipped stop check"
+        if not current_price or current_price <= 0:
+            # no usable price is not a total loss; never stop out on a
+            # missing mark (see trader.py, which skips the check instead)
+            return False, "no usable mark; stop not evaluated"
+        # Implausible-high mark guard. Deliberately ONE-SIDED: a mark far
+        # above entry can never trigger a long stop (the comparison is
+        # price <= stop), so trusting or distrusting it is moot -- it only
+        # guards against a garbage tick being read as truth elsewhere. A mark
+        # far BELOW entry is the direction that does trigger, and it is acted
+        # on: for a loss limiter the costs are asymmetric, since a false
+        # stop-out costs the position while a missed one has no bound.
+        multiple = float(self.risk.get("implausible_mark_multiple", 50) or 0)
+        if multiple > 0 and entry_price and float(entry_price) > 0 \
+                and current_price >= float(entry_price) * multiple:
+            return False, (f"suspect mark (>= {multiple:g}x entry "
+                           f"${float(entry_price):.6g}); stop check skipped")
         if current_price <= float(stop_price):
-            return True, (f"stop hit (${current_price:.2f} <= recorded stop "
-                          f"${float(stop_price):.2f}, entry ${float(entry_price or 0):.2f})")
+            return True, (f"stop hit (${current_price:.6g} <= recorded stop "
+                          f"${float(stop_price):.6g}, entry ${float(entry_price or 0):.6g})")
         return False, "stop intact"
 
     def check(self, symbol, action, qty, price, current_open_positions,

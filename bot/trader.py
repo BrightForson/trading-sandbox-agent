@@ -464,10 +464,20 @@ def run_trading_cycle():
                 mark = float(df["close"].iloc[-1]) if df is not None and len(df) else 0.0
                 if mark <= 0:
                     mark = float(getattr(position, "current_price", 0) or 0)
-                triggered, reason = risk_engine.stop_triggered(symbol, mark)
+                # A non-positive mark means "no usable price", NOT "the price
+                # collapsed to zero". Passing it to stop_triggered read it as a
+                # total loss and fired a market SELL on a data outage, while
+                # the fallback branch below was unreachable because the stop
+                # had already triggered.
+                if mark > 0:
+                    triggered, reason = risk_engine.stop_triggered(symbol, mark)
+                else:
+                    triggered = False
+                    reason = (f"no usable mark for {symbol} (bar close and broker "
+                              f"mark both non-positive); stop not evaluated")
                 if not triggered and mark <= 0:
-                    # recorded stop exists but no usable mark: fall back to the
-                    # legacy current-ATR check rather than skipping entirely
+                    # still no price: the ATR fallback needs one too, so this
+                    # is a skipped check, not a pass. Surfaced, never silent.
                     atr = _atr(df, int((getattr(config, "risk", None) or {}).get("atr_period", 14)))
                     triggered, reason = risk_engine.atr_stop_triggered(
                         float(position.avg_entry_price), mark, atr

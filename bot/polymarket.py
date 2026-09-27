@@ -22,6 +22,25 @@ GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 HEADERS = {"User-Agent": "Mozilla/5.0 (trading-sandbox-agent scanner)"}
 
 
+def _norm_q(text):
+    """Loose key for matching a model response back to a market.
+
+    Case, surrounding whitespace, repeated spaces, typographic quotes and a
+    trailing ellipsis are all things a model changes while reproducing a
+    string, and none of them change which market it means.
+    """
+    s = str(text or "").strip().lower()
+    s = s.replace("’", "'").replace("‘", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    s = s.replace("…", "...")
+    # quote and paren styling never changes which market is meant
+    s = "".join(ch for ch in s if ch not in "\"'`([{")
+    s = " ".join(s.split())
+    # trailing punctuation is cosmetic: a model may end with '?', '.', or '...'
+    s = s.rstrip("?.")
+    return s
+
+
 def _cfg_val(cfg, key, default):
     return float((getattr(cfg, "scanner", None) or {}).get(key, default))
 
@@ -168,11 +187,11 @@ def scan_llm_mispricing(cfg, markets=None, model=None, journal=None):
         return []
     now = datetime.now(timezone.utc)
     lines = []
-    for c in candidates:
+    for i, c in enumerate(candidates):
         days_left = ((c["end_ts"] - now).total_seconds() / 86400
                      if c["end_ts"] else None)
         lines.append(
-            f"- {c['question']} (outcomes: {c['outcomes'][0]} or {c['outcomes'][1]}; "
+            f"[{i}] {c['question']} (outcomes: {c['outcomes'][0]} or {c['outcomes'][1]}; "
             f"current price of {c['outcomes'][0]}: {c['yes_price']:.2f}; "
             f"24h volume ${c['volume_24h']:,.0f}, total volume ${c['volume_total']:,.0f}, "
             f"liquidity ${c['liquidity']:,.0f}"
@@ -187,25 +206,45 @@ THAT outcome, not a generic "yes".
 Markets:
 {chr(10).join(lines)}
 
-Respond with ONLY a JSON array of objects:
-[{{"question": "...", "true_prob": 0.0-1.0}}, ...]"""
+Respond with ONLY a JSON array of objects, one per market, each carrying the
+market's bracketed index exactly as shown above:
+[{{"index": 0, "true_prob": 0.0-1.0}}, ...]"""
     try:
         # reasoning models need headroom to think before emitting the array
         est = model.generate_json_arr(prompt, max_tokens=2000)
     except Exception as e:
         print(f"[scanner] LLM mispricing call failed: {e}")
         return []
+    by_text = {}
+    for c in candidates:
+        by_text.setdefault(_norm_q(c["question"]), c)
     out = []
+    matched = 0
+    dropped = 0
     for item in est:
-        q = item.get("question", "")
-        match = next((c for c in candidates if c["question"] == q), None)
+        match = None
+        idx = item.get("index")
+        if idx is not None:
+            try:
+                i = int(idx)
+                if 0 <= i < len(candidates):
+                    match = candidates[i]
+            except (TypeError, ValueError):
+                match = None
         if match is None:
+            # tolerate a model that echoes the question instead of the index
+            match = by_text.get(_norm_q(item.get("question", "")))
+        if match is None:
+            dropped += 1
             continue
+        matched += 1
         try:
             tp = float(item.get("true_prob"))
         except (TypeError, ValueError):
+            dropped += 1
             continue
         if not 0.0 <= tp <= 1.0:
+            dropped += 1
             continue
         gap = tp - match["yes_price"]
         if abs(gap) >= threshold:
@@ -220,6 +259,17 @@ Respond with ONLY a JSON array of objects:
                             "estimated_probability": round(probability, 3), "gap": round(gap, 3),
                             "side": match["outcomes"][0] if gap > 0 else match["outcomes"][1],
                             "price": price, "paper_bet_allowed": True, **ev})
+    # this is the only path that can place a Tier 3 bet, so a silent total
+    # drop-off here is indistinguishable from "no opportunities existed".
+    # It was: the prompt showed a 200-char truncated question and matching
+    # required a byte-for-byte echo, which models essentially never produce,
+    # so every candidate was discarded and the tier placed no bet for 18 days
+    # while logging "0 EV-qualified finds".
+    print(f"[scanner] LLM scored {matched}/{len(est)} responses matched to "
+          f"{len(candidates)} candidates ({dropped} dropped)")
+    if est and matched == 0:
+        print("[scanner] WARNING: every LLM response failed to match a market — "
+              "the mispricing path produced nothing this cycle")
     return out
 
 

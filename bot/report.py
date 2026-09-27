@@ -118,8 +118,14 @@ Please write a short, professional summary of the trading performance based on t
     try:
         model_client = ModelClient()
         narrative = model_client.generate_text(prompt, max_tokens=500, temperature=0.7)
+        # reasoning models can return None content; that used to escape as a
+        # TypeError inside ModelManager's repair path, and run_report.py calls
+        # create_daily_report() outside its try, so the whole daily report was
+        # lost with a traceback instead of degrading to the template
+        if narrative is None or not str(narrative).strip():
+            raise ModelError("model returned empty content")
         return narrative
-    except ModelError as e:
+    except (ModelError, TypeError, ValueError, AttributeError) as e:
         # Fallback: if model fails, return a simple template
         return f"""Trading Report:
 - Total P&L: ${stats['total_pnl']:.2f}

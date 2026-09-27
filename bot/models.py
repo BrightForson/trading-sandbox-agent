@@ -260,12 +260,16 @@ class ModelManager:
         except ModelError:
             pass
         # retry with strict repair instruction
+        # `raw` can be None: reasoning models emit reasoning_content with no
+        # content, and slicing that raised a TypeError that escaped every
+        # caller (report.py, chat.py) as an unhandled crash
+        prev = "" if raw is None else str(raw)[:300]
         repair = (
             "Your previous answer was not valid JSON. Output ONLY the JSON object, "
             "no prose, no analysis, no markdown. Your very first character must be "
             "'{' and your very last must be '}'. Do not discuss the task; just emit "
             "the object. Previous answer (truncated): "
-            f"{raw[:300]}\n\nOriginal request:\n{prompt}\n\nJSON object only now:"
+            f"{prev}\n\nOriginal request:\n{prompt}\n\nJSON object only now:"
         )
         raw2 = ""
         try:
@@ -277,7 +281,10 @@ class ModelManager:
         except ModelError:
             pass
         # last resort 1: regex-extract the fields we care about from prose
-        extracted = self._regex_extract(raw + "\n" + raw2)
+        # `raw` may be None (reasoning models emit no content); concatenating
+        # it raised TypeError and took down the caller
+        combined = f"{raw or ''}\n{raw2 or ''}"
+        extracted = self._regex_extract(combined)
         if extracted:
             return extracted
         # last resort 2: reconstruct an object from quoted JSON fragments the
@@ -285,7 +292,7 @@ class ModelManager:
         # emitting it): {"take": true, "confidence": 0.78, "reason": "..."}
         import re
         merged = {}
-        for m in re.finditer(r'\{["\']?\w+["\']?\s*:.*?\}', raw + "\n" + raw2, re.DOTALL):
+        for m in re.finditer(r'\{["\']?\w+["\']?\s*:.*?\}', combined, re.DOTALL):
             frag = m.group(0)
             # normalize single quotes and unquoted keys enough to parse
             frag = re.sub(r'(\w+)\s*:', r'"\1":', frag)
@@ -308,7 +315,8 @@ class ModelManager:
                     merged.pop("confidence", None)
             if any(k in merged for k in ("take", "buy", "action", "confidence")):
                 return merged
-        raise ModelError(f"Model refused JSON twice: {raw[:200]}")
+        prev = "" if raw is None else str(raw)[:200]
+        raise ModelError(f"Model refused JSON twice: {prev}")
 
     def generate_json_arr(self, prompt, max_tokens=800, temperature=0.2):
         """Generate and parse a JSON array; one repair retry."""
@@ -316,10 +324,11 @@ class ModelManager:
         try:
             return self._parse_json_arr(raw)
         except ModelError:
+            prev = "" if raw is None else str(raw)[:300]
             repair = (
                 "Your previous answer was not a valid JSON array. Output ONLY the JSON "
                 "array, no prose, no markdown. Begin with '[' and end with ']'. "
-                f"Previous answer (truncated): {raw[:300]}\n\nOriginal request:\n{prompt}\n\n"
+                f"Previous answer (truncated): {prev}\n\nOriginal request:\n{prompt}\n\n"
                 "JSON array only now:"
             )
             raw2 = self.generate_text(repair, max_tokens=max_tokens, temperature=0.0)
@@ -356,6 +365,8 @@ class ModelManager:
     @staticmethod
     def _parse_json_arr(raw):
         """Parse a JSON array from model output (code-fence tolerant)."""
+        if raw is None:
+            raise ModelError("Model returned no content")
         text = raw.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
@@ -390,8 +401,10 @@ class ModelManager:
         try:
             return json.loads(candidate)
         except Exception:
-            # truncated output: try closing the object
-            for suffix in ('"}', '"}', '"} }'):
+            # truncated output: try closing the object. The three closers must
+            # be distinct -- a repeated '"}' wasted a repair attempt and hid
+            # the variant that was meant to be there.
+            for suffix in ('"}', '" }', '"}}'):
                 try:
                     return json.loads(text[start:] + suffix)
                 except Exception:

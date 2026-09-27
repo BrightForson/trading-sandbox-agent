@@ -136,6 +136,14 @@ class TradingAgent:
         except (TypeError, ValueError):
             notional = 0.0
             errors.append("notional not numeric")
+        # NaN defeats every numeric guard below: `nan > cap` and `nan <= 0`
+        # are both False, so a NaN notional passed validation. It then opened
+        # a real shadow position (min(nan, 40, cash) is nan), corrupted
+        # mark_to_market permanently, and sqlite silently stored NULL, which
+        # scored every such proposal as a flat non-win in the scorecard.
+        if notional != notional:
+            notional = 0.0
+            errors.append("notional is NaN")
         if action == "BUY" and notional > float(self.agent_cfg.get("max_proposed_notional", 50)):
             errors.append(f"notional {notional} above agent cap")
         if action == "BUY" and notional <= 0:

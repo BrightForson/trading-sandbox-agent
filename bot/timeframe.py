@@ -28,14 +28,31 @@ class _TimeframeUnit:
 
 
 def make_timeframe(spec):
-    """Build a timeframe object from a config string like '15Min' or '1Day'."""
+    """Build a timeframe object from a config string like '15Min' or '1Day'.
+
+    Unrecognised specs raise instead of falling back to 15 minutes. A config
+    typo ('15min', '1h', '15MIN', 'hourly') used to silently produce 15m
+    bars, so the bot computed SMAs over the wrong history, fetched the wrong
+    window and reported P&L without error anywhere.
+    """
     if isinstance(spec, Minutes) or isinstance(spec, Hours) or isinstance(spec, Days):
         return spec
-    s = str(spec)
-    if s.endswith("Min"):
-        return Minutes(int(s[:-3]))
-    if s.endswith("Hour"):
-        return Hours(int(s[:-4]))
-    if s.endswith("Day"):
-        return Days(int(s[:-3]) if s[:-3] else 1)
-    return Minutes(15)
+    s = str(spec).strip()
+    if not s:
+        raise ValueError("empty timeframe")
+    low = s.lower()
+    for suffix, cls in (("min", Minutes), ("minute", Minutes),
+                        ("hour", Hours), ("day", Days), ("week", Days),
+                        ("m", Minutes), ("h", Hours), ("d", Days), ("w", Days)):
+        if low.endswith(suffix):
+            head = s[: len(s) - len(suffix)].strip()
+            if not head:
+                return cls(1)
+            try:
+                n = int(head)
+            except ValueError:
+                raise ValueError(f"unrecognized timeframe: {spec!r}")
+            if n <= 0:
+                raise ValueError(f"non-positive timeframe: {spec!r}")
+            return cls(n)
+    raise ValueError(f"unrecognized timeframe: {spec!r}")

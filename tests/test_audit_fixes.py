@@ -12,6 +12,8 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot.journal import TradeJournal
@@ -591,3 +593,325 @@ def test_kill_switch_does_not_suspend_tier4_exits(tmp_path):
 
     assert "AAA" not in led._positions(), (
         "a breached stop must be enforced with the kill switch on")
+
+
+# ================= commit 3: high =================
+
+# ---------------- timeframe mapping ----------------
+
+@pytest.mark.parametrize("spec,expected", [
+    ("15Min", "15m"), ("1Hour", "1h"), ("1h", "1h"), ("4h", "4h"),
+    ("1Day", "1d"), ("1d", "1d"), ("2Day", "1d"), ("30Min", "30m"),
+    ("1Week", "1w"), ("d", "1d"), ("h", "1h"), ("m", "1m"),
+    ("60m", "1h"), ("15min", "15m"), ("5Min", "5m"),
+])
+def test_interval_for_is_idempotent(spec, expected):
+    """Mapping must be a fixed point.
+
+    binance_paper applied _interval_for twice, and the old mapper collapsed
+    anything it did not explicitly know back to "15m". So "1Hour" became
+    "1h" and then "15m": the strategy silently fetched 15m bars whatever the
+    config said, and with sma_slow=50 check_crossover returned [] so the bot
+    never traded -- with no error anywhere.
+    """
+    from bot.binance_data import _interval_for
+    once = _interval_for(spec)
+    assert once == expected
+    assert _interval_for(once) == once
+    assert _interval_for(_interval_for(once)) == once
+
+
+def test_alpaca_timeframe_object_maps_to_its_real_interval():
+    """Alpine TimeFrame objects previously always resolved to 15m.
+
+    The old branch read a value_count attribute alpaca-py 0.44 no longer
+    has and imported TimeFrameUnit from a module that does not exist, so the
+    whole block was dead and it fell through to `return "15m"`.
+    """
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from bot.binance_data import _interval_for
+    assert _interval_for(TimeFrame(1, TimeFrameUnit.Hour)) == "1h"
+    assert _interval_for(TimeFrame(1, TimeFrameUnit.Day)) == "1d"
+    assert _interval_for(TimeFrame(15, TimeFrameUnit.Minute)) == "15m"
+
+
+def test_bot_timeframe_objects_still_map():
+    """bot.timeframe objects expose value_count in minutes; keep supporting."""
+    from bot.binance_data import _interval_for
+    from bot.timeframe import Hours, Minutes, make_timeframe
+    assert _interval_for(Minutes(15)) == "15m"
+    assert _interval_for(Hours(1)) == "1h"
+    assert _interval_for(make_timeframe("1Day")) == "1d"
+
+
+@pytest.mark.parametrize("bad", ["banana", "", "hourly", "-1Min", "0Min"])
+def test_unknown_timeframe_raises_instead_of_defaulting(bad):
+    """A silent wrong-timeframe fallback produces plausible output for the
+    wrong data, which is worse than a loud failure."""
+    from bot.binance_data import _interval_for
+    from bot.timeframe import make_timeframe
+    with pytest.raises(ValueError):
+        _interval_for(bad)
+    with pytest.raises(ValueError):
+        make_timeframe(bad)
+
+
+def test_interval_minutes_knows_every_emitted_interval():
+    """The lookup answered 15 for anything it did not know, which silently
+    computed the wrong history window."""
+    from bot.binance_data import _INTERVAL_MINUTES, interval_minutes
+    for iv in ("1m", "5m", "15m", "30m", "1h", "4h", "1d"):
+        assert interval_minutes(iv) == _INTERVAL_MINUTES[iv]
+    assert interval_minutes("1h") == 60
+    with pytest.raises(ValueError):
+        interval_minutes("7q")
+
+
+def test_make_timeframe_accepts_lowercase_specs():
+    from bot.timeframe import Days, Hours, Minutes, make_timeframe
+    assert isinstance(make_timeframe("15min"), Minutes)
+    assert isinstance(make_timeframe("1h"), Hours)
+    assert isinstance(make_timeframe("1d"), Days)
+
+
+# ---------------- zero / implausible marks ----------------
+
+class _J:
+    def __init__(self):
+        self.m = {}
+
+    def get_meta(self, k):
+        return self.m.get(k)
+
+    def set_meta(self, k, v):
+        self.m[k] = v
+
+
+def _risk(**over):
+    from bot.risk import RiskEngine
+    r = RiskEngine(_J(), broker=None)
+    r.risk = {"catastrophic_atr_multiple": 3.0, "fallback_stop_pct": 5.0}
+    r.risk.update(over)
+    return r
+
+
+def test_zero_mark_is_not_a_total_loss():
+    """A missing price must not read as 'the price collapsed to zero' and
+    liquidate the position. It is an absent mark, not a 100% loss."""
+    r = _risk()
+    r.record_stop("BTC/USD", 60000.0, 57000.0)
+    triggered, reason = r.stop_triggered("BTC/USD", 0.0)
+    assert triggered is False
+    assert "no usable mark" in reason
+
+
+def test_stop_still_fires_on_a_genuine_collapse():
+    """The guard is on implausible-HIGH marks only. A real crash must stop
+    out: for a loss limiter a false exit costs the position while a missed
+    one is unbounded."""
+    r = _risk()
+    r.record_stop("BTC/USD", 60000.0, 57000.0)
+    assert r.stop_triggered("BTC/USD", 40000.0)[0] is True
+    assert r.stop_triggered("BTC/USD", 2000.0)[0] is True
+
+
+def test_implausible_high_mark_multiple_is_configurable():
+    r = _risk(implausible_mark_multiple=2.0)
+    r.record_stop("TINY", 0.01, 0.0095)
+    triggered, reason = r.stop_triggered("TINY", 0.05)
+    assert triggered is False
+    assert "suspect mark" in reason
+    # and it names the multiple, so a skipped check is not silent
+    assert "2x" in reason
+
+
+def test_stop_message_is_readable_for_sub_dollar_assets():
+    """$0.01 and $0.0095 both rendered as '$0.01' under a 2dp format."""
+    r = _risk()
+    r.record_stop("TINY", 0.01, 0.0095)
+    _, reason = r.stop_triggered("TINY", 0.0095)
+    assert "$0.01" in reason and "$0.0095" in reason
+
+
+# ---------------- report must survive a model that returns nothing ----------------
+
+def test_report_survives_a_model_returning_none(monkeypatch):
+    """A None narrative used to escape as TypeError; run_report.py calls
+    create_daily_report() outside its try, so the whole daily report was
+    lost with a traceback instead of degrading to the template."""
+    from bot import report
+    stats = {"total_pnl": 1.0, "win_rate": 50.0, "round_trips": 2,
+             "winning_trades": 1, "losing_trades": 1}
+
+    class _NoneModel:
+        def generate_text(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(report, "ModelClient", _NoneModel)
+    out = report.generate_report("narrative", stats)
+    assert out and "Total P&L" in out
+
+
+def test_model_parsers_reject_none_with_modelerror():
+    """None content from a reasoning model must be a ModelError, not an
+    AttributeError/TypeError that escapes every caller."""
+    from bot.errors import ModelError
+    from bot.models import ModelClient
+    with pytest.raises(ModelError):
+        ModelClient._parse_json_arr(None)
+    with pytest.raises(ModelError):
+        ModelClient._parse_json(None)
+
+
+# ---------------- NaN notional ----------------
+
+class _AgentCfg:
+    """Minimal stand-in for bot.config.config as the agent reads it."""
+
+    def __init__(self):
+        self.symbols = ["BTC/USD", "ETH/USD", "SOL/USD"]
+        self.agent = {"enabled": True, "shadow": True, "min_confidence": 0.5,
+                      "max_proposed_notional": 50}
+        self.research = {}
+
+
+class _NoModel:
+    """Never touches the network: a real ModelManager probes on construction."""
+
+    def generate_json(self, *a, **k):
+        return {}
+
+    def generate_json_arr(self, *a, **k):
+        return []
+
+    def generate_text(self, *a, **k):
+        return ""
+
+    def daily_health_check(self):
+        return None
+
+
+def _agent(tmp_path):
+    from bot.agent import TradingAgent
+    j = TradeJournal(db_path=str(tmp_path / "a.db"))
+    return TradingAgent(_AgentCfg(), broker=None, journal=j, model=_NoModel())
+
+
+def test_nan_notional_is_rejected(tmp_path):
+    """Both numeric guards are False for NaN, so it passed validation, opened a
+    real shadow position, and sqlite stored NULL -- scoring the proposal as a
+    flat non-win forever."""
+    ag = _agent(tmp_path)
+    ok, errors = ag._validate({
+        "action": "BUY", "symbol": "BTC/USD",
+        "notional": float("nan"), "confidence": 0.8, "rationale": "r",
+    }, "scout")
+    assert ok is None
+    assert any("NaN" in e for e in errors), errors
+
+
+def test_infinite_notional_is_rejected_by_the_cap(tmp_path):
+    ag = _agent(tmp_path)
+    ok, errors = ag._validate({
+        "action": "BUY", "symbol": "BTC/USD",
+        "notional": float("inf"), "confidence": 0.8, "rationale": "r",
+    }, "scout")
+    assert ok is None
+    assert any("above agent cap" in e for e in errors), errors
+
+
+def test_finite_notional_still_validates(tmp_path):
+    """The NaN guard must not reject ordinary proposals."""
+    ag = _agent(tmp_path)
+    out, errors = ag._validate({
+        "action": "BUY", "symbol": "BTC/USD",
+        "notional": 10.0, "confidence": 0.8, "rationale": "r",
+    }, "scout")
+    assert out is not None and not errors, errors
+    assert out["notional"] == 10.0
+
+
+# ---------------- LLM response matching ----------------
+
+def test_norm_q_absorbs_cosmetic_drift():
+    from bot.polymarket import _norm_q
+    base = "Will Eduardo Leite win the 2026 Brazilian presidential election?"
+    for variant in (
+        base,
+        "  will  eduardo leite win the 2026 brazilian presidential election…  ",
+        "Will Eduardo Leite win the 2026 Brazilian presidential election",
+        'Will "Eduardo Leite" win the 2026 Brazilian Presidential Election.',
+    ):
+        assert _norm_q(base) == _norm_q(variant), variant
+
+
+_GAMMA_MARKET = {
+    "id": "m1", "slug": "m1",
+    "question": "Will X happen by December?",
+    "outcomes": '["Yes", "No"]', "outcomePrices": '["0.30", "0.70"]',
+    "volume24hr": 50000.0, "volume": 500000.0, "liquidityNum": 50000.0,
+    "endDate": "2026-12-31T00:00:00Z", "active": True, "closed": False,
+    "events": [{"id": "ev1", "slug": "ev1"}],
+}
+
+
+class _ScanCfg:
+    scanner = {"stake": 20, "mispricing_threshold": 0.08,
+               "friction_pct": 1.0, "min_expected_value_pct": 2.0,
+               "min_market_liquidity": 1000, "min_market_volume": 1000,
+               "max_llm_markets": 5}
+
+
+class _IdxModel:
+    """Returns the market index only, never the question text."""
+
+    def generate_json_arr(self, prompt, max_tokens=0):
+        assert "[0]" in prompt, "prompt must label markets with an index"
+        return [{"index": 0, "true_prob": 0.62}]
+
+
+class _EchoModel:
+    """A verbose model that echoes a lowercased, de-punctuated question."""
+
+    def generate_json_arr(self, prompt, max_tokens=0):
+        return [{"question": "will x happen by december", "true_prob": 0.62}]
+
+
+def test_llm_mispricing_matches_by_index_not_by_echo():
+    """The only path that can place a Tier 3 bet required the model to echo a
+    200-char truncated question byte-for-byte, which models essentially never
+    do -- so every candidate was discarded and the tier placed no bet for 18
+    days while logging '0 EV-qualified finds'."""
+    from bot.polymarket import scan_llm_mispricing
+    finds = scan_llm_mispricing(_ScanCfg(), markets=[dict(_GAMMA_MARKET)],
+                                model=_IdxModel())
+    assert len(finds) == 1, "an index-keyed response must produce a find"
+    assert finds[0]["llm_prob"] == 0.62
+    assert finds[0]["side"] == "Yes"
+    assert finds[0]["paper_bet_allowed"] is True
+
+
+def test_llm_mispricing_still_accepts_a_question_echo():
+    """A model that echoes the question instead of the index must still work."""
+    from bot.polymarket import scan_llm_mispricing
+    finds = scan_llm_mispricing(_ScanCfg(), markets=[dict(_GAMMA_MARKET)],
+                                model=_EchoModel())
+    assert len(finds) == 1
+
+
+def test_llm_mispricing_surfaces_a_total_match_failure(capsys):
+    """A silent total drop-off is indistinguishable from 'no opportunities
+    existed', which is exactly how 18 days of no bets went unnoticed."""
+    from bot.polymarket import scan_llm_mispricing
+
+    class _BadModel:
+        def generate_json_arr(self, prompt, max_tokens=0):
+            return [{"index": 99, "question": "something else entirely",
+                     "true_prob": 0.9}]
+
+    finds = scan_llm_mispricing(_ScanCfg(), markets=[dict(_GAMMA_MARKET)],
+                                model=_BadModel())
+    assert finds == []
+    out = capsys.readouterr().out
+    assert "WARNING" in out, out
+    assert "0/1" in out, out
