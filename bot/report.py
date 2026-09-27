@@ -48,35 +48,38 @@ def compute_pnl_and_winrate(trades):
                 continue
             fee = float(trade[7] or 0.0) if len(trade) > 7 else 0.0
             if action == "BUY":
-                buy_queue.append((qty, price, fee))
+                # (remaining_qty, price, remaining_fee, accumulated_pnl)
+                buy_queue.append((qty, price, fee, 0.0))
             elif action == "SELL":
                 # Match this sell with previous buys (FIFO)
                 remaining_qty = qty
                 while remaining_qty > 0 and buy_queue:
-                    buy_qty, buy_price, buy_fee = buy_queue[0]
+                    buy_qty, buy_price, buy_fee, buy_pnl = buy_queue[0]
                     matched_qty = min(buy_qty, remaining_qty)
                     buy_fee_part = buy_fee * (matched_qty / buy_qty) if buy_qty else 0.0
                     sell_fee_part = fee * (matched_qty / qty) if qty else 0.0
                     pnl = (price - buy_price) * matched_qty - buy_fee_part - sell_fee_part
+                    total_pnl += pnl
                     if buy_qty <= remaining_qty:
-                        total_pnl += pnl
-                        if pnl > 0:
+                        # this BUY is fully consumed: the round trip closes
+                        # here, scoring the P&L accumulated across every
+                        # partial sell that matched against it. Scoring each
+                        # partial sell separately counted one economic
+                        # round trip as several, inflating the win rate.
+                        round_trip_pnl = buy_pnl + pnl
+                        if round_trip_pnl > 0:
                             winning_trades += 1
-                        else:
+                        elif round_trip_pnl < 0:
                             losing_trades += 1
                         remaining_qty -= matched_qty
                         buy_queue.pop(0)
                         round_trips += 1
                     else:
-                        # Partially consume this buy
-                        total_pnl += pnl
-                        if pnl > 0:
-                            winning_trades += 1
-                        else:
-                            losing_trades += 1
-                        buy_queue[0] = (buy_qty - matched_qty, buy_price, buy_fee - buy_fee_part)
+                        # partial close: carry the remainder plus this
+                        # tranche's P&L forward; nothing is scored yet
+                        buy_queue[0] = (buy_qty - matched_qty, buy_price,
+                                        buy_fee - buy_fee_part, buy_pnl + pnl)
                         remaining_qty = 0
-                        round_trips += 1
                 # If there is remaining qty (should not happen if we don't sell more than we bought)
                 # but ignore for simplicity
     

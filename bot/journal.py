@@ -134,6 +134,7 @@ class TradeJournal:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (timestamp, symbol, action, qty, price, reasoning, fee, order_id, status))
                 conn.commit()
+                return cursor.lastrowid
         except Exception as e:
             raise JournalError(f"Failed to log trade: {e}")
 
@@ -209,6 +210,7 @@ class TradeJournal:
                 """, (timestamp, market, question, side, price, stake, outcome, notes, fee,
                       estimated_probability, expected_value))
                 conn.commit()
+                return cursor.lastrowid
         except Exception as e:
             raise JournalError(f"Failed to log bet: {e}")
 

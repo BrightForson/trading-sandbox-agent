@@ -27,6 +27,10 @@ from bot.journal import TradeJournal
 GATE_META_KEY = "agent_gate_history"
 GATE_HISTORY_KEY = "gate_verdict_history"
 
+# wallet_snapshots is shared by every tier; only epoch 0 is the Tier 1
+# paper account (trader.py). Tier 3's wallet uses epoch >= 1.
+TIER1_EPOCH = 0
+
 
 class GateResult:
     def __init__(self, tier, passed, summary, details):
@@ -70,9 +74,15 @@ def _tier1_drawdown_pct(journal):
 
     The trading cycle snapshots equity (cash + positions) after every
     heartbeat hour; the worst peak-to-trough move across those marks is
-    the account drawdown. Returns 0.0 when no snapshots exist."""
+    the account drawdown. Returns 0.0 when no snapshots exist.
+
+    Only epoch 0 is Tier 1. Tier 3's betting wallet writes into the same
+    table with its own epoch, and mixing the two walks a peak across
+    unrelated bankrolls of different size -- a flat $100 Tier 1 account
+    read 40% drawdown purely because a separate $60 wallet existed.
+    """
     try:
-        snaps = journal.get_wallet_snapshots()
+        snaps = journal.get_wallet_snapshots(epoch=TIER1_EPOCH)
     except Exception:
         return 0.0
     peak = None
@@ -90,33 +100,79 @@ def _tier1_drawdown_pct(journal):
     return worst_dd
 
 
-def _tier1_losing_week_streak(journal):
-    """Consecutive ISO weeks with negative realized P&L, current week back."""
-    try:
-        trades = [t for t in journal.get_trades()
-                  if t[1] and "[shadow-account]" not in (t[6] or "")
-                  and "[tier4-memecoin]" not in (t[6] or "")
-                  and "[tier5-futures]" not in (t[6] or "")
-                  and (t[7] == "filled" if len(t) > 7 else True)]
-    except Exception:
-        return 0
-    # realized P&L per week from SELL proceeds vs FIFO cost is complex here;
-    # proxy: sum of (SELL - BUY) cash impact per week (fees included)
-    weekly = {}
+def _week_key(ts):
+    iso = ts.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def _tier1_weekly_realized_pnl(trades):
+    """Realized P&L per ISO week, credited to the week a round trip CLOSED.
+
+    The old proxy summed weekly cash impact (BUY negative, SELL positive),
+    which measures capital deployed rather than money lost: a week that
+    opened positions scored as a full "losing week" even with nothing
+    realized. Attributing each FIFO-closed round trip to its closing SELL
+    is what the criterion's docstring actually describes.
+    """
+    by_symbol = {}
     for t in trades:
         try:
             ts = datetime.fromisoformat(str(t[1]).replace(" ", "T"))
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            iso = ts.isocalendar()
-            week_key = f"{iso[0]}-W{iso[1]:02d}"
-            qty, price, fee = float(t[4]), float(t[5]), float(t[8] or 0) if len(t) > 8 else 0.0
-            impact = qty * price - fee
-            if str(t[3]).upper() == "BUY":
-                impact = -impact
-            weekly[week_key] = weekly.get(week_key, 0.0) + impact
-        except Exception:
+        except (TypeError, ValueError):
             continue
+        by_symbol.setdefault(t[2], []).append((ts, t))
+
+    weekly = {}
+    for rows in by_symbol.values():
+        rows.sort(key=lambda r: r[0])
+        # (remaining_qty, price, remaining_fee, accumulated_pnl)
+        buy_queue = []
+        for ts, t in rows:
+            action = str(t[3]).upper()
+            try:
+                qty, price = float(t[4]), float(t[5])
+            except (TypeError, ValueError):
+                continue
+            fee = float(t[7] or 0.0) if len(t) > 7 else 0.0
+            if action == "BUY":
+                buy_queue.append((qty, price, fee, 0.0))
+                continue
+            if action != "SELL":
+                continue
+            remaining = qty
+            while remaining > 0 and buy_queue:
+                buy_qty, buy_price, buy_fee, buy_pnl = buy_queue[0]
+                matched = min(buy_qty, remaining)
+                buy_fee_part = buy_fee * (matched / buy_qty) if buy_qty else 0.0
+                sell_fee_part = fee * (matched / qty) if qty else 0.0
+                pnl = (price - buy_price) * matched - buy_fee_part - sell_fee_part
+                if buy_qty <= remaining:
+                    key = _week_key(ts)
+                    weekly[key] = weekly.get(key, 0.0) + buy_pnl + pnl
+                    remaining -= matched
+                    buy_queue.pop(0)
+                else:
+                    buy_queue[0] = (buy_qty - matched, buy_price,
+                                    buy_fee - buy_fee_part, buy_pnl + pnl)
+                    remaining = 0
+    return weekly
+
+
+def _tier1_losing_week_streak(journal):
+    """Consecutive ISO weeks with negative realized P&L, current week back."""
+    try:
+        # trades columns: 0 id, 1 timestamp, 2 symbol, 3 action, 4 qty,
+        # 5 price, 6 reasoning, 7 fee, 8 order_id, 9 status
+        trades = [t for t in journal.get_trades()
+                  if t[1] and "[shadow-account]" not in (t[6] or "")
+                  and "[tier4-memecoin]" not in (t[6] or "")
+                  and "[tier5-futures]" not in (t[6] or "")
+                  and (str(t[9]) if len(t) > 9 and t[9] is not None else "filled") == "filled"]
+    except Exception:
+        return 0
+    weekly = _tier1_weekly_realized_pnl(trades)
     if not weekly:
         return 0
     streak = 0
@@ -173,11 +229,13 @@ def tier3_gate(journal=None):
     try:
         score = journal.bet_scorecard()
     except Exception:
-        score = {"settled": 0, "wins": 0, "net_pnl": 0.0}
+        score = {"settled": 0, "win_rate_pct": 0.0, "net_pnl": 0.0}
     settled = int(score.get("settled", 0))
-    wins = int(score.get("wins", 0))
+    # bet_scorecard returns win_rate_pct, not a raw win count. Reading a
+    # "wins" key that does not exist pinned the win rate to a hard 0%,
+    # which fires the KILL below on any negative net at >= 10 settled bets.
+    win_rate = float(score.get("win_rate_pct", 0.0) or 0.0)
     net = float(score.get("net_pnl", 0.0))
-    win_rate = (wins / settled * 100) if settled else 0.0
 
     reasons = []
     if settled >= 10 and win_rate < 40 and net < 0:
