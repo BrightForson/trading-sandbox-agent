@@ -160,7 +160,7 @@ def _tavily_increment(journal, day, month):
     journal.set_meta(f"tavily_count_{month}", str(int(journal.get_meta(f"tavily_count_{month}") or "0") + 1))
 
 
-def tavily_search(query, cfg=None, max_results=5, journal=None):
+def tavily_search(query, cfg=None, max_results=5, journal=None, time_range=None):
     """
     General web search via Tavily. Hard budget guardrails:
       - daily limit (config research.tavily_daily_limit, default 30)
@@ -172,17 +172,30 @@ def tavily_search(query, cfg=None, max_results=5, journal=None):
     if not api_key:
         return []
     day_count, month_count, day, month = _tavily_counters(journal)
-    daily_limit = int((cfg or {}).get("tavily_daily_limit", 30)) if cfg else 30
-    monthly_limit = int((cfg or {}).get("tavily_monthly_limit", 1000)) if cfg else 1000
+    daily_limit = int((cfg or {}).get("tavily_daily_limit", 30))
+    monthly_limit = int((cfg or {}).get("tavily_monthly_limit", 1500))
     if day_count >= daily_limit or month_count >= monthly_limit:
         print(f"[research] Tavily budget guard: {day_count}/{daily_limit} today, "
               f"{month_count}/{monthly_limit} this month — skipping search")
         return []
+    # Recency has to be requested. Tavily's `time_range` has NO default and
+    # results with no detectable publish date are NOT filtered out, so omitting
+    # it searches ALL TIME — broader than the "this week"/"today" the query
+    # strings merely hint at in prose. `topic` likewise defaults to "general",
+    # which reaches wider sources than a news query wants. (`days` is not a
+    # Tavily parameter at all.)
+    body = {
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "basic",
+        "topic": "news",
+        "time_range": time_range or "week",
+    }
     try:
         resp = requests.post(
             TAVILY_URL,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"query": query, "max_results": max_results, "search_depth": "basic"},
+            json=body,
             timeout=20,
         )
         if resp.status_code != 200:
@@ -205,13 +218,18 @@ def os_getenv_tavily():
 
 # ---------------- whale activity proxy ----------------
 
-def whale_activity(symbol, cfg=None):
+def whale_activity(symbol, cfg=None, journal=None):
     """
     Whale/insider activity approximation. Tavily is expensive (budget) so it's
     used at most ONCE per symbol per day (cached in meta); otherwise RSS
     headlines filtered for the symbol (free).
+
+    Takes the CALLER's journal, like news_digest. Without it this reached for
+    the module-global default DB, so a Tier 2 scout cycle run against a test or
+    scratch journal still wrote its whale cache — and burned Tavily budget
+    counters — against the real data/trades.db.
     """
-    journal = _get_journal()
+    journal = journal or _get_journal()
     day = _day_key()
     cache_key = f"whale_cache_{day}_{symbol.replace('/', '_')}"
     if journal.get_meta(cache_key):
@@ -223,7 +241,7 @@ def whale_activity(symbol, cfg=None):
             except Exception:
                 pass
     name = SYMBOL_TO_NAME.get(symbol, symbol)
-    results = tavily_search(f"{name} whale accumulation large transfers news this week", cfg, max_results=5)
+    results = tavily_search(f"{name} whale accumulation large transfers news this week", cfg, max_results=5, journal=journal)
     if results:
         import json as _json
         payload = {"source": "tavily", "items": results}
@@ -275,7 +293,7 @@ def news_digest(symbol, cfg=None, limit=5, journal=None):
              headlines_for_symbol(symbol, limit=limit)]
     source = "rss"
     tav = tavily_search(f"{SYMBOL_TO_NAME.get(symbol, symbol)} crypto news today",
-                        cfg, max_results=3, journal=journal)
+                        cfg, max_results=3, journal=journal, time_range="day")
     if tav:
         for r in tav[:3]:
             title = str(r.get("title") or "").strip()
@@ -298,8 +316,11 @@ def news_digest(symbol, cfg=None, limit=5, journal=None):
 
 # ---------------- convenience bundle ----------------
 
-def research_bundle(symbols=None, cfg=None):
-    """Everything the agent needs in one call: headlines, stats, trending, whales."""
+def research_bundle(symbols=None, cfg=None, journal=None):
+    """Everything the agent needs in one call: headlines, stats, trending, whales.
+
+    Takes the CALLER's journal so the whale cache lands in the right DB.
+    """
     symbols = symbols or ["BTC/USD", "ETH/USD", "SOL/USD"]
     all_heads = fetch_rss_headlines(limit=20)
     bundle = {
@@ -312,6 +333,6 @@ def research_bundle(symbols=None, cfg=None):
     for sym in symbols:
         bundle["per_symbol"][sym] = {
             "headlines": headlines_for_symbol(sym, limit=5, all_headlines=all_heads),
-            "whales": whale_activity(sym, cfg),
+            "whales": whale_activity(sym, cfg, journal=journal),
         }
     return bundle

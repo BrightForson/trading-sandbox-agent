@@ -54,8 +54,10 @@ class ShadowAccount:
             return {}
 
     def _save(self, cash, positions):
-        self.journal.set_meta("shadow_cash", str(round(cash, 6)))
-        self.journal.set_meta("shadow_positions", json.dumps(positions))
+        self.journal.set_meta_many([
+            ("shadow_cash", str(round(cash, 6))),
+            ("shadow_positions", json.dumps(positions)),
+        ])
 
     def _log_trade(self, symbol, action, qty, price, note=""):
         try:

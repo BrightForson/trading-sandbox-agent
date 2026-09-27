@@ -269,7 +269,14 @@ WORKFLOW_SCHEDULES = {
     "scanner": (6 * 60 * 60, 12),
     "memecoin": (60 * 60, 3),
     "futures": (60 * 60, 3),
-    "report": (24 * 60 * 60, 30),
+    # grace_runs used to be 30 here, which made the staleness threshold
+    # 24h * 31 = 31 days. This is the report's OWN row, and the only thing that
+    # ever renders it is this report running, so its age is always ~24h and the
+    # row is structurally incapable of ever reporting STALLED. A dead report
+    # workflow is exactly the case this meter exists to catch, and 31 days is
+    # also longer than the 4-week graduation window. 3 keeps it consistent with
+    # the other hourly workflows (4 days of silence).
+    "report": (24 * 60 * 60, 3),
 }
 
 
@@ -301,7 +308,11 @@ def actions_health():
                 lines.append(f"- {wf}: unavailable ({e})")
                 continue
             if not runs:
-                lines.append(f"- {wf}: no runs found")
+                # A workflow that has NEVER run is not healthy. This rendered as
+                # a plain informational line and matched none of the tokens in
+                # the any_pain test below, so a disabled or never-dispatched
+                # workflow looked identical to a working one.
+                lines.append(f"- {wf}: NO RUNS FOUND ⚠")
                 continue
             latest = runs[0]
             last_ts = datetime.fromisoformat(
@@ -324,6 +335,7 @@ def actions_health():
             )
         header = "Actions Pain-Meter (workflow freshness):"
         any_pain = any(("FAILED" in ln) or ("STALLED" in ln) or ("unavailable" in ln)
+                       or ("NO RUNS FOUND" in ln)
                        for ln in lines)
         if any_pain:
             header += " ⚠ INVESTIGATE"

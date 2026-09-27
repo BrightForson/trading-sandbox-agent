@@ -521,11 +521,19 @@ def test_close_journals_exit_fee_and_funding(tmp_path):
     close_row = next(t for t in j.get_trades() if t[3] == "CLOSE-LONG")
     # CLOSE row fee = the exit fee ONLY (0.05): funding is settled at
     # accrual, never re-charged or journaled twice (2026-09-13 fix)
-    assert close_row[7] == pytest.approx(0.05, abs=1e-9)
+    #
+    # The exit fee is a share of what transacted on THIS close, i.e.
+    # exit_price * qty. It used to be pos["notional"], the entry notional, so
+    # the fee was wrong in proportion to the move — a 2x winner paid half of
+    # what it owed. Asserted against the exit notional, and asserted NOT equal
+    # to the entry-notional fee, so the old formula cannot come back.
+    exit_fee = r["exit_price"] * pos["qty"] * 0.05 / 100
+    assert close_row[7] == pytest.approx(exit_fee, abs=1e-9)
+    assert close_row[7] != pytest.approx(pos["notional"] * 0.05 / 100, abs=1e-9)
     # close pnl = price pnl (with exit slippage) - exit fee; funding is
     # NOT part of it — already paid once at accrual
     price_pnl = (r["exit_price"] - pos["entry"]) * pos["qty"]
-    assert r["pnl"] == pytest.approx(price_pnl - 0.05, rel=1e-9)
+    assert r["pnl"] == pytest.approx(price_pnl - exit_fee, rel=1e-9)
 
 
 def test_funding_charged_exactly_once_full_lifecycle(tmp_path):
@@ -540,14 +548,22 @@ def test_funding_charged_exactly_once_full_lifecycle(tmp_path):
     pos = led._positions()["BTC/USD"]
     notional = pos["notional"]
     entry_fee = notional * 0.05 / 100
-    exit_fee = notional * 0.05 / 100
+    # exit fee is on the exit notional, not the entry notional (see
+    # test_close_journals_exit_fee_and_funding)
+    exit_fee = led._exit_price("LONG", 101.0) * pos["qty"] * 0.05 / 100
     # age past one 8h boundary -> exactly one funding mark
     positions = led._positions()
     positions["BTC/USD"]["opened"] = (datetime.now(timezone.utc)
                                      - timedelta(hours=9)).isoformat()
     j.set_meta("t5_positions", json.dumps(positions))
-    funding = notional * 0.01 / 100
-    assert led._accrue_funding()[0]["amount"] == pytest.approx(-funding, abs=1e-9)
+    # funding accrues on the MARK notional, not the frozen entry notional
+    funding = positions["BTC/USD"]["qty"] * 100.0 * 0.01 / 100
+    # (the event amount is rounded to 8dp, so the tolerance cannot be tighter)
+    assert led._accrue_funding(marks={"BTC/USD": 100.0})[0]["amount"] == pytest.approx(-funding, abs=1e-8)
+    # the cursor advanced and is persisted, so a second accrual in the same
+    # 8h window charges nothing more
+    assert led._positions()["BTC/USD"]["funding_marks_paid"] == 1
+    assert led._accrue_funding(marks={"BTC/USD": 100.0}) == []
     # close at a +1 price move: price pnl known exactly
     r = led._close_position("BTC/USD", mark=101.0, note="lifecycle")
     price_pnl = (r["exit_price"] - pos["entry"]) * pos["qty"]

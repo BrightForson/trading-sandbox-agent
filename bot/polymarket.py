@@ -57,21 +57,53 @@ def _family_has_open_bet(journal, ev_family):
     return False
 
 
-def _fetch_markets(limit=100, active_only=True, closed=False):
+def _fetch_markets(limit=100, active_only=True, closed=False, pages=3,
+                   order="liquidityNum", end_date_min=None, end_date_max=None):
+    """Fetch Gamma markets across `pages` pages via offset.
+
+    Gamma hard-caps a page at 100 rows — limit=200 and limit=1000 both return
+    100 — so the single request this used to make capped the whole tier at the
+    top 100 markets by whatever it sorted on, and no config value could raise
+    that. `offset` is the pagination parameter and returns a disjoint page.
+
+    `end_date_min`/`end_date_max` filter by resolution date server-side, which
+    is far cheaper than fetching everything and filtering locally, and `order`
+    defaults to depth rather than 24h volume: for a tier that needs liquid,
+    tradeable markets, the 24h-volume leaderboard is mostly short-horizon
+    sports that resolve within hours.
+    """
     params = {
         "limit": limit,
         "active": str(active_only).lower(),
         "closed": str(closed).lower(),
-        "order": "volume24hr",
+        "order": order,
         "ascending": "false",
     }
-    try:
-        resp = requests.get(GAMMA_MARKETS_URL, params=params, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"[scanner] Gamma fetch failed: {e}")
-        return []
+    if end_date_min:
+        params["end_date_min"] = end_date_min
+    if end_date_max:
+        params["end_date_max"] = end_date_max
+    out = []
+    seen = set()
+    for page in range(max(1, int(pages))):
+        params["offset"] = page * limit
+        try:
+            resp = requests.get(GAMMA_MARKETS_URL, params=params, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            batch = resp.json()
+        except Exception as e:
+            print(f"[scanner] Gamma fetch failed (page {page + 1}): {e}")
+            break
+        if not batch:
+            break
+        # Defend against a server that ignores offset and repeats page 1.
+        fresh = [m for m in batch if m.get("id") not in seen]
+        for m in fresh:
+            seen.add(m.get("id"))
+        out.extend(fresh)
+        if len(fresh) < len(batch):
+            break
+    return out
 
 
 def _parse_market(m):
@@ -111,11 +143,26 @@ def _parse_market(m):
 
 
 def scan_near_resolution(cfg, markets=None):
-    """Return expensive favorites as a research watchlist, never as an edge."""
+    """Return expensive favorites as a research watchlist, never as an edge.
+
+    These are watchlist-only by design, not by configuration. There used to be
+    a `near_resolution_watchlist_only` flag whose only effect was to set a
+    `paper_bet_allowed` boolean on these dicts — but scan() builds its candidate
+    list solely from scan_llm_mispricing, so the watchlist was never merged in
+    and the flag controlled nothing. Flipping it appeared to do something and
+    did not.
+
+    It is removed rather than wired up. A >=0.97 favourite has no modelled edge
+    by construction — there is no identifiable inconsistency to price, only a
+    model disagreeing with a market, which the Tier 3 quality floor forbids
+    betting on. Promoting these to bets would also route them around
+    min_expected_value_pct, since _expected_value() is never computed for them.
+    Widening the SEARCH is the sanctioned response to a dry window; lowering
+    this bar is not.
+    """
     max_days = _cfg_val(cfg, "near_resolution_days", 3)
     min_price = _cfg_val(cfg, "near_resolution_min_price", 0.97)
     min_vol = _cfg_val(cfg, "min_market_volume", 50000)
-    watchlist_only = bool((getattr(cfg, "scanner", None) or {}).get("near_resolution_watchlist_only", True))
     markets = markets if markets is not None else _fetch_markets(limit=100)
     now = datetime.now(timezone.utc)
     out = []
@@ -136,7 +183,7 @@ def scan_near_resolution(cfg, markets=None):
             continue
         out.append({**parsed, "strategy": "near_resolution", "side": side, "price": price,
                     "days_left": round(days_left, 2),
-                    "paper_bet_allowed": not watchlist_only and days_left > 0.5})
+                    "paper_bet_allowed": False})
     return out
 
 

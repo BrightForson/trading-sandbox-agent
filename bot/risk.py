@@ -29,8 +29,10 @@ class RiskEngine:
         return self.journal.get_meta("kill_switch") == "on"
 
     def set_kill_switch(self, on, reason="manual"):
-        self.journal.set_meta("kill_switch", "on" if on else "off")
-        self.journal.set_meta("kill_switch_reason", reason if on else "")
+        self.journal.set_meta_many([
+            ("kill_switch", "on" if on else "off"),
+            ("kill_switch_reason", reason if on else ""),
+        ])
 
     def _today_key(self):
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -50,8 +52,10 @@ class RiskEngine:
         except Exception:
             return False  # can't read account -> don't hard-block on infra failure
         if baseline is None:
-            self.journal.set_meta(baseline_key, str(equity))
-            self.journal.set_meta("risk_day", today)
+            self.journal.set_meta_many([
+                (baseline_key, str(equity)),
+                ("risk_day", today),
+            ])
             return False
         baseline_val = float(baseline)
         drop_pct = (baseline_val - equity) / baseline_val * 100.0

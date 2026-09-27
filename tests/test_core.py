@@ -1416,28 +1416,42 @@ def _patch_meter(monkeypatch, runs_by_wf):
     return rp
 
 
+def _healthy_runs(**overrides):
+    """A fresh success for EVERY workflow the meter knows about.
+
+    Derived from WORKFLOW_SCHEDULES so this cannot drift when a workflow is
+    added. Hardcoding the list is what let memecoin and futures go unpatched
+    here, and a workflow with no runs at all used to render as a benign
+    'no runs found' line that matched none of the pain tokens -- so two of
+    seven workflows were silently unmonitored in the 'all healthy' case.
+    """
+    from datetime import datetime, timezone
+    from bot import report as rp
+    now = datetime.now(timezone.utc).isoformat()
+    runs = {wf: [_mk_run(now, "success")] for wf in rp.WORKFLOW_SCHEDULES}
+    runs.update(overrides)
+    return runs
+
+
 def test_pain_meter_flags_stalled_workflow(monkeypatch):
     from datetime import datetime, timedelta, timezone
-    rp = _patch_meter(monkeypatch, {
-        # last trade run 3h ago -> past 2-run grace on a 15-min cron
-        "trade": [_mk_run((datetime.now(timezone.utc) - timedelta(hours=3)
-                          ).isoformat(), "success")],
-        "chat": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
-        "agent": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
-        "scanner": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
-        "report": [_mk_run(datetime.now(timezone.utc).isoformat(), "success")],
-    })
+    # last trade run 3h ago -> past 2-run grace on a 15-min cron
+    rp = _patch_meter(monkeypatch, _healthy_runs(
+        trade=[_mk_run((datetime.now(timezone.utc) - timedelta(hours=3)
+                        ).isoformat(), "success")]))
     out = rp.actions_health()
     assert "INVESTIGATE" in out
     assert "trade: STALLED" in out
     assert "chat: ok" in out
+    assert "NO RUNS FOUND" not in out
 
 
 def test_pain_meter_flags_failed_run(monkeypatch):
     from datetime import datetime, timezone
+    from bot import report as rp
     rp = _patch_meter(monkeypatch, {
         wf: [_mk_run(datetime.now(timezone.utc).isoformat(), "failure")]
-        for wf in ("trade", "chat", "agent", "scanner", "report")
+        for wf in rp.WORKFLOW_SCHEDULES
     })
     out = rp.actions_health()
     assert "INVESTIGATE" in out
@@ -1446,15 +1460,24 @@ def test_pain_meter_flags_failed_run(monkeypatch):
 
 
 def test_pain_meter_all_healthy(monkeypatch):
-    from datetime import datetime, timezone
-    rp = _patch_meter(monkeypatch, {
-        wf: [_mk_run(datetime.now(timezone.utc).isoformat(), "success")]
-        for wf in ("trade", "chat", "agent", "scanner", "report")
-    })
+    rp = _patch_meter(monkeypatch, _healthy_runs())
     out = rp.actions_health()
     assert "INVESTIGATE" not in out
     assert "STALLED" not in out
     assert "FAILED" not in out
+    assert "NO RUNS FOUND" not in out
+
+
+def test_pain_meter_flags_a_workflow_that_never_ran(monkeypatch):
+    """A disabled or never-dispatched workflow used to be indistinguishable
+    from a working one, because 'no runs found' matched none of the pain
+    tokens and the header stayed clean."""
+    from bot import report as rp
+    runs = _healthy_runs()
+    del runs["memecoin"]
+    out = _patch_meter(monkeypatch, runs).actions_health()
+    assert "memecoin: NO RUNS FOUND" in out
+    assert "INVESTIGATE" in out
 
 
 def test_pain_meter_api_failure_degrades_gracefully(monkeypatch):

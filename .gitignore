@@ -14,5 +14,16 @@ data/reports/
 # Keep the trade journal (committed for cross-run state on GitHub Actions)
 !data/trades.db
 
+# Pre-reset snapshots of the journal. tools/reset_day_zero.py writes these
+# locally before a destructive reset; they are recovery copies, not source, and
+# four of them had piled up untracked. The live journal is still committed.
+data/archive/
+
+# SQLite sidecars. journal_mode stays DELETE (see bot/journal.py _BUSY_TIMEOUT_S
+# note) so these should not appear, but a stray -wal must never be staged next
+# to a journal that tools/safe_commit.sh resolves as a single-file binary.
+data/*.db-wal
+data/*.db-shm
+
 # OS
 .DS_Store

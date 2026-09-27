@@ -263,6 +263,13 @@ def test_dexscreener_spike_filter(tmp_path, monkeypatch):
 
     monkeypatch.setattr("bot.memecoin.requests.get", fake_get)
     monkeypatch.setattr("bot.memecoin._pace_coingecko", lambda: None)
+    # bot.memecoin._TICKER_MAP_CACHE is a module-level global with a 24h TTL,
+    # so any earlier test that made a real /coins/list call populates it with
+    # real ids and this test then resolves against live data instead of the
+    # mock above ("black-unicorn-corp" instead of "mooncoin"). Reset it so the
+    # stub is authoritative regardless of test ordering.
+    monkeypatch.setattr("bot.memecoin._TICKER_MAP_CACHE",
+                        {"map": {}, "fetched_at": 0.0})
     cards = led.dexscreener_spike_cards()
     assert [c["symbol"] for c in cards] == ["mooncoin"]  # resolved CG id
     assert "multiple" in cards[0]["detail"]

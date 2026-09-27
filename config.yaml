@@ -119,7 +119,11 @@ scanner:
   friction_pct: 1.0
   min_expected_value_pct: 2.0
   max_total_open_exposure: 100
-  near_resolution_watchlist_only: true  # false = allow paper bets on near-resolution favorites (>= 12h to close)
+  # near_resolution_watchlist_only was REMOVED (audit 4/8). It set a
+  # paper_bet_allowed flag that scan() never consumed, so it controlled nothing.
+  # Near-resolution favourites are now unconditionally watchlist-only: a >=0.97
+  # favourite offers no identifiable inconsistency to price, and promoting these
+  # to bets would route them around min_expected_value_pct.
   # Tier 3 betting wallet (virtual $60, mirrors real deployment size)
   wallet_start_cash: 60
   wallet_stake: 12

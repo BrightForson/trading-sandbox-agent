@@ -18,6 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot.journal import TradeJournal
 
+# conftest's autouse fixture replaces bot.notify.send_notification with a no-op
+# so no test can fire a live webhook. Capture the real function at import time
+# (collection precedes fixtures) for the tests that must exercise it.
+from bot.notify import send_notification as _real_send_notification
+
 
 # ---------------- commit 1: Tier 1 drawdown must not mix ledgers ----------------
 
@@ -915,3 +920,669 @@ def test_llm_mispricing_surfaces_a_total_match_failure(capsys):
     out = capsys.readouterr().out
     assert "WARNING" in out, out
     assert "0/1" in out, out
+
+
+# ================= commit 4: journal durability =================
+
+def test_journal_closes_its_connections(tmp_path):
+    """`with sqlite3.connect(...)` ends a transaction but never closes the
+    handle, so all 23 journal call sites leaked a descriptor until the GC ran.
+    The helper has to close deterministically."""
+    import sqlite3 as _s
+    j = TradeJournal(db_path=str(tmp_path / "j.db"))
+    opened = []
+    real_connect = _s.connect
+
+    def _spy(*a, **k):
+        conn = real_connect(*a, **k)
+        opened.append(conn)
+        return conn
+
+    _s.connect = _spy
+    try:
+        j.log_trade("2026-01-01T00:00:00Z", "BTC/USD", "BUY", 1.0, 100.0, "x")
+        j.get_meta("nothing")
+        j.get_trades()
+    finally:
+        _s.connect = real_connect
+    assert opened, "expected the journal to open connections"
+    assert all(c.__class__ is not None for c in opened)
+    # sqlite3.Connection has no public "closed" flag, so prove it by using it:
+    # a closed connection raises ProgrammingError on any operation.
+    for conn in opened:
+        with pytest.raises(_s.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_journal_sets_a_busy_timeout_and_stays_off_wal(tmp_path):
+    """Lock waits are made explicit rather than relying on the stdlib's
+    undocumented 5s default, and the file stays in DELETE journal mode.
+
+    WAL is deliberately NOT enabled: tools/safe_commit.sh stages the journal as
+    one self-contained binary and resolves conflicts from the :1:/:2:/:3: stages
+    of that single file, so committed rows living in a -wal sidecar would mean
+    staging a stale journal and defeating the union merge.
+    """
+    import sqlite3 as _s
+    j = TradeJournal(db_path=str(tmp_path / "j.db"))
+    with j._conn() as conn:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+
+
+def test_set_meta_many_is_one_transaction(tmp_path):
+    """A tier's cash and positions keys must never be observable disagreeing.
+
+    set_meta committed per call, so a two-key save was two transactions and a
+    crash between them left cash debited with positions unchanged -- which
+    reads as free money rather than as corruption.
+    """
+    j = TradeJournal(db_path=str(tmp_path / "j.db"))
+    calls = []
+    real = j._conn
+
+    class _Spy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._cm = real()
+            conn = self._cm.__enter__()
+            calls.append(conn)
+            return conn
+
+        def __exit__(self, *a):
+            return self._cm.__exit__(*a)
+
+    j._conn = lambda: _Spy(real)
+    j.set_meta_many([("t4_cash", "1"), ("t4_positions", "{}"), ("t5_cash", "2")])
+    assert len(calls) == 1, f"expected one connection, got {len(calls)}"
+    assert j.get_meta("t4_cash") == "1"
+    assert j.get_meta("t5_cash") == "2"
+
+
+def test_ensure_columns_rejects_unknown_identifiers(tmp_path):
+    """_ensure_columns interpolates a table, a column name AND a free-form type
+    definition into DDL. All current callers pass literals, so this is a trap
+    for the next caller rather than a live injection -- but the definition half
+    can carry a "); DROP TABLE ..." payload."""
+    from bot.errors import JournalError
+    j = TradeJournal(db_path=str(tmp_path / "j.db"))
+    import sqlite3 as _s
+    conn = _s.connect(j.db_path)
+    try:
+        cur = conn.cursor()
+        with pytest.raises(JournalError):
+            j._ensure_columns(cur, "sqlite_master", {"x": "TEXT"})
+        with pytest.raises(JournalError):
+            j._ensure_columns(cur, "trades", {"evil": "TEXT"})
+        with pytest.raises(JournalError):
+            j._ensure_columns(cur, "trades", {"fee": "TEXT); DROP TABLE trades; --"})
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='trades'").fetchone()
+    finally:
+        conn.close()
+
+
+def test_open_proposals_query_is_bounded_and_indexed(tmp_path):
+    """The only unbounded reader in the journal, run twice per agent cycle.
+
+    The cap is safe for the evaluation path (ASC ordering keeps the most
+    overdue rows) but NOT for the per-symbol suppression check, which is why
+    that caller moved to a symbol-scoped query.
+    """
+    import sqlite3 as _s
+    j = TradeJournal(db_path=str(tmp_path / "j.db"))
+    for i in range(5):
+        j.log_proposal(timestamp=f"2026-01-0{i+1}T00:00:00Z", source="ai_agent",
+                       kind="scout", symbol="BTC/USD", action="BUY",
+                       notional=10, confidence=0.9, rationale="r",
+                       exec_status="open")
+    assert len(j.get_open_proposals(limit=2)) == 2
+    # symbol-scoped lookup is unaffected by the global cap
+    assert len(j.get_open_proposal_for_symbol("BTC/USD")) == 5
+    assert j.get_open_proposal_for_symbol("ETH/USD") == []
+    conn = _s.connect(j.db_path)
+    try:
+        plan = " ".join(str(r) for r in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM proposals WHERE source=? AND "
+            "exec_status=? ORDER BY timestamp ASC LIMIT 500",
+            ("ai_agent", "open")).fetchall())
+        assert "idx_proposals_open" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    finally:
+        conn.close()
+
+
+# ---------------- commit 4: Tier 5 ATR / fees / funding ----------------
+
+def test_atr_returns_none_rather_than_nan(tmp_path):
+    """A NaN ATR is silent: `not nan` is False and `nan <= 0` is False, so every
+    `if not atr or atr <= 0` guard let it through. It reached the position dict
+    (json.dumps writes a bare NaN), where a NaN stop compares False against
+    every bar low -- the position could never be stopped out or take profit,
+    and the SL-before-liquidation check was silently skipped too."""
+    from bot.futures import _atr
+    import math
+    good = _atr(_rising_bars(n=60))
+    assert good is not None and math.isfinite(good) and good > 0
+    # too few bars for the rolling window -> NaN before the fix
+    assert _atr(_rising_bars(n=5)) is None
+    # a fully-null bar (binance_data does not dropna) poisons the rolling mean,
+    # but only if it falls inside the window the caller reads
+    bars = _rising_bars(n=60)
+    for col in ("open", "high", "low", "close"):
+        bars.iloc[55, bars.columns.get_loc(col)] = float("nan")
+    assert _atr(bars) is None
+
+
+def test_tier5_refuses_an_entry_when_atr_is_nan(tmp_path):
+    """open() persisted stop=NaN, take_profit=NaN and entry_atr=NaN, leaving an
+    unprotected 10x position that only liquidation or the 12h time stop could
+    ever exit."""
+    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
+                        bars={"BTC/USD": (_rising_bars(n=60), None)})
+    # force the NaN the short-frame path produces
+    led._bars_for = lambda s: (_rising_bars(n=5), None)
+    ok, msg = led.open("BTC/USD", "LONG", margin=10)
+    assert not ok
+    assert "ATR" in msg
+    assert led._positions() == {}
+
+
+def test_tier5_exit_fee_is_charged_on_the_exit_notional(tmp_path):
+    """The exit fee used to be pos["notional"], the ENTRY notional, so the fee
+    was wrong in proportion to the move: a 2x winner paid half of what it owed.
+    The journal row, the booked pnl and the cash credit were all wrong
+    together, in the same direction."""
+    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
+                        bars={"BTC/USD": (_rising_bars(n=60), None)})
+    assert led.open("BTC/USD", "LONG", margin=10)[0]
+    pos = led._positions()["BTC/USD"]
+    r = led._close_position("BTC/USD", mark=200.0, note="2x")
+    close_row = next(t for t in j.get_trades() if t[3] == "CLOSE-LONG")
+    expected = r["exit_price"] * pos["qty"] * 0.05 / 100
+    assert close_row[7] == pytest.approx(expected, abs=1e-12)
+    # a 2x winner must pay roughly twice the entry-notional fee, not half
+    assert close_row[7] > pos["notional"] * 0.05 / 100
+
+
+def test_tier5_entry_reserves_the_fee_and_the_cash_floor(tmp_path):
+    """min_cash_fraction was already enforced, but the check ran before the
+    debit and the entry fee was never reserved -- so a margin sized exactly to
+    the free cash left the ledger negative by the fee after the fill. Tier 1 and
+    Tier 4 both size against cost+fee; Tier 5 alone did not."""
+    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
+                        bars={"BTC/USD": (_rising_bars(n=60), None)})
+    # drain cash to just under the 15% floor of a 50 account
+    j.set_meta("t5_cash", "7.5")
+    ok, msg = led.open("BTC/USD", "LONG", margin=10)
+    if ok:
+        assert led._cash() >= 0, f"entry fee pushed cash negative: {led._cash()}"
+        assert led._cash() >= led.valuation()["equity"] * led.min_cash_fraction * 0.999
+    else:
+        assert "cash floor" in msg
+
+
+def test_tier5_funding_cursor_persists_at_zero_net_delta(tmp_path):
+    """The cursor lives inside the positions JSON, so gating the save on
+    cash_delta != 0.0 discarded it whenever the net charge was exactly zero --
+    which a hedged pair of equal-size opposite positions produces, since a LONG
+    and a SHORT at the same notional cancel. Skipped marks then re-priced at
+    the current rate in one lump, funding_accrued stayed 0.0 for the reporting
+    scorecard, and no funding event fired so the notification never appeared.
+    The total was conserved; the bookkeeping was not."""
+    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
+                        bars={"BTC/USD": (_rising_bars(n=60), None)})
+    import json as _json
+    old = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
+    # identical notionals, opposite sides -> funding cancels exactly
+    j.set_meta("t5_positions", _json.dumps({
+        "BTC/USD": {"side": "LONG", "qty": 1.0, "entry": 100.0, "margin": 10.0,
+                    "notional": 100.0, "stop": 95.0, "take_profit": 110.0,
+                    "liquidation": 50.0, "opened": old},
+        "ETH/USD": {"side": "SHORT", "qty": 1.0, "entry": 100.0, "margin": 10.0,
+                    "notional": 100.0, "stop": 105.0, "take_profit": 90.0,
+                    "liquidation": 150.0, "opened": old},
+    }))
+    led.funding_rate_pct_8h = 0.01
+    events = led._accrue_funding(marks={"BTC/USD": 100.0, "ETH/USD": 100.0})
+    assert events == [] or all(e["amount"] == 0 for e in events)
+    for sym in ("BTC/USD", "ETH/USD"):
+        assert led._positions()[sym]["funding_marks_paid"] == 1, (
+            f"{sym} cursor was dropped at zero net delta")
+        assert led._positions()[sym]["funding_accrued"] != 0.0
+
+
+def test_tier5_funding_accrues_on_the_mark_notional(tmp_path):
+    """Funding is a rate on the position's value, so a 3x move over 12h was
+    being charged 3x the truth (or credited 3x, for a short)."""
+    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
+                        bars={"BTC/USD": (_rising_bars(n=60), None)})
+    import json as _json
+    j.set_meta("t5_positions", _json.dumps({
+        "BTC/USD": {"side": "LONG", "qty": 1.0, "entry": 100.0, "margin": 10.0,
+                    "notional": 100.0, "stop": 95.0, "take_profit": 110.0,
+                    "liquidation": 50.0,
+                    "opened": (datetime.now(timezone.utc)
+                               - timedelta(hours=9)).isoformat()},
+    }))
+    led.funding_rate_pct_8h = 0.01
+    ev = led._accrue_funding(marks={"BTC/USD": 300.0})
+    assert ev[0]["amount"] == pytest.approx(-300.0 * 0.01 / 100, abs=1e-8)
+
+
+# ---------------- commit 4: Tier 4 P&L, exit ordering, fill price ----------------
+
+def test_tier4_booked_pnl_charges_the_entry_fee(tmp_path):
+    """The cost basis is qty*entry, which is stake MINUS the entry fee (the fee
+    is paid in tokens, not by an extra cash debit). So comparing proceeds
+    against it without charging the entry fee again FORGIVES that fee: the
+    reported pnl came out exactly one entry_fee too high.
+
+    The ledger cash was always right, which is why no gate ever saw it -- only
+    the per-trade pnl in trades.reasoning and the exit alert were inflated.
+    """
+    led, j = _t4_ledger(tmp_path, prices={"AAA": 0.10})
+    cash_before_buy = led._cash()
+    assert led.buy("AAA", stake=12)[0]
+    pos = led._positions()["AAA"]
+    entry_fee = 12 * 1.0 / 100
+    assert pos["entry_fee"] == pytest.approx(entry_fee, abs=1e-12)
+    r = led._sell_position("AAA", note="test")
+    true_pnl = led._cash() - cash_before_buy
+    assert r["pnl"] == pytest.approx(true_pnl, abs=1e-9), (
+        f"booked pnl {r['pnl']} != actual cash delta {true_pnl}")
+
+
+def test_tier4_exit_fills_at_the_triggering_level_not_the_mark(tmp_path):
+    """_sell_position had no fill-price parameter, so it re-fetched the hourly
+    mark and every Tier 4 exit filled at the mark -- never at the stop, trail or
+    TP level that triggered it. A 50% intrabar crash stopped out at the
+    pre-crash hourly price, booking a small loss instead of the real one, which
+    also left t4_peak_equity high and disarmed the 25% drawdown kill."""
+    led, j = _t4_ledger(tmp_path, prices={"AAA": 0.10})
+    assert led.buy("AAA", stake=12)[0]
+    pos = led._positions()["AAA"]
+    stop = float(pos["stop"])
+    # the mark is far ABOVE the stop, so a mark-fill would look profitable
+    r = led._sell_position("AAA", note="stop loss", fill=stop)
+    assert r["exit_price"] < 0.10, "filled at the mark instead of the stop"
+    assert r["exit_price"] == pytest.approx(
+        stop * (1 - led.slippage_bps / 10_000.0), rel=1e-9)
+    assert r["pnl"] < 0
+
+
+def test_tier4_partial_tp_is_not_pre_empted_by_the_trailing_stop(tmp_path):
+    """The trailing stop is a rule for managing a runner, but it was evaluated
+    BEFORE the partial take-profit. Because the trail level is derived from the
+    same 5m window's high and then tested against that window's low, one bar
+    spanning 0.19 -> 0.14 both armed 0.152 and breached it in a single pass --
+    so a position that should have banked 50% and kept a runner was closed in
+    full with no partial banked at all."""
+    import pandas as pd
+    px = {"AAA": 0.10}
+    led, j = _t4_ledger(tmp_path, prices=px)
+    led.wick_exits = True          # the real config has this on
+    assert led.buy("AAA", stake=12)[0]
+    px["AAA"] = 0.188          # +85% -> past the +80% partial threshold
+    # a single 5m bar spanning 0.19 -> 0.14 both creates the 0.152 trail level
+    # and breaches it, which is what let the trail claim the whole position
+    led._wick_extremes = lambda s, since: (0.19, 0.14)
+    led.partial_tp_pct = 80
+    led.trailing_activate_pct = 25
+    events = led.sweep()
+    kinds = [e["type"] for e in events]
+    assert "partial_tp" in kinds, (
+        f"partial was pre-empted, got {kinds} (the 0.19->0.14 wick armed and "
+        f"breached the trail in the same bar)")
+    assert "trailing_stop" not in kinds
+    # and the runner survives with partial_taken set
+    assert led._positions()["AAA"]["partial_taken"] is True
+
+
+def test_tier4_trail_cannot_fire_on_the_bar_that_armed_it(tmp_path):
+    """A trail level that did not exist at any observable instant cannot have
+    been breached. Tier 5 got this in fb72f00; Tier 4 never had it.
+
+    The wick mock only reports a breaching low for windows that start AFTER the
+    arm time, which is the whole point: the pre-fix code measured from the
+    position's open and so saw lows from before the level existed.
+    """
+    px = {"AAA": 0.10}
+    led, j = _t4_ledger(tmp_path, prices=px)
+    led.wick_exits = True
+    assert led.buy("AAA", stake=12)[0]
+    px["AAA"] = 0.188
+    led.partial_tp_pct = 999     # isolate the trail
+    led.trailing_activate_pct = 25
+    opened_ts = datetime.now(timezone.utc) - timedelta(hours=2)
+    import json as _json
+    pos = led._positions()["AAA"]
+    pos["opened"] = opened_ts.isoformat()
+    pos["take_profit"] = 99.0   # and isolate it from the full TP
+    j.set_meta("t4_positions", _json.dumps({"AAA": pos}))
+
+    def _wicks(sym, since):
+        # the breaching low belongs to the window that includes PRE-arm history;
+        # a window starting at the arm time has no bars yet
+        if since is not None and since > datetime.now(timezone.utc) - timedelta(seconds=30):
+            return (None, None)
+        return (0.19, 0.14)
+
+    led._wick_extremes = _wicks
+    events = led.sweep()
+    assert all(e["type"] != "trailing_stop" for e in events), (
+        f"trail fired on the bar that armed it: {events}")
+    # the level is still recorded, so a LATER sweep can honour it
+    assert led._positions()["AAA"]["trailing_stop"] is not None
+    assert "trailing_stop_armed_at" in led._positions()["AAA"]
+
+
+# ---------------- commit 4: agent context, alerting, notify, report, research ----
+
+def test_change_24h_spans_the_right_number_of_intervals(tmp_path):
+    """A window of N bars spans N-1 intervals, so the bar one full period back
+    is iloc[-(N+1)]. iloc[-96] spans 95 intervals -- 23h45m at 15m -- and was
+    reported as 24h. The availability gate was wrong by the same one, computing
+    a 23.75h change out of 96 bars."""
+    import pandas as pd
+    from bot.agent import TradingAgent
+    closes = [100.0 + i for i in range(200)]
+
+    class _Cfg:
+        timeframe = "15Min"
+        lookback_bars = 200
+        sma_fast = 10
+        sma_slow = 50
+
+    class _Broker:
+        def get_crypto_bars(self, symbol, tf, n):
+            idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=len(closes),
+                                freq="15min", tz="UTC")
+            return pd.DataFrame({"close": closes}, index=idx)
+
+    a = TradingAgent.__new__(TradingAgent)
+    a.cfg = _Cfg()
+    a.broker = _Broker()
+    ctx = a._price_context("BTC/USD")
+    # the last bar is dropped as still-forming, so measure on the same series
+    closed = closes[:-1]
+    # 24h before the last CLOSED close is 96 intervals back
+    expected = (closed[-1] / closed[-(96 + 1)] - 1) * 100
+    assert ctx["change_24h_pct"] == pytest.approx(expected, rel=1e-9)
+    assert ctx["change_24h_pct"] != pytest.approx(
+        (closed[-1] / closed[-96] - 1) * 100, rel=1e-9)
+
+
+def test_bar_counts_follow_the_configured_interval(tmp_path):
+    """96/24 are fifteen-minute constants. At 1Hour the '24h' change was
+    computed over 4 days and the '6h' change over 23 hours."""
+    import pandas as pd
+    from bot.agent import TradingAgent
+    closes = [100.0 + i for i in range(200)]
+
+    class _Cfg:
+        timeframe = "1Hour"
+        lookback_bars = 200
+        sma_fast = 10
+        sma_slow = 50
+
+    class _Broker:
+        def get_crypto_bars(self, symbol, tf, n):
+            idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=len(closes),
+                                freq="1h", tz="UTC")
+            return pd.DataFrame({"close": closes}, index=idx)
+
+    a = TradingAgent.__new__(TradingAgent)
+    a.cfg = _Cfg()
+    a.broker = _Broker()
+    ctx = a._price_context("BTC/USD")
+    assert len(ctx["recent_24_bars"]) == 6, "6h at 1h bars is 6 bars, not 24"
+    # 24h at 1h = 24 intervals -> 25 bars inclusive
+    closed = closes[:-1]
+    expected = (closed[-1] / closed[-(24 + 1)] - 1) * 100
+    assert ctx["change_24h_pct"] == pytest.approx(expected, rel=1e-9)
+
+
+def test_sma_gap_is_none_when_the_window_is_degenerate(tmp_path):
+    """slow is a mean of closes, i.e. a price, and these are numpy floats, so a
+    zero window yields inf/nan with a RuntimeWarning rather than
+    ZeroDivisionError -- and the nan then rides into the journal and the LLM
+    prompt. The two sibling fields already guarded their divisor."""
+    import pandas as pd
+    from bot.agent import TradingAgent
+    closes = [0.0] * 200
+
+    class _Cfg:
+        timeframe = "15Min"
+        lookback_bars = 200
+        sma_fast = 10
+        sma_slow = 50
+
+    class _Broker:
+        def get_crypto_bars(self, symbol, tf, n):
+            idx = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=len(closes),
+                                freq="15min", tz="UTC")
+            return pd.DataFrame({"close": closes}, index=idx)
+
+    a = TradingAgent.__new__(TradingAgent)
+    a.cfg = _Cfg()
+    a.broker = _Broker()
+    ctx = a._price_context("BTC/USD")
+    assert ctx["sma_gap_pct"] is None
+    # and the context must still be JSON-serialisable under allow_nan=False
+    import json
+    json.dumps(ctx, allow_nan=False)
+
+
+def test_journal_write_refuses_a_non_finite_context(tmp_path):
+    """allow_nan=False has to be caught HERE: this call sits before
+    log_proposal, so an escaping ValueError loses the row entirely, and
+    run_cycle's handler only prints to the CI log -- the proposal would vanish
+    with a green check."""
+    j = TradeJournal(db_path=str(tmp_path / "a.db"))
+    before = len(j.get_proposals(limit=1000))
+    a = _agent(tmp_path)
+    a._price_context = lambda s: {
+        "symbol": s, "last_close": float("nan"), "sma_fast": 1.0,
+        "sma_slow": 1.0, "sma_gap_pct": None, "recent_24_bars": [1.0],
+        "change_6h_pct": 0.0, "change_24h_pct": None,
+    }
+    a._log_and_alert({"kind": "scout", "action": "BUY", "symbol": "BTC/USD",
+                      "notional": 10, "confidence": 0.9, "rationale": "r"})
+    assert len(j.get_proposals(limit=1000)) == before, "a non-finite context was journaled"
+
+
+def test_log_and_alert_surfaces_the_downgrade_reason(tmp_path, monkeypatch):
+    """`extra` was accepted and never used, so a downgraded low-confidence exit
+    reached Discord as a plain HOLD idea -- the operator could not tell the
+    model had wanted out and been overruled."""
+    sent = []
+    import bot.agent
+    monkeypatch.setattr(bot.agent, "send_notification",
+                        lambda m, c=None: sent.append(m))
+    a = _agent(tmp_path)
+    a._price_context = lambda s: None
+    a._log_and_alert({"kind": "exit", "action": "HOLD", "symbol": "BTC/USD",
+                      "notional": 0, "confidence": 0.4, "rationale": "r"},
+                     extra="(low-confidence exit suggestion — logged as HOLD)")
+    assert any("low-confidence exit suggestion" in m for m in sent), sent
+
+
+def test_notify_refuses_an_empty_message(monkeypatch, tmp_path):
+    """An empty message produced zero chunks, so the loop body never ran and the
+    function returned as if it had delivered: no post, no file, no summary, no
+    log. The docstring promises at-least-one durable write."""
+    from bot.errors import NotificationError
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.invalid/hook")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(NotificationError):
+        _real_send_notification("", None)
+
+
+def test_notify_reports_which_channel_delivered(monkeypatch, tmp_path):
+    """Returning None let the caller assume success, which is how a no-delivery
+    day stayed green: run_report.py printed 'delivery verified' whenever it ran
+    on CI, whether or not any channel had actually taken a copy."""
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert _real_send_notification("hello", None) == "file"
+    summary = tmp_path / "sum.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert _real_send_notification("hello", None) == "file+summary"
+    assert "hello" in summary.read_text()
+
+
+def test_notify_masks_secrets_in_every_persisted_sink(monkeypatch, tmp_path):
+    """The report body reaches a public CI log, a file and the step summary, and
+    it is built from raw model output and raw exception strings."""
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    leaky = ("see https://gamma-api.polymarket.com/markets?api_key=TOPSECRET "
+             "and nvapi-abcdef123 and ghp_AAAABBBBCCCC")
+    _real_send_notification(leaky, None)
+    written = list((tmp_path / "data" / "reports").glob("*.txt"))
+    assert written, "no fallback file written"
+    body = written[0].read_text()
+    for secret in ("TOPSECRET", "nvapi-abcdef123", "ghp_AAAABBBBCCCC"):
+        assert secret not in body, f"{secret} leaked into the report file"
+    assert "api_key=[REDACTED]" in body
+
+
+def test_report_pain_meter_flags_a_dead_workflow(monkeypatch):
+    """Two independent ways a dead report went unnoticed for 31 days: its own
+    grace_runs of 30 made the threshold 24h*31 against a row that can only be
+    rendered BY the report running (age ~24h), and a workflow with zero runs
+    matched none of the pain tokens so it read as healthy."""
+    from bot import report
+    assert report.WORKFLOW_SCHEDULES["report"][1] == 3
+    interval, grace = report.WORKFLOW_SCHEDULES["report"]
+    assert interval * (grace + 1) < 86400 * 7, "report stall threshold > 7 days"
+
+    class _Resp:
+        def __init__(self, runs):
+            self._runs = runs
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"workflow_runs": self._runs}
+
+    monkeypatch.setattr(report, "requests",
+                        type("R", (), {"get": staticmethod(lambda *a, **k: _Resp([]))}))
+    out = report.actions_health()
+    assert "NO RUNS FOUND" in out
+    assert "INVESTIGATE" in out
+
+
+def test_polymarket_paginates_past_the_first_hundred(monkeypatch):
+    """Gamma hard-caps a page at 100 -- limit=200 and limit=1000 both return
+    100 -- so one request capped the whole tier at the top 100 by 24h volume,
+    and no config value could raise that."""
+    from bot import polymarket
+
+    seen_offsets = []
+
+    class _Resp:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._rows
+
+    def _get(url, params=None, headers=None, timeout=None):
+        seen_offsets.append((params or {}).get("offset"))
+        off = (params or {}).get("offset") or 0
+        return _Resp([{"id": off + i} for i in range(100)])
+
+    monkeypatch.setattr(polymarket, "requests",
+                        type("R", (), {"get": staticmethod(_get)}))
+    rows = polymarket._fetch_markets(limit=100, pages=3)
+    assert seen_offsets == [0, 100, 200], seen_offsets
+    assert len(rows) == 300
+    assert len({r["id"] for r in rows}) == 300, "pages overlapped"
+
+
+def test_polymarket_pagination_stops_when_the_server_repeats(monkeypatch):
+    """Defend against a server that ignores offset: without dedupe the tier
+    would re-scan page 1 forever and count the same market 300 times."""
+    from bot import polymarket
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{"id": i} for i in range(100)]
+
+    calls = []
+
+    def _get(url, params=None, headers=None, timeout=None):
+        calls.append(1)
+        return _Resp()
+
+    monkeypatch.setattr(polymarket, "requests",
+                        type("R", (), {"get": staticmethod(_get)}))
+    rows = polymarket._fetch_markets(limit=100, pages=5)
+    assert len(rows) == 100
+    assert len(calls) == 2, calls
+
+
+def test_research_uses_the_callers_journal(monkeypatch, tmp_path):
+    """whale_activity and research_bundle reached for the module-global default
+    DB, so a Tier 2 scout cycle run against a scratch journal still wrote its
+    whale cache -- and burned Tavily budget counters -- into data/trades.db."""
+    from bot import research
+    j = TradeJournal(db_path=str(tmp_path / "r.db"))
+    monkeypatch.setattr(research, "_get_journal",
+                        lambda: TradeJournal(db_path=str(tmp_path / "prod.db")))
+    monkeypatch.setattr(research, "tavily_search", lambda *a, **k: [])
+    monkeypatch.setattr(research, "fetch_rss_headlines", lambda limit=20: [])
+    monkeypatch.setattr(research, "market_stats", lambda s: {})
+    monkeypatch.setattr(research, "trending_coins", lambda: [])
+    monkeypatch.setattr(research, "headlines_for_symbol", lambda *a, **k: [])
+    research.research_bundle(["BTC/USD"], None, journal=j)
+    prod = TradeJournal(db_path=str(tmp_path / "prod.db"))
+    assert not [k for k in _all_meta_keys(prod) if k.startswith("whale_cache")]
+
+
+def test_tavily_requests_a_recency_window(monkeypatch, tmp_path):
+    """Tavily's time_range has NO default and undated results are not filtered
+    out, so omitting it searched ALL TIME -- broader than the "this week" the
+    query strings only hint at in prose. `days` is not a Tavily parameter."""
+    from bot import research
+    j = TradeJournal(db_path=str(tmp_path / "r.db"))
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"results": []}
+
+    def _post(url, headers=None, json=None, timeout=None):
+        captured.update(json or {})
+        return _Resp()
+
+    monkeypatch.setattr(research, "requests",
+                        type("R", (), {"post": staticmethod(_post)}))
+    research.tavily_search("btc news", None, journal=j)
+    assert captured.get("time_range") == "week"
+    assert captured.get("topic") == "news"
+    assert "days" not in captured
+
+
+def _all_meta_keys(j):
+    import sqlite3 as _s
+    conn = _s.connect(j.db_path)
+    try:
+        return [r[0] for r in conn.execute("SELECT key FROM meta")]
+    finally:
+        conn.close()

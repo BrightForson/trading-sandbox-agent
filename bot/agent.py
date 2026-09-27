@@ -61,11 +61,20 @@ class TradingAgent:
                 return None
             fast = close.rolling(self.cfg.sma_fast).mean().iloc[-1]
             slow = close.rolling(self.cfg.sma_slow).mean().iloc[-1]
-            recent = [float(x) for x in close.tail(24)]
-            # true 24h change: 96 fifteen-minute bars (24 bars is only 6h)
+            # Bar counts must follow the configured interval. 96/24 are
+            # fifteen-minute constants: at 1Hour the "24h" change was computed
+            # over 4 days and the "6h" change over 23 hours.
+            bar_minutes = float(tf.value_count)
+            bars_6h = max(1, int(360 // bar_minutes))
+            bars_24h = max(1, int(1440 // bar_minutes))
+            recent = [float(x) for x in close.tail(bars_6h)]
+            # A window of N bars spans N-1 intervals, so the bar that is one
+            # full period back is iloc[-(N+1)]. iloc[-96] spans 95 intervals
+            # (23h45m at 15m) and was reported as 24h; the availability gate was
+            # wrong by the same one, computing a 23.75h change from 96 bars.
             change_24h = None
-            if len(close) >= 96:
-                first = float(close.iloc[-96])
+            if len(close) >= bars_24h + 1:
+                first = float(close.iloc[-(bars_24h + 1)])
                 if first > 0:
                     change_24h = (float(close.iloc[-1]) / first - 1) * 100
             return {
@@ -73,7 +82,12 @@ class TradingAgent:
                 "last_close": float(close.iloc[-1]),
                 "sma_fast": float(fast),
                 "sma_slow": float(slow),
-                "sma_gap_pct": float((fast - slow) / slow * 100),
+                # slow is a mean of closes, i.e. a price, and these are numpy
+                # floats: a zero window yields inf/nan with a RuntimeWarning
+                # rather than ZeroDivisionError, and a nan sma_gap_pct then
+                # rides into the journal and the LLM prompt. The two sibling
+                # fields already guard on their divisor.
+                "sma_gap_pct": float((fast - slow) / slow * 100) if slow else None,
                 "recent_24_bars": recent,
                 "change_6h_pct": (recent[-1] / recent[0] - 1) * 100 if recent[0] else 0.0,
                 "change_24h_pct": change_24h,
@@ -189,13 +203,32 @@ class TradingAgent:
             "btc_entry_price": btc_entry_price,
             "evaluation_horizon_hours": int(self.agent_cfg.get("evaluation_horizon_hours", 24)),
         }
-        context_json = json.dumps(context, separators=(",", ":"))
+        # allow_nan=False so a non-finite value fails here, loudly, instead of
+        # being written as the bare NaN/Infinity tokens that are not valid JSON
+        # and that json.loads on the read side silently accepts back. It has to
+        # be caught here because this call sits BEFORE log_proposal: an escaping
+        # ValueError would lose the row entirely, and run_cycle's handler only
+        # prints to the CI log, so the proposal would vanish with a green check.
+        try:
+            context_json = json.dumps(context, separators=(",", ":"),
+                                      allow_nan=False)
+        except ValueError as e:
+            print(f"[agent] non-finite price context, proposal not journaled: {e}")
+            return
         if len(context_json) > 4000:
-            # drop the bulky bar history rather than storing truncated (invalid) JSON
+            # drop the bulky bar history rather than storing truncated JSON
             trimmed = {k: v for k, v in context.items() if k != "price"}
             if price_ctx:
                 trimmed["price"] = {k: v for k, v in price_ctx.items() if k != "recent_24_bars"}
-            context_json = json.dumps(trimmed, separators=(",", ":"))[:4000]
+            context_json = json.dumps(trimmed, separators=(",", ":"),
+                                      allow_nan=False)
+            if len(context_json) > 4000:
+                # Slicing to [:4000] would cut mid-token and store unparseable
+                # JSON, which is the exact failure the trim above exists to
+                # avoid. Shed the price context entirely rather than truncate.
+                minimal = {k: v for k, v in context.items() if k != "price"}
+                context_json = json.dumps(minimal, separators=(",", ":"),
+                                          allow_nan=False)
         self.journal.log_proposal(
             timestamp=ts,
             source="ai_agent",
@@ -259,9 +292,14 @@ class TradingAgent:
                 )
             else:
                 # no shadow fill path (e.g. HOLD downgrades): keep it minimal
+                # `extra` has to appear here. A downgraded low-confidence exit
+                # and a plain HOLD idea are otherwise the same line in Discord,
+                # so the operator cannot tell that the model wanted out and was
+                # overruled — the parameter was accepted and silently dropped.
                 send_notification(
                     f"{emoji} Tier 2 AI {proposal['action']} idea: "
-                    f"{proposal.get('symbol') or 'market'} — logged, watching",
+                    f"{proposal.get('symbol') or 'market'} — logged, watching"
+                    + (f" {extra}" if extra else ""),
                     self.cfg,
                 )
         except Exception as e:
@@ -347,7 +385,7 @@ Respond with ONLY a JSON object, max 60 words total:
         Universe: Tier 1 symbols PLUS agent.scout_extra_universe (any liquid
         Binance spot coin, e.g. XRP/DOGE) — the AI's idea net is wider than
         the SMA strategy's execution scope by design."""
-        bundle = research_bundle(self.symbols, self.research_cfg)
+        bundle = research_bundle(self.symbols, self.research_cfg, journal=self.journal)
         price_ctxs = []
         for sym in self.scout_symbols:
             ctx = self._price_context(sym)
@@ -392,8 +430,7 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
         if valid["symbol"] in self.shadow._positions():
             print(f"[agent] scout proposal suppressed: already holding {valid['symbol']}")
             return []
-        recent_open = [p for p in self.journal.get_open_proposals()
-                       if p[2] == valid["symbol"]]
+        recent_open = self.journal.get_open_proposal_for_symbol(valid["symbol"])
         if recent_open:
             print(f"[agent] scout proposal suppressed: open proposal exists for {valid['symbol']}")
             return []

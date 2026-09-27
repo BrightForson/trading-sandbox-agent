@@ -9,25 +9,30 @@ import os
 import sys
 
 from bot.report import create_daily_report
-from bot.notify import send_notification
+from bot.notify import send_notification, _mask_secrets
 from bot.config import config
 
 
 def main():
     report = create_daily_report()
     print("Generated report:")
-    print(report)
+    print(_mask_secrets(report))
     print("\nSending notification...")
     failed = False
     try:
-        send_notification(report, config)
-        # delivery path check: webhook used and no file fallback written
-        # this cycle, OR we're local (file fallback is persistent here)
+        channel = send_notification(report, config)
+        # delivery path check: webhook used, OR we're local (file fallback is
+        # persistent here), OR the step summary took a copy that outlives the
+        # runner. A bare "file" on CI is NOT a verified delivery.
         on_ci = bool(os.getenv("GITHUB_STEP_SUMMARY"))
-        if on_ci:
-            print("CI: delivery verified via webhook or step summary")
+        if on_ci and channel == "file":
+            print("CI: NOT delivered — no webhook and no step-summary copy; "
+                  "data/reports is gitignored and this runner is ephemeral")
+            failed = True
+        elif on_ci:
+            print(f"CI: delivery verified via {channel}")
         else:
-            print("Notification sent successfully.")
+            print(f"Notification sent successfully ({channel}).")
     except Exception as e:
         print(f"Failed to send notification: {e}")
         failed = True

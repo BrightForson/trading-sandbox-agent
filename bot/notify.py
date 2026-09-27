@@ -7,13 +7,31 @@ from datetime import datetime
 
 from bot.errors import NotificationError
 
-_SECRET_RE = re.compile(r"discord\.com/api/webhooks/\S+|api/webhooks/\d+/\S+")
+_SECRET_RE = re.compile(
+    r"discord\.com/api/webhooks/\S+"
+    r"|api/webhooks/\d+/\S+"
+    r"|nvapi-[A-Za-z0-9_\-]+"
+    r"|gh[pousr]_[A-Za-z0-9_]+"
+    r"|github_pat_[A-Za-z0-9_]+"
+)
+# A requests exception embeds the whole URL, so a query-string credential is
+# as much of a leak as a webhook path. Keep the key visible, drop the value.
+_SECRET_QUERY_RE = re.compile(
+    r"([?&](?:api_?key|apikey|token|secret|access_token)=)[^&\s\"']+",
+    re.IGNORECASE,
+)
 
 
 def _mask_secrets(text):
-    """Strip webhook tokens (and similar URL-embedded secrets) from any
-    exception/message text before it reaches CI logs (public repo)."""
-    return _SECRET_RE.sub("api/webhooks/[REDACTED]", str(text))
+    """Strip webhook tokens and other URL/header-embedded secrets from any
+    exception/message text before it reaches CI logs (this repo is public).
+
+    The webhook pattern is not the only shape a secret arrives in, and it was
+    the only one covered: a `?api_key=` in any query string and the
+    NVIDIA/GitHub token prefixes both passed through untouched.
+    """
+    masked = _SECRET_RE.sub("[REDACTED]", str(text))
+    return _SECRET_QUERY_RE.sub(r"\1[REDACTED]", masked)
 
 
 def _post_chunk(webhook_url, chunk, max_attempts=3):
@@ -56,13 +74,22 @@ def send_notification(message, config):
     """
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
 
+    if not message or not message.strip():
+        # An empty message produced zero chunks, so the loop body never ran and
+        # the function returned as if it had delivered — no webhook post, no
+        # file, no summary, no log. The docstring promises at-least-one durable
+        # write, so refuse rather than silently succeed. Whitespace-only is not
+        # the same case: it produced one request that Discord rejected, which
+        # did reach the fallback.
+        raise NotificationError("refusing to send an empty notification")
+
     if webhook_url:
         # Discord webhooks accept max 2000 chars; split long reports
         chunks = [message[i:i+1900] for i in range(0, len(message), 1900)]
         try:
             for chunk in chunks:
                 _post_chunk(webhook_url, chunk)
-            return
+            return "webhook"
         except Exception as e:
             # Webhook failed -> degrade gracefully to file. Never print the
             # raw exception: requests errors embed the webhook URL (a secret).
@@ -74,17 +101,28 @@ def send_notification(message, config):
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"data/reports/report_{timestamp}.txt"
         with open(filename, "w") as f:
-            f.write(message)
+            f.write(_mask_secrets(message))
     except Exception as e:
         raise NotificationError(f"Failed to write report to file: {e}")
 
     # CI: surface the undelivered message in the workflow summary so it is
     # not lost when the ephemeral runner dies (data/reports is gitignored).
     summary = os.getenv("GITHUB_STEP_SUMMARY")
+    channel = "file"
     if summary:
         try:
             with open(summary, "a") as f:
                 f.write("\n## Discord notification (file fallback)\n\n```\n"
-                        + message[:60000] + "\n```\n")
-        except Exception:
-            pass
+                        + _mask_secrets(message)[:60000] + "\n```\n")
+            channel = "file+summary"
+        except Exception as e:
+            # This was `pass`, the one fully silent loss path. On CI
+            # data/reports is gitignored and the runner is ephemeral, so a
+            # failure here means the only surviving copy is about to be
+            # deleted, and the run still exited 0 claiming delivery.
+            print(f"step summary append failed (message is in "
+                  f"data/reports/ only): {_mask_secrets(e)}")
+    # The channel is returned so the caller can tell a real delivery from a
+    # write to a directory that CI is about to throw away. Returning None and
+    # letting the caller assume success is how a no-delivery day stayed green.
+    return channel

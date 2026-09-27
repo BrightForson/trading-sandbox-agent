@@ -103,7 +103,16 @@ def _atr(df, period=14):
     prev_close = close.shift()
     tr = pd.concat([high - low, (high - prev_close).abs(),
                     (low - prev_close).abs()], axis=1).max(axis=1)
-    return float(tr.rolling(period).mean().iloc[-1])
+    value = tr.rolling(period).mean().iloc[-1]
+    # Return None rather than NaN. A NaN here is silent: `not nan` is False and
+    # `nan <= 0` is False, so every `if not atr or atr <= 0` guard in this module
+    # lets it through. It then reaches the position dict, where json.dumps writes
+    # a bare NaN, and a NaN stop compares False against every bar low — so the
+    # position can never be stopped out or take profit, while
+    # `if stop <= liq` (the SL-before-liquidation safety check) is also False and
+    # skipped. The tier was left holding an unprotected 10x position. NaN also
+    # comes from a null field in a klines row, which binance_data does not dropna.
+    return float(value) if value == value and value > 0 else None
 
 
 class FuturesLedger:
@@ -174,8 +183,10 @@ class FuturesLedger:
             return {}
 
     def _save(self, cash, positions):
-        self.journal.set_meta(CASH_META, str(round(cash, 8)))
-        self.journal.set_meta(POSITIONS_META, json.dumps(positions))
+        self.journal.set_meta_many([
+            (CASH_META, str(round(cash, 8))),
+            (POSITIONS_META, json.dumps(positions)),
+        ])
 
     def _log_trade(self, symbol, action, qty, price, note="", fee=0.0):
         self.journal.log_trade(
@@ -255,7 +266,7 @@ class FuturesLedger:
         close = m15["close"]
         vol = m15["volume"]
         atr = _atr(m15, 14)
-        if not atr or atr <= 0 or close.iloc[-1] <= 0:
+        if atr is None or close.iloc[-1] <= 0:
             return None
         atr_pct = atr / float(close.iloc[-1]) * 100
         if atr_pct < self.min_atr_pct or atr_pct > self.max_atr_pct:
@@ -345,10 +356,12 @@ class FuturesLedger:
 
     def _trigger_kill(self, reason):
         count = self.kill_count() + 1
-        self.journal.set_meta(KILL_META, "on")
-        self.journal.set_meta(KILL_COUNT_META, str(count))
-        self.journal.set_meta(KILL_REASON_META, reason)
-        self.journal.set_meta(KILL_AT_META, _now_iso())
+        self.journal.set_meta_many([
+            (KILL_META, "on"),
+            (KILL_COUNT_META, str(count)),
+            (KILL_REASON_META, reason),
+            (KILL_AT_META, _now_iso()),
+        ])
         for symbol, pos in list(self._positions().items()):
             try:
                 self._close_position(symbol, note="kill flatten")
@@ -372,11 +385,13 @@ class FuturesLedger:
     def reset_kill(self, quiet=False):
         if not self.kill_active():
             return False, "no kill active"
-        self.journal.set_meta(KILL_META, "off")
-        self.journal.set_meta(KILL_REASON_META, "")
-        self.journal.set_meta(MANUAL_RESET_META, "false")
         v = self.valuation()
-        self.journal.set_meta(PEAK_META, str(round(v["equity"], 8)))
+        self.journal.set_meta_many([
+            (KILL_META, "off"),
+            (KILL_REASON_META, ""),
+            (MANUAL_RESET_META, "false"),
+            (PEAK_META, str(round(v["equity"], 8))),
+        ])
         return True, f"kill reset; futures equity ${v['equity']:.2f}, peak re-armed"
 
     # ---------------- entries ----------------
@@ -429,12 +444,27 @@ class FuturesLedger:
         if m15 is None:
             return False, f"no bars for {symbol}"
         atr = _atr(m15, 14)
-        if not atr or atr <= 0:
+        if atr is None:
             return False, "ATR unavailable"
         margin = float(margin if margin is not None else self.base_margin)
-        margin = min(margin, self.max_margin, v["cash"])
+        # The floor is checked above and the entry fee is charged below, so the
+        # clipping here has to leave room for the fee. Tier 1 and Tier 4 both
+        # size against cost+fee; Tier 5 alone did not, so a margin sized exactly
+        # to the free cash left the ledger negative by the fee after the fill.
+        rate = self.taker_fee_pct / 100.0
+        margin = min(margin, self.max_margin,
+                     v["cash"] / (1.0 + rate * self.leverage))
         if margin <= 0:
             return False, f"insufficient futures cash (${v['cash']:.2f})"
+        notional = margin * self.leverage
+        fee = notional * rate
+        # Re-check the floor against the post-fill state. equity - margin is
+        # equity once the margin is encumbered, so this is the floor the entry
+        # actually has to clear rather than one measured before it.
+        if v["cash"] - margin - fee < (v["equity"] - margin) * self.min_cash_fraction:
+            return False, (f"cash floor: entry of ${margin:.2f} margin + "
+                           f"${fee:.4f} fee would breach "
+                           f"{self.min_cash_fraction:.0%} of equity")
         entry = self._entry_prices(side, mark)
         liq = self._liquidation_price(side, entry)
         # SL must trigger before liquidation or it is fiction.
@@ -450,9 +480,7 @@ class FuturesLedger:
             tp = entry - self.tp_atr_mult * atr
             if stop >= liq:
                 return False, "SL beyond liquidation price (ATR too wide for leverage)"
-        notional = margin * self.leverage
         qty = notional / entry
-        fee = notional * self.taker_fee_pct / 100.0
         r_distance = abs(entry - stop)
         positions[symbol] = {
             "side": side,
@@ -493,7 +521,13 @@ class FuturesLedger:
             pnl = (exit_price - float(pos["entry"])) * qty
         else:
             pnl = (float(pos["entry"]) - exit_price) * qty
-        fee = float(pos["notional"]) * self.taker_fee_pct / 100.0
+        # Fee is a share of what actually transacted on this close, which is
+        # exit_price * qty. It used to be pos["notional"], the ENTRY notional, so
+        # a 2x winner paid half the exit fee it owed and a 50% loser paid double
+        # — the error scaled with the move and the journal, the booked pnl and
+        # the cash credit were all wrong in the same direction. Tier 1 and Tier 4
+        # already used the exit notional.
+        fee = exit_price * qty * self.taker_fee_pct / 100.0
         # funding was already deducted from cash at each 8h accrual —
         # deducting it from pnl again would charge the ledger twice
         # per mark (fixed 2026-09-13)
@@ -562,7 +596,7 @@ class FuturesLedger:
                 return events
             # 1) funding accrual at 8h boundaries since each position's open
             try:
-                events_f = self._accrue_funding()
+                events_f = self._accrue_funding(marks=marks)
                 if events_f:
                     events.extend(events_f)
             except Exception as e:
@@ -692,7 +726,7 @@ class FuturesLedger:
             return mark <= liq
         return mark >= liq
 
-    def _accrue_funding(self):
+    def _accrue_funding(self, marks=None):
         """Funding at 8h boundaries, accrued per-position from its open time.
 
         Longs pay (default positive funding), shorts receive. Each position
@@ -716,13 +750,27 @@ class FuturesLedger:
             new_marks = marks_due - marks_paid
             if new_marks <= 0:
                 continue
-            amount = float(pos["notional"]) * rate * new_marks
+            # Funding is a rate on the position's value, so it accrues on the
+            # mark notional, not the entry notional frozen at open. A 3x move
+            # over 12h was being charged (or credited) 3x the truth.
+            mark = (marks or {}).get(symbol) or float(pos["entry"])
+            mark_notional = float(mark) * float(pos["qty"])
+            amount = mark_notional * rate * new_marks
             pos["funding_marks_paid"] = marks_due
             pos["funding_accrued"] = float(pos.get("funding_accrued") or 0.0) + (amount if pos["side"] == "LONG" else -amount)
             cash_delta += (-amount if pos["side"] == "LONG" else amount)
+        # Persist unconditionally. The cursor lives inside the positions JSON, so
+        # gating the save on cash_delta != 0.0 discarded the advanced cursor
+        # whenever the net charge was exactly zero — which a hedged pair of
+        # equal-size opposite positions produces, since a LONG and a SHORT at the
+        # same notional cancel. The skipped marks then re-priced at the current
+        # rate in one lump, funding_accrued stayed 0.0 for the reporting
+        # scorecard, and no funding event fired, so the Discord notification
+        # added in 2ba6a09 never appeared. The total was conserved; the
+        # bookkeeping and the notification were both wrong.
         if cash_delta != 0.0:
-            self._save(self._cash() + cash_delta, positions)
             events.append({"type": "funding", "amount": round(cash_delta, 8)})
+        self._save(self._cash() + cash_delta, positions)
         return events
 
     # ---------------- LLM gate + auto entries ----------------

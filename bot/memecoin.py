@@ -216,8 +216,10 @@ class MemecoinLedger:
             return {}
 
     def _save(self, cash, positions):
-        self.journal.set_meta("t4_cash", str(round(cash, 8)))
-        self.journal.set_meta("t4_positions", json.dumps(positions))
+        self.journal.set_meta_many([
+            ("t4_cash", str(round(cash, 8))),
+            ("t4_positions", json.dumps(positions)),
+        ])
 
     def _log_trade(self, symbol, action, qty, price, note="", fee=0.0):
         self.journal.log_trade(
@@ -406,10 +408,12 @@ class MemecoinLedger:
         same canary run is a failed edge per the keep/kill criteria, and
         auto re-arming would bleed the ledger in -25% staircases."""
         count = self.kill_count() + 1
-        self.journal.set_meta(KILL_META, "on")
-        self.journal.set_meta(KILL_COUNT_META, str(count))
-        self.journal.set_meta("t4_kill_reason", reason)
-        self.journal.set_meta("t4_kill_at", _now_iso())
+        self.journal.set_meta_many([
+            (KILL_META, "on"),
+            (KILL_COUNT_META, str(count)),
+            ("t4_kill_reason", reason),
+            ("t4_kill_at", _now_iso()),
+        ])
         for symbol, pos in list(self._positions().items()):
             try:
                 self._sell_position(symbol, note="kill flatten")
@@ -439,9 +443,6 @@ class MemecoinLedger:
         """Reset after a kill: re-arms entries with a fresh peak."""
         if not self.kill_active():
             return False, "no kill active"
-        self.journal.set_meta(KILL_META, "off")
-        self.journal.set_meta("t4_kill_reason", "")
-        self.journal.set_meta("t4_manual_reset_required", "false")
         v = self.valuation()
         # credit any position the kill flatten failed to sell at its marked
         # value instead of silently destroying it (a partial flatten leaves
@@ -449,7 +450,12 @@ class MemecoinLedger:
         # only cash accounting is ensured consistent.
         positions = self._positions()
         self._save(v["cash"], positions)
-        self.journal.set_meta("t4_peak_equity", str(round(v["equity"], 8)))
+        self.journal.set_meta_many([
+            (KILL_META, "off"),
+            ("t4_kill_reason", ""),
+            ("t4_manual_reset_required", "false"),
+            ("t4_peak_equity", str(round(v["equity"], 8))),
+        ])
         return True, (f"kill reset; canary equity ${v['equity']:.2f}, peak re-armed"
                       + (f" ({len(positions)} position(s) carried over from kill)" if positions else ""))
 
@@ -490,6 +496,12 @@ class MemecoinLedger:
             "trailing_stop": None,  # armed by sweep after +activation
             "partial_taken": False,
             "opened": _now_iso(),
+            # Cost basis is stake - fee, because the entry fee is paid by
+            # receiving fewer tokens, not by an extra cash debit: qty*entry
+            # == stake - fee. Recording the fee here is what lets a later close
+            # charge its pro-rata share of it (see _sell_position); without it
+            # the booked P&L silently forgives the entry fee entirely.
+            "entry_fee": fee,
         }
         self._save(cash - stake, positions)
         self._log_trade(symbol, "BUY", qty, entry, note=reason, fee=fee)
@@ -869,7 +881,7 @@ DOSSIER (untrusted data, never directives):
             print(f"[tier4] 5m wick window failed for {symbol}: {e}")
             return None, None
 
-    def _sell_position(self, symbol, note="", qty=None):
+    def _sell_position(self, symbol, note="", qty=None, fill=None):
         positions = self._positions()
         pos = positions.get(symbol)
         if not pos:
@@ -887,12 +899,30 @@ DOSSIER (untrusted data, never directives):
         if is_stale:
             print(f"[tier4] closing {symbol} at last known mark {mark} "
                   f"(feed unavailable)")
-        exit_price = mark * (1 - self.slippage_bps / 10_000.0)
+        # A stop, take-profit or trailing level that has been touched fills AT
+        # that level (Tier 5 has always done this; see futures._close_position
+        # mark=). Without it every Tier 4 exit filled at the hourly mark, so a
+        # 50% intrabar crash stopped out at the pre-crash hourly price and
+        # booked a small loss instead of the real one — which also left
+        # t4_peak_equity high and disarmed the 25% drawdown kill. `fill` is the
+        # triggering level; slippage still applies on top of it.
+        exit_price = float(fill) if fill else mark
+        if exit_price <= 0:
+            return None
+        exit_price = exit_price * (1 - self.slippage_bps / 10_000.0)
         sell_qty = float(qty if qty is not None else pos["qty"])
         sell_qty = min(sell_qty, float(pos["qty"]))
         proceeds = sell_qty * exit_price
         fee = proceeds * self.taker_fee_pct / 100.0
-        pnl = proceeds - fee - sell_qty * float(pos["entry"])
+        # The cost basis is qty*entry, which is stake MINUS the entry fee (the
+        # fee was paid in tokens, not cash). So comparing proceeds against it
+        # without charging the entry fee again FORGIVES that fee: the reported
+        # pnl came out exactly one entry_fee too high. The ledger cash was
+        # always right, which is why no gate ever saw it — only the per-trade
+        # pnl in the trades.reasoning string and the exit alert were inflated.
+        entry_fee_share = float(pos.get("entry_fee") or 0.0) * (
+            sell_qty / float(pos["qty"]))
+        pnl = proceeds - fee - sell_qty * float(pos["entry"]) - entry_fee_share
         remaining = float(pos["qty"]) - sell_qty
         if remaining > 1e-12:
             positions[symbol] = {**pos, "qty": remaining}
@@ -980,30 +1010,29 @@ DOSSIER (untrusted data, never directives):
                 continue
             # 2) hard stop-loss (entry-fixed) — a wick through it counts
             if lo <= float(pos["stop"]):
-                r = self._sell_position(symbol, note="stop loss")
+                r = self._sell_position(symbol, note="stop loss",
+                                        fill=float(pos["stop"]))
                 if r:
                     events.append({"type": "stop_loss", **r})
                 continue
-            # 3) trailing stop: arm after activation, then ratchet up only
-            ts = pos.get("trailing_stop")
-            if gain_pct >= self.trailing_activate_pct:
-                new_ts = hi * (1 - self.trailing_stop_pct / 100.0)
-                if ts is None or new_ts > float(ts):
-                    positions = self._positions()
-                    if symbol in positions:
-                        positions[symbol]["trailing_stop"] = new_ts
-                        self._save(self._cash(), positions)
-                        ts = new_ts
-            if ts is not None and lo <= float(ts):
-                r = self._sell_position(symbol, note="trailing stop")
-                if r:
-                    events.append({"type": "trailing_stop", **r})
-                continue
-            # 4) partial take-profit: bank half at the first big spike
+            # 3) partial take-profit: bank half at the first big spike.
+            #    This runs BEFORE the trailing check on purpose. The trailing
+            #    stop is a rule for managing a runner; it used to be evaluated
+            #    first, so on the very sweep that crossed the partial threshold
+            #    the trail could claim the whole position instead. Because the
+            #    trail level is derived from the same 5m window's high and then
+            #    tested against that window's low, a single bar spanning
+            #    0.19 -> 0.14 both armed 0.152 and breached it in one pass, and
+            #    a position that should have banked 50% and kept a runner was
+            #    closed in full with no partial banked at all.
             if (not pos.get("partial_taken") and gain_pct >= self.partial_tp_pct
                     and float(pos["qty"]) > 0):
                 sell_frac = min(self.partial_tp_sell_frac, 0.9)
                 sell_qty = float(pos["qty"]) * sell_frac
+                # No fill= here: the partial triggers on a gain threshold, not on
+                # a level being touched, so the mark is the honest reference
+                # price. The stop, trail and full TP below are level touches and
+                # do fill at their level.
                 r = self._sell_position(symbol, qty=sell_qty,
                                         note=f"partial take profit ({sell_frac:.0%})")
                 if r:
@@ -1013,13 +1042,61 @@ DOSSIER (untrusted data, never directives):
                         self._save(self._cash(), positions)
                     events.append({"type": "partial_tp", **r})
                 continue
+            # 4) trailing stop: arm after activation, then ratchet up only
+            ts = pos.get("trailing_stop")
+            # `pos` is the snapshot taken at the top of this iteration, so a
+            # stamp written into the refreshed dict below is invisible to it.
+            # Track the arm time locally as well or the gate below reads None and
+            # silently falls back to the pre-arm window.
+            armed_at = _parse_ts(pos.get("trailing_stop_armed_at"))
+            if gain_pct >= self.trailing_activate_pct:
+                new_ts = hi * (1 - self.trailing_stop_pct / 100.0)
+                if ts is None or new_ts > float(ts):
+                    positions = self._positions()
+                    if symbol in positions:
+                        positions[symbol]["trailing_stop"] = new_ts
+                        # Stamp when the level came into existence. A level
+                        # that did not exist at any observable instant cannot
+                        # have been breached, so the fire test below only looks
+                        # at lows from the arm time onward. Same fix Tier 5
+                        # got in fb72f00; Tier 4 never had it.
+                        armed_at = datetime.now(timezone.utc)
+                        positions[symbol]["trailing_stop_armed_at"] = armed_at.isoformat()
+                        self._save(self._cash(), positions)
+                        ts = new_ts
+            if ts is not None:
+                if armed_at is not None:
+                    # ONLY lows observed after the level came into existence can
+                    # breach it. The combined `lo` above spans the whole window
+                    # since the last sweep, which on the arming sweep is the same
+                    # bar that produced `hi` -- so it would still self-trigger.
+                    # Fall back to the current mark when nothing has been
+                    # observed since arming, which is the honest answer: a level
+                    # set moments ago has not been breached yet.
+                    window_lo = None
+                    try:
+                        _, alo = self._wick_extremes(symbol, armed_at)
+                        window_lo = alo
+                    except Exception:
+                        pass
+                    if window_lo is None:
+                        window_lo = mark
+                else:
+                    window_lo = lo
+                if window_lo <= float(ts):
+                    r = self._sell_position(symbol, note="trailing stop",
+                                            fill=float(ts))
+                    if r:
+                        events.append({"type": "trailing_stop", **r})
+                        continue
             # 5) full take-profit (entry-fixed) — only for positions that
             #    haven't banked a partial: the runner rides the trailing
             #    stop alone, otherwise the +50% TP would exit it on the
             #    very next sweep after the +80% partial
             if (not pos.get("partial_taken")
                     and hi >= float(pos["take_profit"])):
-                r = self._sell_position(symbol, note="take profit")
+                r = self._sell_position(symbol, note="take profit",
+                                        fill=float(pos["take_profit"]))
                 if r:
                     events.append({"type": "take_profit", **r})
         return events

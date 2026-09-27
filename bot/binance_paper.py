@@ -93,9 +93,11 @@ class BinancePaperBroker:
             return {}
 
     def _save(self, cash, positions, next_id):
-        self.journal.set_meta("paper_cash", str(round(cash, 8)))
-        self.journal.set_meta("paper_positions", json.dumps(positions))
-        self.journal.set_meta("paper_next_order_id", str(next_id))
+        self.journal.set_meta_many([
+            ("paper_cash", str(round(cash, 8))),
+            ("paper_positions", json.dumps(positions)),
+            ("paper_next_order_id", str(next_id)),
+        ])
 
     def _next_order_id(self):
         v = self.journal.get_meta("paper_next_order_id")
@@ -269,11 +271,15 @@ class BinancePaperBroker:
         ledger = {sym: {"qty": float(p["qty"]), "entry": float(p["entry"])}
                   for sym, p in positions.items()}
         self._save(float(cash), ledger, self._next_order_id())
-        self.journal.set_meta("paper_seeded_at", datetime.now(timezone.utc).isoformat())
-        self.journal.set_meta("paper_epoch_start_cash", str(float(cash)))
+        self.journal.set_meta_many([
+            ("paper_seeded_at", datetime.now(timezone.utc).isoformat()),
+            ("paper_epoch_start_cash", str(float(cash))),
+        ])
 
     def seed_fresh(self, cash):
         self._clear_all_stops()
         self._save(float(cash), {}, self._next_order_id())
-        self.journal.set_meta("paper_seeded_at", datetime.now(timezone.utc).isoformat())
-        self.journal.set_meta("paper_epoch_start_cash", str(float(cash)))
+        self.journal.set_meta_many([
+            ("paper_seeded_at", datetime.now(timezone.utc).isoformat()),
+            ("paper_epoch_start_cash", str(float(cash))),
+        ])
