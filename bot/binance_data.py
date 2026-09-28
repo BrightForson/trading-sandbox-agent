@@ -204,7 +204,6 @@ class BinanceDataClient:
         Binance serves 1000 klines/request ending at endTime; we walk the
         endTime back until the requested window is filled.
         """
-        iv = interval_minutes(interval) * 60_000
         end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         start_ms = end_ms - int(days) * 86_400_000
         frames = []

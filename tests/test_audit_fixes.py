@@ -7,6 +7,35 @@ Commit 1 (gate correctness): Tier 1 drawdown must not mix ledgers (epoch
 filter), the losing-week streak must use the right column indices, the
 Tier 3 gate must read a win rate that bet_scorecard actually returns, and
 a split round trip must be scored once rather than per partial sell.
+
+Commit 2 (criticals): a trailing stop must be judged only on bars since its
+level was armed; a live kill must not suspend exit enforcement; an unpriceable
+position must not vanish from equity; volatility must be annualized; RSI must
+actually be computable.
+
+Commit 3 (silent fallbacks): interval mapping must be idempotent and total, a
+non-positive mark is no usable price rather than a total loss, a None model
+response must not be subscripted, a NaN notional must be rejected, and the LLM
+must not be asked to echo a question string byte-for-byte.
+
+Commit 4 (medium): the journal must close its connections and save a tier's
+cash+positions in one transaction; _ensure_columns must refuse unknown
+identifiers; get_open_proposals must be bounded but the per-symbol suppression
+check must not be; a NaN ATR must not become a NaN stop; Tier 5 must reserve
+the entry fee and charge the exit fee on the exit notional; the funding cursor
+must survive a zero-delta cycle; Tier 4 must charge the entry fee in its booked
+P&L, fill at the level that triggered the exit, and let the partial take-profit
+precede the trailing stop; agent context must use interval-aware bar counts and
+refuse a non-finite value; notify must not silently drop a message; the pain
+meter must flag a dead workflow; the scanner must paginate; research must use
+the caller's journal and request a recency window.
+
+Commit 5 (low): the shadow account must mark and fill on the last CLOSED bar,
+not the still-forming one; a corrupt cash or equity-peak meta key must be
+refused rather than read as unlimited buying power or as "no drawdown"; the
+paper broker must not write a non-finite balance; the strategy contract must
+be validated where signals are produced and an unknown strategy name must
+raise; no module may stamp a naive local clock.
 """
 import os
 import sys
@@ -1577,6 +1606,396 @@ def test_tavily_requests_a_recency_window(monkeypatch, tmp_path):
     assert captured.get("time_range") == "week"
     assert captured.get("topic") == "news"
     assert "days" not in captured
+
+
+# ================= commit 5: low =================
+
+
+class _ShadowCfg:
+    symbols = ["BTC/USD"]
+    timeframe = "1Hour"
+    lookback_bars = 60
+    agent = {"shadow_start_cash": 80, "shadow_max_per_position": 40}
+
+
+class _FormingBarBroker:
+    """Bars whose last row is the still-forming candle.
+
+    Binance and Alpaca both append the in-progress bar; the repo drops it
+    everywhere else (agent._price_context, trader, futures, and binance_data's
+    own last_close helper all read iloc[-2] or iloc[:-1]).
+    """
+
+    def __init__(self, closed=100.0, forming=180.0):
+        self.closed = closed
+        self.forming = forming
+
+    def get_crypto_bars(self, symbol, timeframe, limit):
+        idx = pd.date_range(end=datetime.now(timezone.utc), periods=4, freq="1h", tz="UTC")
+        closes = [self.closed - 2, self.closed - 1, self.closed, self.forming]
+        return pd.DataFrame({"open": closes, "high": closes, "low": closes,
+                             "close": closes, "volume": [1.0] * 4}, index=idx)
+
+    def last_close(self, symbol, interval="15m", limit=2):
+        return self.closed
+
+
+def _shadow(tmp_path, closed=100.0, forming=180.0):
+    from bot.shadow import ShadowAccount
+    j = TradeJournal(db_path=str(tmp_path / "shadow.db"))
+    return ShadowAccount(_ShadowCfg, _FormingBarBroker(closed, forming), journal=j)
+
+
+# ---------------- the shadow account must price off a closed bar ----------------
+
+def test_shadow_marks_to_the_last_closed_bar(tmp_path):
+    """The shadow account marked equity off the still-forming candle.
+
+    _last_close read iloc[-1], so a virtual position, the reported shadow
+    equity and the Tier 1 heartbeat money line all carried a price that could
+    still move until the hour boundary. A forming close 80% above the last
+    closed bar was booked as a real gain.
+    """
+    acc = _shadow(tmp_path, closed=100.0, forming=180.0)
+    acc.journal.set_meta("shadow_cash", "0.0")
+    acc.journal.set_meta("shadow_positions", '{"BTC/USD": {"qty": 0.5, "entry": 90.0, "opened": "x"}}')
+
+    equity, cash, block = acc.mark_to_market()
+
+    assert equity == pytest.approx(50.0, abs=1e-9)
+    assert "$100.00" in block
+
+
+def test_shadow_fills_at_the_last_closed_bar(tmp_path):
+    """A virtual fill priced on the forming bar is not a price the market gave."""
+    acc = _shadow(tmp_path, closed=100.0, forming=180.0)
+
+    ok, _note = acc.take_buy("BTC/USD", 40)
+
+    assert ok
+    assert acc._positions()["BTC/USD"]["entry"] == pytest.approx(100.0, abs=1e-9)
+    assert acc._cash() == pytest.approx(40.0, abs=1e-9)
+
+
+# ---------------- corrupt cash/peak meta must not become buying power ----------------
+
+class _CashCfg:
+    """One config satisfying all four ledgers, so _cash() is testable uniformly."""
+
+    symbols = ["BTC/USD"]
+    timeframe = "1Hour"
+    lookback_bars = 60
+    agent = _ShadowCfg.agent
+    execution = {"taker_fee_pct": 0.1, "slippage_bps": 8}
+    broker = {"name": "binance_paper", "paper": {"start_cash": 20},
+              "taker_fee_pct": 0.1, "slippage_bps": 8}
+    futures = _T5Cfg.futures
+    memecoin = _T4Cfg.memecoin
+
+
+def _cash_ledgers(tmp_path):
+    """(label, ledger, cash meta key) for every tier that keeps cash in meta."""
+    from bot.binance_paper import BinancePaperBroker
+    from bot.futures import FuturesLedger
+    from bot.memecoin import MemecoinLedger
+    from bot.shadow import ShadowAccount
+    j = TradeJournal(db_path=str(tmp_path / "cash.db"))
+    paper = BinancePaperBroker(_CashCfg, journal=j)
+    paper.data = _FormingBarBroker()
+    return [
+        ("shadow", ShadowAccount(_CashCfg, _FormingBarBroker(), journal=j), "shadow_cash"),
+        ("paper", paper, "paper_cash"),
+        ("tier5", FuturesLedger(_CashCfg, journal=j), "t5_cash"),
+        ("tier4", MemecoinLedger(_CashCfg, journal=j), "t4_cash"),
+    ]
+
+
+def test_missing_cash_meta_is_a_fresh_ledger_not_a_corrupt_one(tmp_path):
+    """No cash row yet means the ledger has never traded, not that cash is lost."""
+    for label, led, _key in _cash_ledgers(tmp_path):
+        assert led._cash() == pytest.approx(led.start_cash), label
+
+
+@pytest.mark.parametrize("bad", ["", "None", "1,000", "nan", "inf", "-inf"])
+def test_corrupt_cash_meta_is_refused_instead_of_becoming_buying_power(tmp_path, bad):
+    """A cash key that reads back as text or NaN must fail loudly, not spend.
+
+    float(v) raised a bare ValueError on unparseable text and returned NaN for
+    "nan" -- and every sizing guard passes NaN, because `nan > cap` and
+    `nan <= 0` are both False. A corrupt ledger therefore read as unlimited
+    buying power; the unparseable case instead died somewhere far away with no
+    mention of the key that was actually broken.
+    """
+    from bot.errors import JournalError
+    for label, led, key in _cash_ledgers(tmp_path):
+        led.journal.set_meta(key, bad)
+        with pytest.raises(JournalError) as ei:
+            led._cash()
+        assert key in str(ei.value), label
+
+
+def test_corrupt_peak_meta_does_not_silently_disable_the_drawdown_kill(tmp_path):
+    """A NaN peak read as "no drawdown", disarming Tier 5's 25% kill.
+
+    _drawdown_hit returns False when peak is None or <= 0, and a NaN peak
+    satisfies neither branch -- then `(nan - equity) / nan * 100 >= pct` is
+    False too, so the kill could never fire.
+    """
+    from bot.errors import JournalError
+    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0})
+    j.set_meta("t5_cash", "5.0")
+    j.set_meta("t5_peak_equity", "nan")
+
+    with pytest.raises(JournalError) as ei:
+        led._drawdown_hit(1.0)
+    assert "t5_peak_equity" in str(ei.value)
+
+
+# ---------------- the paper broker must not write a non-finite cash ----------------
+
+def test_paper_broker_refuses_a_non_finite_quantity(tmp_path):
+    """A NaN quantity poisoned paper_cash permanently.
+
+    `qty <= 0` and `cost + fee > cash` are both False for NaN, so both guards
+    passed, and _save persisted str(round(nan, 8)) == "nan" as the balance.
+    Every later read of that ledger returned NaN cash, which reads as free
+    money to every guard downstream.
+    """
+    from bot.binance_paper import BinancePaperBroker
+    from bot.errors import BrokerError
+    j = TradeJournal(db_path=str(tmp_path / "paper.db"))
+    b = BinancePaperBroker(_CashCfg, journal=j)
+    b.data = _FormingBarBroker()
+
+    for side in ("BUY", "SELL"):
+        with pytest.raises(BrokerError):
+            b.place_order("BTC/USD", float("nan"), side)
+    assert b._cash() == pytest.approx(20.0, abs=1e-9)
+    assert j.get_meta("paper_cash") is None
+
+
+def test_paper_broker_clips_an_oversized_sell_to_the_held_qty(tmp_path):
+    """Coverage for the clipping the audit flagged: it was already correct.
+
+    Recorded so the behaviour is pinned rather than "fixed" -- an audit pass
+    that re-reports this will find a test asserting the good behaviour.
+    """
+    from bot.binance_paper import BinancePaperBroker
+    j = TradeJournal(db_path=str(tmp_path / "paper.db"))
+    b = BinancePaperBroker(_CashCfg, journal=j)
+    b.data = _FormingBarBroker()
+    b.place_order("BTC/USD", 0.10, "BUY")
+
+    order = b.place_order("BTC/USD", 5.0, "SELL")
+
+    assert float(order.filled_qty) == pytest.approx(0.10, abs=1e-12)
+    assert b._positions() == {}
+
+
+# ---------------- the strategy contract must be checked, not assumed ----------------
+
+def test_unknown_crossover_signal_is_a_no_op_not_a_sell(monkeypatch):
+    """sma_cross fell through to SELL for anything that was not "golden".
+
+    A renamed or misspelt signal string therefore sold the position instead of
+    doing nothing -- the worst possible default for a fail-to-parse input.
+    """
+    from bot import strategies
+    cfg = type("C", (), {"sma_fast": 20, "sma_slow": 50})()
+    df = pd.DataFrame({"close": [1.0] * 60})
+
+    monkeypatch.setattr(strategies, "check_crossover",
+                        lambda *a, **k: ("goldan", 1.0, 2.0, 3.0, 4.0))
+    assert strategies.sma_cross("BTC/USD", df, cfg) == []
+
+    monkeypatch.setattr(strategies, "check_crossover",
+                        lambda *a, **k: ("death", 1.0, 2.0, 3.0, 4.0))
+    assert strategies.sma_cross("BTC/USD", df, cfg)[0]["action"] == "SELL"
+
+
+def test_signal_shape_is_validated_where_it_is_produced():
+    """The signal contract was stringly typed and never checked.
+
+    The consumer matched action by equality and fell through to "no action
+    needed", so a signal naming an action the executor did not implement was
+    reported as a decision rather than as the silent no-op it was.
+    """
+    from bot.strategies import _signal
+
+    with pytest.raises(ValueError) as ei:
+        _signal("HOLD", "BTC/USD", "notional", "reason")
+    assert "HOLD" in str(ei.value)
+
+    with pytest.raises(ValueError) as ei:
+        _signal("BUY", "BTC/USD", "half_position", "reason")
+    assert "half_position" in str(ei.value)
+
+    assert _signal("BUY", "BTC/USD", "notional", "reason")["action"] == "BUY"
+
+
+def test_unknown_strategy_name_raises_instead_of_trading_nothing():
+    """A typo in active_strategies used to produce a green, trade-free cycle.
+
+    get_strategies printed a warning and skipped, leaving an empty list; the
+    trader then printed "No strategies registered" and the cycle exited 0, so
+    a dead configuration looked exactly like a quiet market.
+    """
+    from bot.strategies import get_strategies
+
+    with pytest.raises(ValueError) as ei:
+        get_strategies(["sma_cross", "sma_cros"])
+
+    assert "sma_cros" in str(ei.value)
+    assert "sma_cross" in str(ei.value)
+
+
+# ---------------- the Tier 5 trend guard must partition by symbol ----------------
+
+def test_trend_guard_partitions_signals_by_symbol(tmp_path):
+    """Eligible-vs-skipped was decided by dict equality, at O(n*m).
+
+    `s not in eligible` compares signal dicts by value, so two signals with
+    equal contents would both be judged eligible and the skip would go
+    unprinted -- the only reason it cannot happen today is that each signal
+    carries a distinct symbol. Keying on the symbol makes the partition exact
+    and costs one pass.
+    """
+    led, _j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0})
+    held = {"ETH/USD": {"qty": 1.0, "entry": 100.0, "side": "LONG"}}
+
+    a = {"symbol": "BTC/USD", "side": "LONG", "atr": 1.0}
+    b = {"symbol": "SOL/USD", "side": "LONG", "atr": 1.0}
+    c = {"symbol": "ETH/USD", "side": "LONG", "atr": 1.0}
+
+    eligible, skipped = led._partition_eligible([a, b, c], held)
+
+    assert [s["symbol"] for s in eligible] == ["BTC/USD", "SOL/USD"]
+    assert [s["symbol"] for s in skipped] == ["ETH/USD"]
+
+    twin = dict(a)
+    eligible, skipped = led._partition_eligible([a, twin], {"BTC/USD": held["ETH/USD"]})
+    assert eligible == []
+    assert len(skipped) == 2
+
+
+# ---------------- a dead local must not shadow the real argument ----------------
+
+def test_fetch_history_forwards_the_requested_interval_verbatim(monkeypatch):
+    """A dead local held a millisecond width under the name `iv`.
+
+    Nothing read it -- the paging loop passes `interval` through -- but `iv`
+    conventionally means implied volatility, so the line invited a future
+    "fix" that handed 900000 to the Binance interval parameter. Pin the
+    argument that is real.
+    """
+    import bot.binance_data as bd
+    seen = []
+
+    def _fake_get_klines(symbol, interval="15m", limit=1000, end_time=None):
+        seen.append(interval)
+        return None
+
+    monkeypatch.setattr(bd, "get_klines", _fake_get_klines)
+    bd.BinanceDataClient().fetch_history("BTCUSD", days=1, interval="1h")
+
+    assert seen == ["1h"]
+
+
+# ---------------- timestamps must not be local time ----------------
+
+def test_no_module_calls_a_naive_clock():
+    """42 call sites stamped datetime.now() into logs, headers and filenames.
+
+    The journal writes UTC everywhere and gates.py re-tagging a naive value as
+    UTC is what hid this, so a CI log interleaving local and UTC stamps could
+    not be lined up against the rows it described -- and on any non-UTC host
+    the daily report's own header disagreed with every timestamp in its body.
+    The repo has no linter, so this is the invariant test.
+    """
+    import ast
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    files = sorted(root.glob("bot/*.py")) + sorted(root.glob("*.py")) \
+        + sorted(root.glob("tools/*.py"))
+    assert files
+    offenders = []
+    for path in files:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr not in ("now", "utcnow"):
+                continue
+            if ast.unparse(func.value) == "datetime" and not node.args and not node.keywords:
+                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert not offenders, f"naive local clock: {offenders}"
+
+
+def test_daily_report_header_stamp_is_utc(monkeypatch):
+    """The report header was the one local-time stamp in a UTC document.
+
+    On a UTC host the bug is invisible, so the clock is injected: a host three
+    hours behind UTC must still produce a header that matches UTC.
+    """
+    import bot.report as report
+
+    class _ThreeHoursBehind:
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return datetime(2026, 9, 27, 12, 0, 0)
+            return datetime(2026, 9, 27, 15, 0, 0, tzinfo=timezone.utc)
+
+    class _NoTrades:
+        def get_trades(self, *_a, **_k):
+            return []
+
+    monkeypatch.setattr(report, "datetime", _ThreeHoursBehind)
+    monkeypatch.setattr(report, "TradeJournal", lambda *a, **k: _NoTrades())
+    monkeypatch.setattr(report, "account_snapshot", lambda: "acct")
+    monkeypatch.setattr(report, "shadow_snapshot", lambda: "shadow")
+
+    out = report.create_daily_report()
+
+    assert out.splitlines()[1].strip() == "2026-09-27 15:00:00"
+
+
+# ---------------- docstrings that no longer describe the code ----------------
+
+def test_shadow_module_docstring_names_the_table_it_actually_uses():
+    """The docstring promised a `shadow_trades` table that does not exist.
+
+    `shadow_trades` appeared exactly once in the repo: the comment itself.
+    Shadow state lives in `trades` -- found back by the "[shadow-account]"
+    reasoning prefix -- plus the two meta keys the comment did name.
+    """
+    import inspect
+
+    import bot.shadow as shadow
+
+    assert "shadow_trades" not in shadow.__doc__
+    assert "[shadow-account]" in shadow.__doc__
+    assert "shadow_cash" in shadow.__doc__ and "shadow_positions" in shadow.__doc__
+
+    # the prefix is what the read side actually filters on
+    assert '"[shadow-account]"' in inspect.getsource(shadow.ShadowAccount.realized_pnl)
+
+
+def test_no_comment_still_claims_a_three_symbol_tier1_universe():
+    """A hard-scope comment naming BTC/ETH/SOL sat over a ten-symbol universe.
+
+    The scope is enforced from cfg.symbols, so the comment drifted silently
+    every time the universe grew -- and it sat directly above the list a
+    reader would trust.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders = [f"{p.name}:{i}" for p in sorted(root.glob("bot/*.py"))
+                 for i, line in enumerate(p.read_text().splitlines(), 1)
+                 if "BTC/ETH/SOL" in line and not line.lstrip().startswith("#!")]
+    assert not offenders, offenders
 
 
 def _all_meta_keys(j):

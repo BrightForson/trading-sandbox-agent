@@ -202,8 +202,7 @@ class MemecoinLedger:
     # ---------------- state (journal meta) ----------------
 
     def _cash(self):
-        v = self.journal.get_meta("t4_cash")
-        return float(v) if v is not None else self.start_cash
+        return self.journal.get_meta_float("t4_cash", self.start_cash)
 
     def _positions(self):
         raw = self.journal.get_meta("t4_positions")

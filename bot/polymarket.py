@@ -328,7 +328,7 @@ def scan(cfg, journal=None, model=None):
     if not scanner_cfg.get("enabled", True):
         print("[scanner] disabled in config — skipping cycle")
         return {"paper_finds": [], "watchlist": [], "bust": False}
-    print(f"[{datetime.now()}] Scanner cycle starting (paper bets only)")
+    print(f"[{datetime.now(timezone.utc)}] Scanner cycle starting (paper bets only)")
     wallet = BettingWallet(cfg, journal=journal)
     wallet_bust = wallet.is_bust()
     raw_markets = _fetch_markets(limit=100)
@@ -394,7 +394,7 @@ def scan(cfg, journal=None, model=None):
 
     if watchlist:
         print(f"[scanner] {len(watchlist)} near-resolution favorites kept as watchlist only")
-    print(f"[{datetime.now()}] Scanner done: {len(paper_finds)} EV-qualified finds, watchlist={len(watchlist)}")
+    print(f"[{datetime.now(timezone.utc)}] Scanner done: {len(paper_finds)} EV-qualified finds, watchlist={len(watchlist)}")
     return {"paper_finds": paper_finds, "watchlist": watchlist, "bust": wallet_bust}
 
 

@@ -3,7 +3,7 @@ import re
 import time
 
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 from bot.errors import NotificationError
 
@@ -98,7 +98,7 @@ def send_notification(message, config):
     # Fallback to file
     try:
         os.makedirs("data/reports", exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"data/reports/report_{timestamp}.txt"
         with open(filename, "w") as f:
             f.write(_mask_secrets(message))

@@ -33,7 +33,9 @@ class TradingAgent:
         self.model = model or ModelManager(journal=self.journal)
         self.agent_cfg = getattr(cfg, "agent", None) or {}
         self.research_cfg = getattr(cfg, "research", None) or {}
-        # Tier 1 execution universe (hard scope: BTC/ETH/SOL)
+        # Tier 1 execution universe: exactly cfg.symbols, which is the hard
+        # scope. The comment used to name three coins and the list has been ten
+        # for some time, so the count lives in config.yaml and not here.
         self.symbols = list(cfg.symbols)
         # Tier 2 scout universe: Tier 1 symbols + configurable extra coins
         # (any liquid Binance spot pair) the AI may propose ideas on
@@ -444,7 +446,7 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
 
     def run_cycle(self):
         """One agent cycle: health check, babysit open positions, scout for new trades."""
-        print(f"[{datetime.now()}] Agent cycle starting (shadow={self.agent_cfg.get('shadow', True)})")
+        print(f"[{datetime.now(timezone.utc)}] Agent cycle starting (shadow={self.agent_cfg.get('shadow', True)})")
         self.model.daily_health_check()
         evaluated = self.evaluate_due_proposals()
         proposals = []
@@ -458,7 +460,7 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
                 proposals += self.scout()
             except Exception as e:
                 print(f"[agent] scout error: {e}")
-        print(f"[{datetime.now()}] Agent cycle done: {len(proposals)} actionable proposals, {evaluated} evaluated")
+        print(f"[{datetime.now(timezone.utc)}] Agent cycle done: {len(proposals)} actionable proposals, {evaluated} evaluated")
         # per-cycle Tier 2 money line to Discord
         try:
             from bot.brief import money_line, emoji_for

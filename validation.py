@@ -6,7 +6,7 @@ strategy registry, risk engine, journal (trades/proposals/bets), model manager
 health + JSON roundtrip, research tools, notifications file fallback.
 No orders are placed.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 from bot.config import config
 from bot.broker import make_broker
@@ -83,7 +83,7 @@ def main():
     print("[8/8] notification fallback (file)...")
     import os
     os.environ.pop("DISCORD_WEBHOOK_URL", None)
-    send_notification(f"validation run {datetime.now().isoformat()}", config)
+    send_notification(f"validation run {datetime.now(timezone.utc).isoformat()}", config)
     print("      file fallback written (data/reports/)")
 
     print("=== ALL CHECKS PASSED ===")

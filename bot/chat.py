@@ -2,8 +2,10 @@
 
 Reads recent messages in the webhook's channel via REST (no gateway needed),
 lets the agent answer questions with live data, replies through the same
-channel using the bot token. Runs on its own 5-min cron — never collides
-with the 15-min trading cron.
+channel using the bot token. The workflow's own cron is 15-min
+(9,24,39,54), offset 5 min from the trading cron so the two never collide;
+because GitHub's scheduler under-delivers 15-min crons, the local crontab
+pinger dispatches this workflow instead and the native cron is the fallback.
 
 Safety: chat is READ-ONLY for trading decisions. No matter what is asked,
 this module never places orders. It can only answer with data + analysis.

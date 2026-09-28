@@ -12,10 +12,10 @@ position and order objects so _execute_signal and every consumer
 (risk, chat, report, agent, validation) work unchanged.
 """
 import json
-import time as _time
+import math
 from datetime import datetime, timezone
 
-from bot.binance_data import BinanceDataClient, interval_minutes, _interval_for
+from bot.binance_data import BinanceDataClient, _interval_for
 from bot.errors import BrokerError
 
 
@@ -80,8 +80,7 @@ class BinancePaperBroker:
     # ---------------- state (journal meta) ----------------
 
     def _cash(self):
-        v = self.journal.get_meta("paper_cash")
-        return float(v) if v is not None else self.start_cash
+        return self.journal.get_meta_float("paper_cash", self.start_cash)
 
     def _positions(self):
         raw = self.journal.get_meta("paper_positions")
@@ -174,6 +173,12 @@ class BinancePaperBroker:
     def place_order(self, symbol, qty, side):
         side = str(side).upper()
         qty = float(qty)
+        # A non-finite qty passes every guard below -- `qty <= 0` and
+        # `cost + fee > cash` are both False for NaN -- and would then be
+        # persisted by _save as the string "nan", permanently poisoning the
+        # cash balance for every later read.
+        if not math.isfinite(qty):
+            raise BrokerError(f"Invalid {side} quantity {qty!r} for {symbol}")
         mark = self._mark(symbol)
         if mark is None:
             raise BrokerError(f"No price available for {symbol}")

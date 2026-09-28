@@ -92,8 +92,14 @@ def send_heartbeat(broker, journal):
         equity = float(acct.equity)
         delta = equity - start_cash
 
+        # The heartbeat label used to hardcode the three-coin universe it was
+        # written against, which stopped being true when symbols grew to ten.
+        # Derive the count from the configured list so the money line cannot
+        # misdescribe the account.
+        _n = len(getattr(config, "symbols", None) or [])
+        tier1_label = f"Tier 1 ({_n} coin{'s' if _n != 1 else ''})"
         lines = [f"🫀 {emoji_for(delta)} "
-                 f"{money_line('Tier 1 BTC/ETH/SOL', equity, start_cash)}"]
+                 f"{money_line(tier1_label, equity, start_cash)}"]
         if positions:
             # activity: open positions with unrealized P&L each
             for p in positions:
@@ -118,10 +124,10 @@ def send_heartbeat(broker, journal):
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 epoch=0, cash=cash_now, locked=positions_value, equity=equity_now)
         except Exception as snap_err:
-            print(f"[{datetime.now()}] Tier 1 equity snapshot failed: {snap_err}")
-        print(f"[{datetime.now()}] Heartbeat sent (hour {current_hour})")
+            print(f"[{datetime.now(timezone.utc)}] Tier 1 equity snapshot failed: {snap_err}")
+        print(f"[{datetime.now(timezone.utc)}] Heartbeat sent (hour {current_hour})")
     except Exception as e:
-        print(f"[{datetime.now()}] Heartbeat failed (will retry next cycle): {e}")
+        print(f"[{datetime.now(timezone.utc)}] Heartbeat failed (will retry next cycle): {e}")
 
 
 # ---------------- persistent strategy state ----------------
@@ -338,19 +344,19 @@ def _catchup_signal(holding, relation, prev_relation, fresh_cross):
 
 def run_trading_cycle():
     """Run one trading cycle for all symbols across all registered strategies."""
-    print(f"[{datetime.now()}] Starting trading cycle...")
+    print(f"[{datetime.now(timezone.utc)}] Starting trading cycle...")
 
     # Initialize components
     try:
         broker = make_broker(config)
         journal = TradeJournal()
     except Exception as e:
-        print(f"[{datetime.now()}] Failed to initialize components: {e}")
+        print(f"[{datetime.now(timezone.utc)}] Failed to initialize components: {e}")
         return
 
     strategies = get_strategies(getattr(config, "active_strategies", ["sma_cross"]))
     if not strategies:
-        print(f"[{datetime.now()}] No strategies registered — nothing to do")
+        print(f"[{datetime.now(timezone.utc)}] No strategies registered — nothing to do")
         return
 
     risk_engine = RiskEngine(config, broker, journal)
@@ -364,23 +370,23 @@ def run_trading_cycle():
         try:
             df = broker.get_crypto_bars(symbol, timeframe, config.lookback_bars)
             if df is None or df.empty:
-                print(f"[{datetime.now()}] No data for {symbol}")
+                print(f"[{datetime.now(timezone.utc)}] No data for {symbol}")
                 continue
             # Drop the still-forming (unclosed) bar: signals must use closed bars only
             df = df.iloc[:-1]
             bars_by_symbol[symbol] = df
         except BrokerError as e:
-            print(f"[{datetime.now()}] Broker error fetching {symbol}: {e}")
+            print(f"[{datetime.now(timezone.utc)}] Broker error fetching {symbol}: {e}")
         except Exception as e:
-            print(f"[{datetime.now()}] Unexpected fetch error for {symbol}: {e}")
+            print(f"[{datetime.now(timezone.utc)}] Unexpected fetch error for {symbol}: {e}")
 
     if risk_engine.daily_loss_hit():
-        print(f"[{datetime.now()}] Daily loss limit hit")
+        print(f"[{datetime.now(timezone.utc)}] Daily loss limit hit")
         if (getattr(config, "risk", None) or {}).get("flatten_on_daily_loss", False):
             try:
                 held_symbols = {p.symbol for p in broker.get_all_positions()}
             except Exception as e:
-                print(f"[{datetime.now()}] Could not enumerate positions for flatten: {e}")
+                print(f"[{datetime.now(timezone.utc)}] Could not enumerate positions for flatten: {e}")
                 held_symbols = set(bars_by_symbol)
             # map broker symbols (ETHUSD) back to our format (ETH/USD)
             slash_map = {s.replace("/", ""): s for s in config.symbols}
@@ -404,7 +410,7 @@ def run_trading_cycle():
         symbol_cycle_ok = True
         relation = None
         try:
-            print(f"[{datetime.now()}] Processing {symbol}...")
+            print(f"[{datetime.now(timezone.utc)}] Processing {symbol}...")
 
             # ---- pending exit replay: an exit that previously failed must
             # retry until executed, regardless of SMA-relation whipsaws.
@@ -448,7 +454,7 @@ def run_trading_cycle():
                     symbol, getattr(position, "avg_entry_price", 0),
                     _atr(df, int((getattr(config, "risk", None) or {}).get("atr_period", 14))))
                 if healed:
-                    print(f"[{datetime.now()}] Healed missing stop for {symbol}: "
+                    print(f"[{datetime.now(timezone.utc)}] Healed missing stop for {symbol}: "
                           f"${stop_price:.2f} (entry ${float(position.avg_entry_price):.2f})")
                     try:
                         send_notification(
@@ -516,7 +522,7 @@ def run_trading_cycle():
                 try:
                     signals = strat_fn(symbol, df, config)
                 except Exception as e:
-                    print(f"[{datetime.now()}] Strategy {strat_name} error on {symbol}: {e}")
+                    print(f"[{datetime.now(timezone.utc)}] Strategy {strat_name} error on {symbol}: {e}")
                     symbol_cycle_ok = False
                     continue
                 for sig in signals:
@@ -528,10 +534,10 @@ def run_trading_cycle():
                     # a failed/blocked BUY consumes the transition by design:
                     # entries are one-shot and never retry-spam
         except BrokerError as e:
-            print(f"[{datetime.now()}] Broker error for {symbol}: {e}")
+            print(f"[{datetime.now(timezone.utc)}] Broker error for {symbol}: {e}")
             symbol_cycle_ok = False
         except Exception as e:
-            print(f"[{datetime.now()}] Unexpected error for {symbol}: {e}")
+            print(f"[{datetime.now(timezone.utc)}] Unexpected error for {symbol}: {e}")
             symbol_cycle_ok = False
         finally:
             # state advances ONLY on a fully successful cycle for this symbol:
@@ -557,7 +563,7 @@ def run_trading_cycle():
             healed, stop_price = risk_engine.ensure_stop(
                 symbol, getattr(position, "avg_entry_price", 0), None)
             if healed:
-                print(f"[{datetime.now()}] Healed missing stop for {symbol} (no bars): "
+                print(f"[{datetime.now(timezone.utc)}] Healed missing stop for {symbol} (no bars): "
                       f"${stop_price:.2f}")
                 try:
                     send_notification(
@@ -578,14 +584,14 @@ def run_trading_cycle():
         # re-seed wiped positions): drop them so they can never mis-fire
         stale = risk_engine.prune_stale_stops(held_symbols)
         if stale:
-            print(f"[{datetime.now()}] Pruned stale stops: {stale}")
+            print(f"[{datetime.now(timezone.utc)}] Pruned stale stops: {stale}")
     except Exception as e:
-        print(f"[{datetime.now()}] Stop sweep for barless positions failed: {e}")
+        print(f"[{datetime.now(timezone.utc)}] Stop sweep for barless positions failed: {e}")
 
     # Hourly status heartbeat (no-op if less than an hour since last one)
     send_heartbeat(broker, journal)
 
-    print(f"[{datetime.now()}] Trading cycle completed.")
+    print(f"[{datetime.now(timezone.utc)}] Trading cycle completed.")
 
 
 def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
@@ -621,13 +627,13 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
         if qty <= 0 or price <= 0:
             # risk sizing clipped the order to nothing (or no usable price):
             # never submit an empty order to the broker
-            print(f"[{datetime.now()}] BUY {symbol} sized to zero (price={price}, "
+            print(f"[{datetime.now(timezone.utc)}] BUY {symbol} sized to zero (price={price}, "
                   f"cash={available}); skipping")
             return False
     elif action == "SELL" and current_qty > 0:
         qty = current_qty
     else:
-        print(f"[{datetime.now()}] {action} signal for {symbol} but no action needed (qty={current_qty})")
+        print(f"[{datetime.now(timezone.utc)}] {action} signal for {symbol} but no action needed (qty={current_qty})")
         return True  # desired end state already holds; nothing failed
 
     if qty > 0 and action == "BUY":
@@ -638,7 +644,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             open_count = len(positions)
             crypto_notional = sum(abs(float(getattr(p, "market_value", 0) or 0)) for p in positions)
         except Exception:
-            print(f"[{datetime.now()}] BUY {symbol}: cannot enumerate positions — failing closed")
+            print(f"[{datetime.now(timezone.utc)}] BUY {symbol}: cannot enumerate positions — failing closed")
             return False
         try:
             account_equity = float(broker.get_account().equity)
@@ -648,7 +654,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
                                             current_crypto_notional=crypto_notional,
                                             account_equity=account_equity)
         if not allowed:
-            print(f"[{datetime.now()}] RISK BLOCKED {action} {symbol}: {reason}")
+            print(f"[{datetime.now(timezone.utc)}] RISK BLOCKED {action} {symbol}: {reason}")
             try:
                 send_notification(
                     f"🛑 Tier 1: {action} {symbol} blocked — {reason}",
@@ -658,11 +664,11 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
                 pass
             return False
 
-    print(f"[{datetime.now()}] Placing {action} order for {symbol}: qty={qty:.6f}, price={price:.2f}")
+    print(f"[{datetime.now(timezone.utc)}] Placing {action} order for {symbol}: qty={qty:.6f}, price={price:.2f}")
     reasoning = sig.get("reasoning", action)
     client_order_id = _client_order_id(symbol, action, reasoning, qty)
     if _already_executed(journal, client_order_id):
-        print(f"[{datetime.now()}] Duplicate order suppressed for {symbol} {action} "
+        print(f"[{datetime.now(timezone.utc)}] Duplicate order suppressed for {symbol} {action} "
               f"(client_order_id {client_order_id} already executed)")
         return True
     try:
@@ -679,12 +685,12 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             )
             journal.set_meta(alert_key, now_iso)
     except Exception as notify_err:
-        print(f"[{datetime.now()}] Pre-trade Discord alert failed (continuing trade): {notify_err}")
+        print(f"[{datetime.now(timezone.utc)}] Pre-trade Discord alert failed (continuing trade): {notify_err}")
     try:
         order = broker.place_order(symbol, qty, action.upper())
         confirmed = broker.await_terminal_order(order.id)
     except BrokerError as e:
-        print(f"[{datetime.now()}] Order submission/confirmation failed for {symbol}: {e}")
+        print(f"[{datetime.now(timezone.utc)}] Order submission/confirmation failed for {symbol}: {e}")
         if action == "SELL":
             # exit intent did NOT execute: persist it so it retries every
             # cycle until filled, regardless of SMA-relation whipsaws
@@ -716,7 +722,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             entry_atr = _atr(df, int((getattr(config, "risk", None) or {}).get("atr_period", 14))) if df is not None else None
             stop_price = risk_engine.entry_fixed_stop(symbol, fill_price, entry_atr)
             risk_engine.record_stop(symbol, fill_price, stop_price)
-            print(f"[{datetime.now()}] Stop recorded for {symbol}: ${stop_price:.2f} (entry ${fill_price:.2f})")
+            print(f"[{datetime.now(timezone.utc)}] Stop recorded for {symbol}: ${stop_price:.2f} (entry ${fill_price:.2f})")
         elif action == "SELL":
             # keep the stop if a partial fill leaves a residual position
             try:
@@ -726,7 +732,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             if remaining is None or float(getattr(remaining, "qty", 0) or 0) <= 0:
                 risk_engine.clear_stop(symbol)
                 _clear_pending_exit(journal, symbol)  # exit intent satisfied
-        print(f"[{datetime.now()}] Confirmed paper fill for {symbol}: {action} {fill_qty:.6f} @ {fill_price:.2f}")
+        print(f"[{datetime.now(timezone.utc)}] Confirmed paper fill for {symbol}: {action} {fill_qty:.6f} @ {fill_price:.2f}")
         try:
             notional = fill_qty * fill_price
             # realized P&L on a full exit: equity move tells the money story
@@ -742,7 +748,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
                 config
             )
         except Exception as notify_err:
-            print(f"[{datetime.now()}] Post-trade Discord alert failed: {notify_err}")
+            print(f"[{datetime.now(timezone.utc)}] Post-trade Discord alert failed: {notify_err}")
         return True
     else:
         # journal non-fills so the audit trail matches the broker's order history
@@ -754,7 +760,7 @@ def _execute_signal(broker, journal, risk_engine, symbol, df, sig):
             fee=0.0, order_id=str(getattr(order, "id", "")),
             status=status or "pending",
         )
-        print(f"[{datetime.now()}] Order {getattr(order, 'id', 'unknown')} ended as {status or 'pending'}; journaled as non-fill")
+        print(f"[{datetime.now(timezone.utc)}] Order {getattr(order, 'id', 'unknown')} ended as {status or 'pending'}; journaled as non-fill")
         if action == "SELL":
             _add_pending_exit(journal, symbol)
             _bump_exit_attempt(journal, symbol)
@@ -791,7 +797,7 @@ def run_agent_cycle():
     try:
         send_heartbeat(broker, journal)
     except Exception as e:
-        print(f"[{datetime.now()}] Heartbeat fallback failed: {e}")
+        print(f"[{datetime.now(timezone.utc)}] Heartbeat fallback failed: {e}")
 
 
 def run_scanner_cycle():
@@ -802,7 +808,7 @@ def run_scanner_cycle():
     try:
         settle_open_bets(config, journal=journal)
     except Exception as e:
-        print(f"[{datetime.now()}] Bet settlement failed: {e}")
+        print(f"[{datetime.now(timezone.utc)}] Bet settlement failed: {e}")
     scan(config, journal=journal)
     try:
         wallet = BettingWallet(config, journal=journal)
@@ -813,7 +819,7 @@ def run_scanner_cycle():
         bets_txt = f" | {v['open_bets']} open bet(s)" if v["open_bets"] else " | no open bets"
         send_notification(f"{emoji_for(delta)} {money_line('Tier 3 Bets', v['equity'], wallet.start_cash)}{bets_txt}", config)
     except Exception as e:
-        print(f"[{datetime.now()}] Wallet snapshot failed: {e}")
+        print(f"[{datetime.now(timezone.utc)}] Wallet snapshot failed: {e}")
 
 
 def main():

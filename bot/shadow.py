@@ -10,8 +10,10 @@ real dollars, on a dedicated virtual $80 account:
     (default $40) and by remaining shadow cash
   - babysitter SELL closes the virtual position, realizes P&L
   - every agent cycle marks positions to market; equity = cash + position value
-  - state persists in journal tables (shadow_trades) + meta (shadow_cash,
-    shadow_positions JSON) so it survives across CI runs
+  - state persists in the `trades` table -- every row tagged with a
+    "[shadow-account]" reasoning prefix, which is how reads find them again --
+    plus the meta keys shadow_cash and shadow_positions (JSON), so it survives
+    across CI runs
 
 Discord gets a one-line status per cycle; the daily report and chat can query
 the same ledger.
@@ -41,8 +43,7 @@ class ShadowAccount:
     # ---------------- state ----------------
 
     def _cash(self):
-        v = self.journal.get_meta("shadow_cash")
-        return float(v) if v is not None else self.start_cash
+        return self.journal.get_meta_float("shadow_cash", self.start_cash)
 
     def _positions(self):
         raw = self.journal.get_meta("shadow_positions")
@@ -75,13 +76,22 @@ class ShadowAccount:
     # ---------------- prices ----------------
 
     def _last_close(self, symbol):
+        """Close of the last CLOSED bar.
+
+        Both data backends append the still-forming candle as the final row, so
+        iloc[-1] is a price that can still move until the interval boundary.
+        Every other reader in the repo drops it (agent._price_context,
+        trader, futures) and binance_data's own last_close() reads iloc[-2].
+        Marking a virtual position on the forming bar booked gains the market
+        had not paid out yet.
+        """
         try:
             from bot.timeframe import make_timeframe
             tf = make_timeframe(self.cfg.timeframe)
             df = self.broker.get_crypto_bars(symbol, tf, self.cfg.lookback_bars)
-            if df is None or df.empty:
+            if df is None or df.empty or len(df) < 2:
                 return None
-            return float(df["close"].iloc[-1])
+            return float(df["close"].iloc[-2])
         except Exception as e:
             print(f"[shadow] price fetch failed for {symbol}: {e}")
             return None

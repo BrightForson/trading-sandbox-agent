@@ -363,7 +363,7 @@ def create_daily_report():
     trades = journal.get_trades()
     if not trades:
         return f"""=== Trading Bot Daily Report ===
-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
 
 {account_snapshot()}
 
@@ -403,7 +403,7 @@ for SMA20/SMA50 crossovers and will act on the first signal.
     # Combine stats and narrative into a report
     report = f"""
 === Trading Bot Daily Report ===
-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
 
 {account_snapshot()}
 

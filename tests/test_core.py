@@ -61,9 +61,15 @@ def test_registry_sma_cross_buy_signal():
     assert len(sigs) == 1 and sigs[0]["action"] == "BUY"
 
 
-def test_registry_resolves_and_skips_unknown():
-    out = get_strategies(["sma_cross", "nope"])
+def test_registry_resolves_and_rejects_unknown():
+    # Unknown names used to be printed and skipped, which left the trader with
+    # an empty strategy list and a green cycle: a dead config was
+    # indistinguishable from a quiet market. It must raise instead.
+    out = get_strategies(["sma_cross"])
     assert len(out) == 1 and out[0][0] == "sma_cross"
+    with pytest.raises(ValueError) as ei:
+        get_strategies(["sma_cross", "nope"])
+    assert "nope" in str(ei.value)
 
 
 # ---------------- risk ----------------
@@ -1667,8 +1673,9 @@ def test_heartbeat_tier1_label_and_tier_one_liners(tmp_path, monkeypatch):
     T.send_heartbeat(_Broker(), j)
     assert len(sent) == 1
     msg = sent[0]
-    # Tier 1 money line + open position
-    assert "Tier 1 BTC/ETH/SOL" in msg
+    # Tier 1 money line + open position. The label is derived from
+    # config.symbols; it used to hardcode a three-coin universe.
+    assert "Tier 1 (1 coin)" in msg
     assert "was $100" in msg
     assert "BTC/USD" in msg
     # one-liners for the other tiers, money-first
