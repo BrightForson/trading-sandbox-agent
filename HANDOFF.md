@@ -1,15 +1,17 @@
 # Handoff — trading-sandbox-agent
 
-Updated: 2026-09-28 (audit remediation, commits 1-5 landed)
+Updated: 2026-10-08 (Tier 1 + Tier 5 removed; audit commits 1-5 pushed; Tier 3 rebuild parked)
 
-Supersedes the 2026-09-09 handoff (algorithm upgrade + selective ledger reset).
-That session's work is committed (`993bf39` and later) and all landed.
+Supersedes the 2026-09-28 handoff. Its detail below ("Done this session"
+onward) is kept for reference; where it mentions Tier 1, Tier 5, the paper
+broker, strategies or the backtester, that code no longer exists.
 
 ## Task
 
 Fix a full-codebase audit of the sandbox: ~60 correctness findings across all
 five tiers, worked severity-tiered with a regression test per fix. **Status:
-in progress — commits 1-5 landed (5/8).**
+commits 1-5 landed and pushed to origin on 2026-10-07; commit 6 parked; the
+owner then removed Tier 1 and Tier 5.**
 
 Owner decisions already made (do not re-litigate):
 - Scope: everything, tiered in order, **one commit per phase** (8 total).
@@ -18,32 +20,39 @@ Owner decisions already made (do not re-litigate):
 - Tier 3 redesign: quality over frequency — never force a bet to satisfy an
   invariant; report near-misses instead so thresholds can be tuned on evidence.
 - Max **3** concurrent subagents (rate-limit limit).
+- 2026-10-07: **Tier 1 (SMA bot) and Tier 5 (futures canary) removed.** Code
+  deleted (git history keeps it); `data/trades.db` history kept. Tiers 2, 3
+  and 4 stay and keep their numbers. The Tier 2 babysitter went with Tier 1
+  (it only reviewed Tier 1 positions); the scout stays. The hourly heartbeat
+  moved to the agent cycle and is sent even when the model is down.
+- 2026-10-07: **Tier 3 keeps the old LLM strategy.** The commit-6 rebuild is
+  parked on branch `tier3-family-arb-rebuild` (`c22855e`); its commit message
+  lists the 5 defects found in review.
 
 ## Resume here
 
-**Commits 1-5 of 8 are landed and green. Next up is commit 6/8, the Tier 3
-rebuild** — the design is fully researched and agreed in "Key context"
-below; nothing needs new reconnaissance, it needs building. After it come the
-data repair (7) and pinger hardening (8).
-
-Before starting commit 6:
-1. Read the **Tier 3 redesign** section of "Key context" in full. It carries
-   owner decisions already taken — do not re-litigate them. Two re-measurements
-   are recorded there and one of them **reversed an earlier number**: do not
-   relax `min_market_volume`.
-2. Re-run the suite to confirm the baseline you are building on:
-   `./venv/bin/python -m pytest tests/ -q -p no:cacheprovider` → expect
-   **338 passed**, budget **>= 800s**.
-3. Keep the discipline: one regression test per finding, proven to fail
-   before it passes. The cheap way to prove it is `git stash push -- bot/
-   validation.py` (production code only — the tests must stay), run the audit
-   file, confirm the new tests fail *for the right reason* (not an incidental
-   `TypeError` from a missing kwarg), then `git stash pop`.
-4. Do **not** stage `data/trades.db` (see Open threads).
-5. Note that **`get_strategies` now raises** on an unknown strategy name, and
-   **`TradeJournal.get_meta_float` now raises** on unparseable or non-finite
-   meta. Both are intentional. Anything that reads a cash or peak balance must
-   go through the latter.
+1. **The NVIDIA key is dead** (`403 Authorization failed` since 2026-10-03).
+   Every LLM path (agent, chat, Tier 3 candidates, Tier 4 gate) is down until
+   the owner renews `NVIDIA_API_KEY` in the GitHub secret and the local `.env`.
+   `deepseek-v4-flash` in MODEL_CHAIN is end-of-life (410) and should go.
+2. **Tier 2's shadow account cannot close a position.** Its only SELL path
+   was the babysitter, and the scout may not SELL, so realized P&L stays 0 and
+   the agent-alpha gate stays RED. It needs an exit rule (time stop, or an exit
+   reviewer over shadow positions); the owner has not chosen one.
+3. **Tier 4 is starved, not crashing**: candidate filters plus CoinGecko 429s.
+4. **Tier 4 NaN peak**: `MemecoinLedger._peak_equity_meta` reads
+   `t4_peak_equity` with a bare `float()`, so a NaN peak disarms the drawdown
+   kill, the defect commit 5 fixed for Tier 5. Route it through
+   `get_meta_float`.
+5. Commits 7 (data repair) and 8 (pinger hardening) are still open; see
+   "Remaining commits".
+6. Pushing the removal needs the local pinger edited in the same step:
+   `~/.config/trading-pinger/pinger.sh` must stop dispatching `trade` and
+   stop checking `futures` (both workflow files are gone).
+7. Tests: `./venv/bin/python -m pytest tests/ -q -p no:cacheprovider`, expect
+   **207 passed** in about 2.5 min. The suite still writes gate history into
+   the real `data/trades.db`; run `git checkout -- data/trades.db` after it and
+   never stage the journal.
 
 ## Done this session
 
@@ -493,7 +502,8 @@ chose regression-tests-only, so this is flagged in commit messages, not fixed.
    (a NaN peak disarmed the drawdown kill). Four real defects were found but
    deliberately left open and are listed under "Done this session".
 
-6. **Tier 3 rebuild** — see Key context above. **Next up.** The agreed shape:
+6. **Tier 3 rebuild** — **PARKED** on branch `tier3-family-arb-rebuild`
+   (`c22855e`); the owner kept the old LLM strategy. The agreed shape was:
    hard quality floor + edge bar, never waived; *widen the search* when the
    window is dry rather than lowering the bar. Bet only an **identifiable**
    inconsistency (family sum ≠ 1.00 primary). Dossier per bet in new
