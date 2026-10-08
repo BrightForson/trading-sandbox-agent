@@ -11,14 +11,7 @@ class Config:
         
         # Credentials from environment (no hard failure at import: components
         # that need a credential check for it themselves at use time)
-        self.alpaca_api_key_id = os.getenv("ALPACA_API_KEY_ID")
-        self.alpaca_api_secret_key = os.getenv("ALPACA_API_SECRET_KEY")
         self.nvidia_api_key = os.getenv("NVIDIA_API_KEY")
-
-        broker_cfg = self._config.get("broker") or {}
-        if str(broker_cfg.get("name", "alpaca")).lower() == "alpaca":
-            if not self.alpaca_api_key_id or not self.alpaca_api_secret_key:
-                raise ValueError("Alpaca API keys not found in environment variables")
 
     def require(self, *names):
         """Raise if any named env credential is missing (components opt in)."""

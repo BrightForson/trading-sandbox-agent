@@ -20,7 +20,8 @@ get created. Chronic, not episodic.
 ## Implemented fix: local crontab pinger (REINSTALLED 2026-09-10)
 
 This machine's cron fires authenticated `workflow_dispatch` POSTs every
-15 minutes for `chat` and `trade`. Dispatch-created runs bypass the
+15 minutes for `chat` (and for `trade` until Tier 1 was removed on
+2026-10-07). Dispatch-created runs bypass the
 broken scheduler entirely. Verified again on rollback: `HTTP 204` →
 runs created → `completed/success`, heartbeat resumed within minutes.
 
@@ -28,7 +29,7 @@ runs created → `completed/success`, heartbeat resumed within minutes.
 
 | File | Role |
 |---|---|
-| `pinger.sh` | POSTs dispatches for chat + trade; freshness-checks agent + futures workflows (>100 min stale → dispatch); logs HTTP codes to `pinger.log` |
+| `pinger.sh` | POSTs dispatches for chat; freshness-checks the agent workflow (>100 min stale → dispatch); logs HTTP codes to `pinger.log` |
 | `refresh_token.sh` | weekly re-cache of the gh CLI token (Sundays 04:00) |
 | `gh_token` | cached gh OAuth token (mode 600; gh itself refreshes on use) |
 
@@ -39,9 +40,9 @@ Active again after the cron-job.org failure. Verify any time:
 
 ## Current setup: LOCAL crontab pinger (since 2026-09-10 rollback)
 
-`*/15 * * * *` fires `pinger.sh`, which POSTs dispatches for chat +
-trade and freshness-checks agent + futures workflows (>100 min stale →
-dispatch), logging HTTP codes to `pinger.log`. Auth: the cached gh OAuth
+`*/15 * * * *` fires `pinger.sh`, which POSTs dispatches for chat and
+freshness-checks the agent workflow (>100 min stale → dispatch), logging
+HTTP codes to `pinger.log`. Auth: the cached gh OAuth
 token (`gh_token`, mode 600, refreshed weekly by `refresh_token.sh`).
 
 The cron-job.org experiment (2026-09-09 → 2026-09-10) failed silently:
@@ -51,38 +52,32 @@ one is VERIFIED delivering, the local pinger is the sole reliable
 dispatch source.
 
 **Host dependency:** this machine must stay on for the pinger to fire.
-If it sleeps/shuts down, 15-min workflows degrade to GitHub's native
-scheduler (~6-8% delivery) and the hourly heartbeat falls back to the
-agent workflow's native hourly cron (usually reliable).
+If it sleeps/shuts down, chat degrades to GitHub's native scheduler
+(~6-8% delivery); the hourly heartbeat rides the agent workflow's native
+hourly cron (usually reliable).
 
 ### How it interacts with native schedules
 
-Native crons (`trade` 4,19,34,49 / `chat` 9,24,39,54) remain in place
-as best-effort backup. Interleaved offsets mean no systematic collision;
-GitHub's per-workflow concurrency groups serialize any accidental
-overlap (cancel-in-progress: false — second run queues, never lost).
-Chat is idempotent (cursor in meta `discord_chat_last_seen`), trade is
-idempotent (edge-triggered cross state).
+The native chat cron (9,24,39,54) remains in place as best-effort
+backup. GitHub's per-workflow concurrency group serializes any
+accidental overlap (cancel-in-progress: false — second run queues, never
+lost). Chat is idempotent (cursor in meta `discord_chat_last_seen`).
 
 ### Verify / operate
 
 ```bash
-gh run list --workflow trade.yml --limit 3   # expect workflow_dispatch runs
-gh run list --workflow chat.yml --limit 3    # every ~15 min
+gh run list --workflow chat.yml --limit 3    # expect workflow_dispatch runs every ~15 min
 ```
 
 Pain-meter (`actions_health()` in the daily report) reads `ok` for
-trade/chat — it measures exactly this.
+chat — it measures exactly this.
 
 ### Staleness net for hourly workflows (local pinger era, 2026-09-09)
 
-The LOCAL pinger also checked the LAST RUN of `agent`/`futures` and
-dispatched when >100 min stale. The cloud pinger does blind POSTs and
-does not replicate this — acceptable because GitHub delivers hourly
-schedules reliably and the agent-cycle heartbeat fallback
-(bot/trader.py) posts the hourly heartbeat even when 15-min trade
-cycles never ran. If hourly delivery ever degrades, add two more
-cron-job.org jobs pointing at agent.yml/futures.yml dispatch URLs.
+The local pinger also checks the LAST RUN of `agent` and dispatches it
+when >100 min stale (it checked `futures` too until Tier 5 was removed
+on 2026-10-07). The agent cycle posts the hourly heartbeat
+(bot/trader.py) after every run, even when the model is down.
 
 ### Known limitation — third-party dependency
 

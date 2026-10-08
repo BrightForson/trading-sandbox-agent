@@ -2,7 +2,7 @@ name: chat
 
 on:
   schedule:
-    # Discord chat reader: every 15 min, offset between the trade crons
+    # Discord chat reader: every 15 min
     - cron: '9,24,39,54 * * * *'
   workflow_dispatch:
 
@@ -33,8 +33,6 @@ jobs:
 
       - name: Run Discord chat cycle
         env:
-          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
-          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}

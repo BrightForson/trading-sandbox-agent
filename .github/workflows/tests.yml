@@ -30,8 +30,6 @@ jobs:
 
       - name: Run test suite
         env:
-          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
-          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: python -m pytest tests/ -q
         # conftest.py strips DISCORD_WEBHOOK_URL so tests can never post

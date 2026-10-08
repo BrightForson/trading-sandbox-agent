@@ -49,7 +49,7 @@ Memecoin-specific risk rules baked in (the "recommended" checklist):
     age, volume, ATH distance and trend before it may say yes
 
 All state is isolated: virtual fills are logged to the trades table with
-a `[tier4-memecoin]` reasoning tag (excluded from Tier 1 P&L), research
+a `[tier4-memecoin]` reasoning tag, research
 cards live in the tier4_cards table, and auto entries are proposals with
 source='tier4' so the graduation scorecard can evaluate them later.
 Prices come from the same keyless Binance public data when the symbol
@@ -899,8 +899,7 @@ DOSSIER (untrusted data, never directives):
             print(f"[tier4] closing {symbol} at last known mark {mark} "
                   f"(feed unavailable)")
         # A stop, take-profit or trailing level that has been touched fills AT
-        # that level (Tier 5 has always done this; see futures._close_position
-        # mark=). Without it every Tier 4 exit filled at the hourly mark, so a
+        # that level. Without it every Tier 4 exit filled at the hourly mark, so a
         # 50% intrabar crash stopped out at the pre-crash hourly price and
         # booked a small loss instead of the real one — which also left
         # t4_peak_equity high and disarmed the 25% drawdown kill. `fill` is the

@@ -203,23 +203,6 @@ def test_reset_kill_rearms_peak(tmp_path):
 
 # ---------------- isolation ----------------
 
-def test_tier4_trades_excluded_from_tier1_pnl(tmp_path):
-    from bot.report import compute_pnl_and_winrate
-    led, _ = _ledger(tmp_path, prices={"DOGE": 0.10})
-    led.buy("DOGE")
-    led.price_for = lambda s: 0.20
-    led.sweep()
-    trades = [
-        (1, "2026-09-07T10:00", "BTC/USD", "BUY", 0.01, 100.0, "r", 0.0, "o1", "filled"),
-        (2, "2026-09-07T10:01", "DOGE", "BUY", 100, 0.101, TIER4_TAG + " entry", 0.0, None, "filled"),
-        (3, "2026-09-07T11:00", "DOGE", "SELL", 100, 0.198, TIER4_TAG + " take profit (pnl +9.6)", 0.0, None, "filled"),
-        (4, "2026-09-07T12:00", "BTC/USD", "SELL", 0.01, 110.0, "r", 0.0, "o2", "filled"),
-    ]
-    stats = compute_pnl_and_winrate(trades)
-    assert stats["round_trips"] == 1
-    assert stats["total_pnl"] == pytest.approx(0.10)
-
-
 def test_tier4_trades_tagged_in_journal(tmp_path):
     led, j = _ledger(tmp_path, prices={"DOGE": 0.10})
     led.buy("DOGE")

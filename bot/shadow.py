@@ -1,6 +1,6 @@
 """Shadow account: a virtual $80 ledger for AI proposals (money that doesn't exist).
 
-The AI agent's proposals never touch the real broker account (shadow mode).
+The AI agent's proposals are never executed anywhere real (shadow mode).
 This module simulates what WOULD have happened if they had been executed with
 real dollars, on a dedicated virtual $80 account:
 
@@ -8,7 +8,7 @@ real dollars, on a dedicated virtual $80 account:
   - scout BUY (confidence >= min_confidence) opens a virtual position at the
     current close, sized to the proposed notional, capped at max_per_position
     (default $40) and by remaining shadow cash
-  - babysitter SELL closes the virtual position, realizes P&L
+  - a SELL closes the virtual position, realizes P&L
   - every agent cycle marks positions to market; equity = cash + position value
   - state persists in the `trades` table -- every row tagged with a
     "[shadow-account]" reasoning prefix, which is how reads find them again --
@@ -25,14 +25,14 @@ from bot.journal import TradeJournal
 
 
 class ShadowAccount:
-    def __init__(self, cfg, broker, journal=None):
+    def __init__(self, cfg, market_data, journal=None):
         self.cfg = cfg
-        self.broker = broker
+        self.market_data = market_data
         self.journal = journal or TradeJournal()
         self.agent_cfg = getattr(cfg, "agent", None) or {}
         self.start_cash = float(self.agent_cfg.get("shadow_start_cash", 80))
         self.max_per_position = float(self.agent_cfg.get("shadow_max_per_position", 40))
-        # tradable = Tier 1 symbols + the AI scout's extra universe; both
+        # tradable = configured symbols + the AI scout's extra universe; both
         # priced from the same keyless Binance public data
         self.symbols = list(cfg.symbols)
         for s in (self.agent_cfg.get("scout_extra_universe") or []):
@@ -88,7 +88,7 @@ class ShadowAccount:
         try:
             from bot.timeframe import make_timeframe
             tf = make_timeframe(self.cfg.timeframe)
-            df = self.broker.get_crypto_bars(symbol, tf, self.cfg.lookback_bars)
+            df = self.market_data.get_crypto_bars(symbol, tf, self.cfg.lookback_bars)
             if df is None or df.empty or len(df) < 2:
                 return None
             return float(df["close"].iloc[-2])
@@ -119,7 +119,7 @@ class ShadowAccount:
         return True, f"shadow BUY {symbol}: ${notional:.2f} @ ${price:,.2f} (qty {qty:.6f})"
 
     def take_sell(self, symbol, rationale=""):
-        """Simulate executing a babysitter SELL. Returns (ok, note)."""
+        """Simulate executing a SELL. Returns (ok, note)."""
         positions = self._positions()
         if symbol not in positions:
             return False, f"no shadow position in {symbol}"
@@ -133,7 +133,7 @@ class ShadowAccount:
         cash = self._cash() + proceeds
         self._save(cash, positions)
         self._log_trade(symbol, "SELL", pos["qty"], price,
-                        note=f"babysitter exit: {rationale[:120]} (pnl {pnl:+.2f})")
+                        note=f"exit: {rationale[:120]} (pnl {pnl:+.2f})")
         return True, (f"shadow SELL {symbol} @ ${price:,.2f}: "
                       f"P&L {pnl:+.2f} ({pnl / cost * 100 if cost else 0:+.1f}%)")
 

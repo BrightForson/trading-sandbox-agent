@@ -1,13 +1,8 @@
-"""AI agent (Tier 2): babysitter + scout, shadow mode.
-
-Babysitter: reviews each open position held by the SMA strategy each cycle —
-  price move since entry, SMA alignment, news research — and proposes early
-  exits when a thesis breaks. Never overrides the algorithm silently: every
-  proposal is validated, logged, and sent to Discord.
+"""AI agent (Tier 2): scout, shadow mode.
 
 Scout: researches the market (headlines, trending, whale proxies, SMA states)
-  and proposes its own high-conviction entries the SMA algorithm can't see
-  (e.g., news-driven moves before any cross).
+  and proposes its own high-conviction entries (e.g., news-driven moves
+  before any cross).
 
 Guardrails:
   - shadow mode (config agent.shadow): proposals are logged/alerted, NEVER
@@ -21,23 +16,22 @@ from datetime import datetime, timedelta, timezone
 
 from bot.journal import TradeJournal
 from bot.models import ModelManager
-from bot.research import research_bundle, headlines_for_symbol
+from bot.research import research_bundle
 from bot.notify import send_notification
 
 
 class TradingAgent:
-    def __init__(self, cfg, broker, journal=None, model=None):
+    def __init__(self, cfg, market_data, journal=None, model=None):
         self.cfg = cfg
-        self.broker = broker
+        self.market_data = market_data
         self.journal = journal or TradeJournal()
         self.model = model or ModelManager(journal=self.journal)
         self.agent_cfg = getattr(cfg, "agent", None) or {}
         self.research_cfg = getattr(cfg, "research", None) or {}
-        # Tier 1 execution universe: exactly cfg.symbols, which is the hard
-        # scope. The comment used to name three coins and the list has been ten
-        # for some time, so the count lives in config.yaml and not here.
+        # Core universe: exactly cfg.symbols. The count lives in config.yaml
+        # and not here.
         self.symbols = list(cfg.symbols)
-        # Tier 2 scout universe: Tier 1 symbols + configurable extra coins
+        # Scout universe: core symbols + configurable extra coins
         # (any liquid Binance spot pair) the AI may propose ideas on
         self.scout_symbols = list(self.symbols)
         for s in (self.agent_cfg.get("scout_extra_universe") or []):
@@ -45,7 +39,7 @@ class TradingAgent:
             if s and s not in self.scout_symbols:
                 self.scout_symbols.append(s)
         from bot.shadow import ShadowAccount
-        self.shadow = ShadowAccount(cfg, broker, journal=self.journal)
+        self.shadow = ShadowAccount(cfg, market_data, journal=self.journal)
 
     # ---------------- context building ----------------
 
@@ -54,7 +48,7 @@ class TradingAgent:
         try:
             from bot.timeframe import make_timeframe
             tf = make_timeframe(self.cfg.timeframe)
-            df = self.broker.get_crypto_bars(symbol, tf, self.cfg.lookback_bars)
+            df = self.market_data.get_crypto_bars(symbol, tf, self.cfg.lookback_bars)
             if df is None or df.empty:
                 return None
             df = df.iloc[:-1]  # closed bars only
@@ -97,27 +91,6 @@ class TradingAgent:
         except Exception as e:
             print(f"[agent] price context failed for {symbol}: {e}")
             return None
-
-    def _position_context(self):
-        try:
-            positions = list(self.broker.get_all_positions())
-            out = []
-            # Alpaca returns crypto position symbols without the slash (ETHUSD);
-            # map back to our ETH/USD format for whitelist checks
-            slash_map = {s.replace("/", ""): s for s in self.symbols}
-            for p in positions:
-                sym = slash_map.get(p.symbol, p.symbol)
-                out.append({
-                    "symbol": sym,
-                    "qty": float(p.qty),
-                    "avg_entry": float(p.avg_entry_price),
-                    "unrealized_pl": float(p.unrealized_pl),
-                    "unrealized_pct": float(p.unrealized_plpc) * 100,
-                })
-            return out
-        except Exception as e:
-            print(f"[agent] position context failed: {e}")
-            return []
 
     # ---------------- proposal plumbing ----------------
 
@@ -166,8 +139,6 @@ class TradingAgent:
             errors.append("BUY notional must be positive")
         if kind == "scout" and action == "SELL":
             errors.append("scout may not propose short sales in this long-only experiment")
-        if kind == "babysitter" and action == "BUY":
-            errors.append("babysitter may only HOLD or SELL")
         if errors:
             return None, errors
         return {
@@ -338,55 +309,13 @@ class TradingAgent:
             evaluated += 1
         return evaluated
 
-    # ---------------- babysitter ----------------
-
-    def babysit(self):
-        """Review open positions; propose early exits if thesis broke."""
-        positions = self._position_context()
-        if not positions:
-            return []
-        proposals = []
-        for pos in positions:
-            price_ctx = self._price_context(pos["symbol"])
-            heads = headlines_for_symbol(pos["symbol"], limit=5)
-            prompt = f"""You are a risk manager reviewing an open crypto position (paper trading).
-Data:
-- Position: {json.dumps(pos)}
-- Technicals: {json.dumps(price_ctx)}
-- Recent news headlines: {json.dumps(heads)}
-
-Task: decide if the original trend thesis is intact. Exit early ONLY on clear
-evidence (trend reversal confirmed, breaking news materially negative, thesis
-invalidated). Minor dips are noise and should HOLD.
-
-Respond with ONLY a JSON object, max 60 words total:
-{{"action": "HOLD"|"SELL", "symbol": "{pos['symbol']}", "confidence": 0.0-1.0, "rationale": "one sentence"}}"""
-            try:
-                proposal = self.model.generate_json(prompt, max_tokens=600)
-            except Exception as e:
-                print(f"[agent] babysit LLM call failed for {pos['symbol']}: {e}")
-                continue
-            valid, errors = self._validate(proposal, "babysitter")
-            if valid is None:
-                print(f"[agent] babysit proposal rejected for {pos['symbol']}: {errors}")
-                continue
-            if valid["action"] == "SELL" and valid["confidence"] >= float(self.agent_cfg.get("min_confidence", 0.7)):
-                self._log_and_alert(valid)
-                proposals.append(valid)
-            elif valid["action"] == "SELL":
-                # low-confidence exits downgraded to informational
-                self._log_and_alert({**valid, "action": "HOLD"},
-                                    extra="(low-confidence exit suggestion — logged as HOLD)")
-        return proposals
-
     # ---------------- scout ----------------
 
     def scout(self):
-        """Research the market for high-conviction entries beyond SMA crosses.
+        """Research the market for high-conviction entries.
 
-        Universe: Tier 1 symbols PLUS agent.scout_extra_universe (any liquid
-        Binance spot coin, e.g. XRP/DOGE) — the AI's idea net is wider than
-        the SMA strategy's execution scope by design."""
+        Universe: cfg.symbols PLUS agent.scout_extra_universe (any liquid
+        Binance spot coin, e.g. XRP/DOGE)."""
         bundle = research_bundle(self.symbols, self.research_cfg, journal=self.journal)
         price_ctxs = []
         for sym in self.scout_symbols:
@@ -445,16 +374,11 @@ OUTPUT: a single JSON object, nothing else, rationale under 40 words:
     # ---------------- cycle ----------------
 
     def run_cycle(self):
-        """One agent cycle: health check, babysit open positions, scout for new trades."""
+        """One agent cycle: health check, evaluate due proposals, scout for new trades."""
         print(f"[{datetime.now(timezone.utc)}] Agent cycle starting (shadow={self.agent_cfg.get('shadow', True)})")
         self.model.daily_health_check()
         evaluated = self.evaluate_due_proposals()
         proposals = []
-        if self.agent_cfg.get("babysitter_enabled", True):
-            try:
-                proposals += self.babysit()
-            except Exception as e:
-                print(f"[agent] babysitter error: {e}")
         if self.agent_cfg.get("scout_enabled", True):
             try:
                 proposals += self.scout()

@@ -1,21 +1,7 @@
 # Trading sandbox agent configuration
 # All parameters for the bot
 
-# Broker backend for Tier 1 execution:
-#   alpaca        - Alpaca paper trading (needs ALPACA_API_KEY_ID/SECRET in .env)
-#   binance_paper - local simulated account priced by keyless Binance public
-#                   data (state persists in data/trades.db journal meta)
-broker:
-  name: binance_paper
-  paper:
-    start_cash: 100
-  taker_fee_pct: 0.1
-  slippage_bps: 8
-
-# Alpaca paper trading credentials (loaded from .env, only used when broker.name = alpaca)
-# API keys are read from environment variables: ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY
-
-# Trading symbols (editable)
+# Core symbol universe for the AI agent (Tier 2) and its shadow account (editable)
 symbols:
   - BTC/USD
   - ETH/USD
@@ -28,62 +14,31 @@ symbols:
   - LTC/USD
   - XLM/USD
 
-# Strategy parameters
+# SMA lengths for the agent's price context
 sma_fast: 20
 sma_slow: 50
-
-# Position sizing (paper notional per trade in USD)
-notional: 100
-
-# Conservative assumptions used only for research/backtests and paper fills.
-# Binance spot taker fee is 0.1%. Must match broker.taker_fee_pct — the broker
-# journals its actual fill fees, and a mismatch here skews backtests.
-execution:
-  taker_fee_pct: 0.1
-  slippage_bps: 8
 
 # Report delivery
 report_channel: null  # legacy; Discord delivery uses DISCORD_WEBHOOK_URL
 
 # Other
-timeframe: 15Min  # Alpaca timeframe for bars
+timeframe: 15Min  # bar timeframe for the agent's price context
 lookback_bars: 120  # Number of bars to fetch for SMA calculation
 
-# Strategies registered for the trading loop (names map to bot/strategies/)
-active_strategies:
-  - sma_cross
-
-# Risk controls (checked before every order; SELLs always allowed)
-risk:
-  max_notional_per_trade: 100
-  max_open_positions: 3
-  daily_loss_limit_pct: 5.0
-  flatten_on_daily_loss: true
-  target_risk_pct_per_trade: 0.5
-  # scaled for the $100 binance_paper ledger
-  max_crypto_allocation_pct: 75.0
-  atr_period: 14
-  catastrophic_atr_multiple: 3.0
-  # Stop used only when entry-ATR is unavailable; ATR stop takes precedence
-  fallback_stop_pct: 5.0
-
-# AI agent (Tier 2) — shadow mode: proposals are logged/alerted, never executed
-# on the real account. They ARE simulated on a virtual $80 shadow account.
+# AI agent (Tier 2) — shadow mode: proposals are logged/alerted, never executed.
+# They ARE simulated on a virtual $80 shadow account.
 agent:
   enabled: true
   shadow: true
   cycle_interval_minutes: 60
   min_confidence: 0.7
   max_proposed_notional: 50
-  babysitter_enabled: true
   scout_enabled: true
   shadow_start_cash: 80
   shadow_max_per_position: 40
   evaluation_horizon_hours: 24
-  # Scout may ALSO propose high-conviction ideas OUTSIDE the Tier 1 universe
-  # (e.g. XRP, DOGE — any liquid Binance spot coin with news behind it).
-  # Tier 1 execution stays hard-scoped to `symbols:`; this widens the AI's
-  # idea net only. Babysitter stays scoped to held positions.
+  # Scout may ALSO propose high-conviction ideas OUTSIDE `symbols:`
+  # (any liquid Binance spot coin with news behind it).
   scout_extra_universe:
     - AVAX/USD
     - LINK/USD
@@ -101,7 +56,7 @@ agent:
 # Research tools for the agent (all free tiers)
 research:
   headlines_per_symbol: 5
-  tavily_daily_limit: 60     # futures universe (22) + memecoin dossiers fit
+  tavily_daily_limit: 60     # scout universe + memecoin dossiers fit
                             # under this; per-symbol-per-day caches keep the
                             # real daily burn well below it
   tavily_monthly_limit: 1500  # free-plan cap (85/1500 used as of 2026-09-09)
@@ -178,67 +133,3 @@ memecoin:
     - frog
     - inu
     - wif
-
-# Tier 5 futures canary — the last tier (owner decision 2026-09-09). Virtual
-# $50 leveraged ledger: LONG and SHORT on liquid Binance USDT pairs. Entries
-# gated by a deterministic 1h-trend + 15m-momentum + volume-surge signal and
-# an LLM conviction check; exits are fully deterministic (ATR stop/target,
-# 12h time stop, funding accrual, liquidation sim, 30% drawdown kill with
-# manual-reset escalation after a second kill).
-futures:
-  start_cash: 50           # virtual futures ledger (owner allocation)
-  universe:                # liquid USDT perps: the LLM best-pick gate may
-                           # trade ANY of these — it ranks every signal and
-                           # takes the single highest-potential at that
-                           # instance (owner decision 2026-09-09)
-    - BTC/USD
-    - ETH/USD
-    - SOL/USD
-    - BNB/USD
-    - XRP/USD
-    - DOGE/USD
-    - ADA/USD
-    - AVAX/USD
-    - LINK/USD
-    - TRX/USD
-    - XLM/USD
-    - LTC/USD
-    - DOT/USD
-    - UNI/USD
-    - ATOM/USD
-    - NEAR/USD
-    - ZEC/USD
-    - SHIB/USD
-    - ETC/USD
-    - AAVE/USD
-    - ALGO/USD
-    - GRT/USD
-  leverage: 10             # mildly extreme (owner: "not like the memecoin")
-  max_margin: 15          # per-position margin cap ($ of the $50)
-  base_margin: 8           # margin at the LLM confidence threshold
-  stop_atr_mult: 1.5        # stop distance = 1.5 * 15m ATR
-  tp_atr_mult: 2.25        # target = 2.25 * ATR (1.5 R:R)
-  trailing_atr_mult: 1.0    # trail distance = 1.0 * entry-ATR once armed
-  trailing_activate_r: 1.0  # arm the trail at +1R unrealized
-  max_hold_hours: 12        # a 15m momentum thesis is dead by 12h
-  max_drawdown_pct: 25      # hard kill: flatten + cooldown (kept under the
-                            # ~29.9% worst-case single-liquidation floor: one
-                            # bad trade never kills, two always do)
-  taker_fee_pct: 0.05       # Binance perp taker fee
-  slippage_bps: 5           # liquid-book adverse slippage per fill
-  funding_rate_pct_8h: 0.01  # longs pay/shorts receive, accrued at 8h marks
-  auto_entry: true
-  auto_cooldown_hours: 24    # kill cooldown before entries auto-resume
-  min_llm_confidence: 0.70
-  best_pick: true            # LLM scores ALL signals in one call, enters the
-                             # single highest-potential trade (not list order)
-  max_open_positions: 2
-  cooldown_hours: 24         # per-symbol cooldown after any exit
-  min_cash_fraction: 0.15    # keep >= 15% of equity as free cash
-  trend_ema_period: 50       # 1h trend regime filter
-  momentum_bars: 3           # 15m momentum lookback (45 min)
-  momentum_pct: 0.5          # required move for a signal
-  volume_surge_mult: 1.5     # signal bar volume vs 20-bar mean
-  min_atr_pct: 0.15          # dead-tape floor (% of price)
-  max_atr_pct: 3.0           # news-spike ceiling (% of price)
-  trend_filter_1h: true

@@ -3,177 +3,15 @@ import os
 import requests
 from datetime import datetime, timezone
 from bot.journal import TradeJournal
-from bot.models import ModelClient
-from bot.errors import ModelError, JournalError
 
-def compute_pnl_and_winrate(trades):
-    """
-    Compute P&L and win-rate from a list of trades.
-    Assumes trades are sorted by timestamp and we only have long positions.
-    Matches each BUY with the next SELL for the same symbol.
-    Non-filled order records (status != 'filled', e.g. journaled cancels/
-    expires) are skipped so they never distort FIFO matching.
-    Shadow-account virtual trades ([shadow-account] reasoning) and Tier 4
-    canary virtual trades ([tier4-memecoin] reasoning) are excluded:
-    this scorecard measures the Tier 1 strategy's paper performance only.
-    :param trades: list of tuples (id, timestamp, symbol, action, qty, price, reasoning[, ...])
-    :return: dict with total_pnl, win_rate, num_trades, num_losing, num_winning
-    """
-    # Group trades by symbol
-    trades_by_symbol = {}
-    for trade in trades:
-        symbol = trade[2]
-        trades_by_symbol.setdefault(symbol, []).append(trade)
-    
-    total_pnl = 0.0
-    winning_trades = 0
-    losing_trades = 0
-    round_trips = 0
-    
-    for symbol, symbol_trades in trades_by_symbol.items():
-        # Sort by timestamp
-        symbol_trades.sort(key=lambda x: x[1])
-        # We'll use a queue for buys
-        buy_queue = []  # each element: (qty, price, fee)
-        for trade in symbol_trades:
-            _, timestamp, symbol, action, qty, price, reasoning, *_ = trade
-            if "[shadow-account]" in (reasoning or ""):
-                continue  # virtual Tier-2 trades, not Tier-1 strategy fills
-            if "[tier4-memecoin]" in (reasoning or ""):
-                continue  # virtual Tier-4 canary trades, isolated ledger
-            if "[tier5-futures]" in (reasoning or ""):
-                continue  # virtual Tier-5 futures trades, isolated ledger
-            status = str(trade[9]) if len(trade) > 9 and trade[9] is not None else "filled"
-            if status != "filled":
-                continue
-            fee = float(trade[7] or 0.0) if len(trade) > 7 else 0.0
-            if action == "BUY":
-                # (remaining_qty, price, remaining_fee, accumulated_pnl)
-                buy_queue.append((qty, price, fee, 0.0))
-            elif action == "SELL":
-                # Match this sell with previous buys (FIFO)
-                remaining_qty = qty
-                while remaining_qty > 0 and buy_queue:
-                    buy_qty, buy_price, buy_fee, buy_pnl = buy_queue[0]
-                    matched_qty = min(buy_qty, remaining_qty)
-                    buy_fee_part = buy_fee * (matched_qty / buy_qty) if buy_qty else 0.0
-                    sell_fee_part = fee * (matched_qty / qty) if qty else 0.0
-                    pnl = (price - buy_price) * matched_qty - buy_fee_part - sell_fee_part
-                    total_pnl += pnl
-                    if buy_qty <= remaining_qty:
-                        # this BUY is fully consumed: the round trip closes
-                        # here, scoring the P&L accumulated across every
-                        # partial sell that matched against it. Scoring each
-                        # partial sell separately counted one economic
-                        # round trip as several, inflating the win rate.
-                        round_trip_pnl = buy_pnl + pnl
-                        if round_trip_pnl > 0:
-                            winning_trades += 1
-                        elif round_trip_pnl < 0:
-                            losing_trades += 1
-                        remaining_qty -= matched_qty
-                        buy_queue.pop(0)
-                        round_trips += 1
-                    else:
-                        # partial close: carry the remainder plus this
-                        # tranche's P&L forward; nothing is scored yet
-                        buy_queue[0] = (buy_qty - matched_qty, buy_price,
-                                        buy_fee - buy_fee_part, buy_pnl + pnl)
-                        remaining_qty = 0
-                # If there is remaining qty (should not happen if we don't sell more than we bought)
-                # but ignore for simplicity
-    
-    num_trades = winning_trades + losing_trades
-    win_rate = (winning_trades / num_trades * 100) if num_trades > 0 else 0.0
-    
-    return {
-        "total_pnl": total_pnl,
-        "win_rate": win_rate,
-        "num_trades": num_trades,
-        "winning_trades": winning_trades,
-        "losing_trades": losing_trades,
-        "round_trips": round_trips
-    }
-
-def generate_report(narrative_prompt, stats):
-    """
-    Generate a report narrative using the LLM.
-    :param narrative_prompt: base prompt for the model
-    :param stats: dictionary of computed statistics
-    :return: narrative string
-    """
-    # Prepare the prompt with the stats (but the numbers are not generated by the model)
-    prompt = f"""
-{narrative_prompt}
-
-Here are the statistics for the trading period:
-- Total P&L: ${stats['total_pnl']:.2f}
-- Win Rate: {stats['win_rate']:.2f}%
-- Number of round-trip trades: {stats['round_trips']}
-- Winning trades: {stats['winning_trades']}
-- Losing trades: {stats['losing_trades']}
-
-Please write a short, professional summary of the trading performance based on these numbers.
-"""
-    try:
-        model_client = ModelClient()
-        narrative = model_client.generate_text(prompt, max_tokens=500, temperature=0.7)
-        # reasoning models can return None content; that used to escape as a
-        # TypeError inside ModelManager's repair path, and run_report.py calls
-        # create_daily_report() outside its try, so the whole daily report was
-        # lost with a traceback instead of degrading to the template
-        if narrative is None or not str(narrative).strip():
-            raise ModelError("model returned empty content")
-        return narrative
-    except (ModelError, TypeError, ValueError, AttributeError) as e:
-        # Fallback: if model fails, return a simple template
-        return f"""Trading Report:
-- Total P&L: ${stats['total_pnl']:.2f}
-- Win Rate: {stats['win_rate']:.2f}%
-- Number of round-trip trades: {stats['round_trips']}
-- Winning trades: {stats['winning_trades']}
-- Losing trades: {stats['losing_trades']}
-
-Note: The narrative generation failed due to: {e}
-"""
-
-def account_snapshot():
-    """
-    Fetch account equity and open positions from the configured broker (pure Python, no LLM).
-    Returns a formatted string section for the daily report.
-    """
-    try:
-        from bot.config import config
-        from bot.broker import make_broker
-        broker = make_broker(config)
-        acct = broker.get_account()
-        lines = [
-            "Account Snapshot:",
-            f"- Equity: ${float(acct.equity):,.2f}",
-            f"- Cash: ${float(acct.cash):,.2f}",
-        ]
-        positions = list(broker.get_all_positions())
-        if positions:
-            lines.append(f"- Open positions: {len(positions)}")
-            for p in positions:
-                lines.append(
-                    f"  * {p.symbol}: {float(p.qty):.6f} @ ${float(p.avg_entry_price):,.2f} "
-                    f"(unrealized P&L: ${float(p.unrealized_pl):,.2f})"
-                )
-        else:
-            lines.append("- Open positions: none (flat)")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Account snapshot unavailable: {e}"
 
 def shadow_snapshot():
     """Shadow account section for the daily report (virtual $80 ledger)."""
     try:
         from bot.config import config
-        from bot.broker import make_broker
+        from bot.binance_data import BinanceDataClient
         from bot.shadow import ShadowAccount
-        broker = make_broker(config)
-        shadow = ShadowAccount(config, broker)
+        shadow = ShadowAccount(config, BinanceDataClient(config))
         lines = [f"AI Shadow Account (virtual ${shadow.start_cash:.0f}):",
                  f"- {shadow.status_line()}",
                  f"- Realized P&L from closed AI trades: ${shadow.realized_pnl():.2f}"]
@@ -223,27 +61,6 @@ def tier4_snapshot():
         return f"Tier 4 canary snapshot unavailable: {e}"
 
 
-def tier5_snapshot():
-    """Tier 5 futures canary section (virtual leveraged ledger)."""
-    try:
-        from bot.config import config
-        from bot.futures import FuturesLedger
-        ledger = FuturesLedger(config)
-        v = ledger.valuation()
-        net = v["equity"] - ledger.start_cash
-        lines = [f"Tier 5 Futures Canary (virtual ${ledger.start_cash:.0f}, "
-                 f"{ledger.leverage:.0f}x leverage, long/short):",
-                 f"- {ledger.status_line()}",
-                 f"- Net P&L: {'+' if net >= 0 else '-'}${abs(net):,.2f}"]
-        if ledger.kill_active():
-            reason = ledger.journal.get_meta("t5_kill_reason") or "unknown"
-            lines.append(f"- KILL ACTIVE: {reason} — entries blocked until "
-                         f"manual reset (tools/tier5.py reset-kill)")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Tier 5 futures snapshot unavailable: {e}"
-
-
 def experiment_scorecards():
     """Deterministic evaluation of AI proposals and paper prediction bets."""
     try:
@@ -263,12 +80,10 @@ def experiment_scorecards():
 
 
 WORKFLOW_SCHEDULES = {
-    "trade": (15 * 60, 2),
     "chat": (15 * 60, 2),
     "agent": (60 * 60, 3),
     "scanner": (6 * 60 * 60, 12),
     "memecoin": (60 * 60, 3),
-    "futures": (60 * 60, 3),
     # grace_runs used to be 30 here, which made the staleness threshold
     # 24h * 31 = 31 days. This is the report's OWN row, and the only thing that
     # ever renders it is this report running, so its age is always ~24h and the
@@ -354,18 +169,9 @@ def gates_section():
 
 
 def create_daily_report():
-    """
-    Create a daily report by reading trades from journal, computing stats,
-    and generating a narrative.
-    """
-    journal = TradeJournal()
-    # Get all trades (or maybe only today's trades? For simplicity, get all)
-    trades = journal.get_trades()
-    if not trades:
-        return f"""=== Trading Bot Daily Report ===
+    """Assemble the daily report from the per-tier sections."""
+    return f"""=== Trading Bot Daily Report ===
 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-
-{account_snapshot()}
 
 {shadow_snapshot()}
 
@@ -373,62 +179,8 @@ def create_daily_report():
 
 {tier4_snapshot()}
 
-{tier5_snapshot()}
-
 {experiment_scorecards()}
 
 {actions_health()}
 
-{gates_section()}
-
-Statistics:
-- Total P&L: $0.00
-- Win Rate: 0.00%
-- Number of round-trip trades: 0
-- Winning trades: 0
-- Losing trades: 0
-
-Narrative:
-No trades have been executed yet. The bot is monitoring BTC/USD, ETH/USD, and SOL/USD
-for SMA20/SMA50 crossovers and will act on the first signal.
-"""
-    
-    stats = compute_pnl_and_winrate(trades)
-    
-    # Base prompt for the narrative
-    base_prompt = "You are a trading assistant. Write a concise daily report summarizing the performance of a crypto trading bot."
-    
-    narrative = generate_report(base_prompt, stats)
-    
-    # Combine stats and narrative into a report
-    report = f"""
-=== Trading Bot Daily Report ===
-{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-
-{account_snapshot()}
-
-{shadow_snapshot()}
-
-{tier3_wallet_snapshot()}
-
-{tier4_snapshot()}
-
-{tier5_snapshot()}
-
-{experiment_scorecards()}
-
-{actions_health()}
-
-{gates_section()}
-
-Statistics:
-- Total P&L: ${stats['total_pnl']:.2f}
-- Win Rate: {stats['win_rate']:.2f}%
-- Number of round-trip trades: {stats['round_trips']}
-- Winning trades: {stats['winning_trades']}
-- Losing trades: {stats['losing_trades']}
-
-Narrative:
-{narrative}
-"""
-    return report.strip()
+{gates_section()}"""

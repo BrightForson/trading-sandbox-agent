@@ -208,26 +208,8 @@ User question: {question}
 Helpful, direct answer:"""
 
 
-def _system_context(broker, cfg, journal):
+def _system_context(market_data, cfg, journal):
     """Compact live snapshot the chat agent can draw from."""
-    try:
-        acct = broker.get_account()
-        acct_block = (f"Equity ${float(acct.equity):,.2f}, Cash ${float(acct.cash):,.2f}, "
-                      f"Paper account, Binance public data (simulated)")
-    except Exception as e:
-        acct_block = f"account unavailable ({e})"
-    try:
-        positions = list(broker.get_all_positions())
-        if positions:
-            pos_block = "; ".join(
-                f"{p.symbol} {float(p.qty):.6f} @ ${float(p.avg_entry_price):,.0f} "
-                f"({float(p.unrealized_plpc) * 100:+.1f}%)"
-                for p in positions
-            )
-        else:
-            pos_block = "flat (no open positions)"
-    except Exception:
-        pos_block = "positions unavailable"
     try:
         trades = journal.get_trades(limit=5)
         trade_block = "; ".join(f"{t[1][:16]} {t[3]} {t[2]} @ {t[5]:.0f}" for t in trades) or "none yet"
@@ -240,28 +222,13 @@ def _system_context(broker, cfg, journal):
         ) or "none yet"
     except Exception:
         prop_block = "unavailable"
-    try:
-        kill = journal.get_meta("kill_switch") == "on"
-        kill_reason = journal.get_meta("kill_switch_reason") or ""
-        if kill:
-            risk_block = "Tier 1 kill switch: ON (BUYs blocked"
-            if kill_reason:
-                risk_block += f", reason: {kill_reason}"
-            risk_block += ")"
-        else:
-            risk_block = "Tier 1 kill switch: off (BUYs allowed)"
-    except Exception:
-        risk_block = "risk-gate state unavailable"
     context = (
-        f"Account: {acct_block}\nPositions: {pos_block}\n"
-        f"Risk gates: {risk_block}\n"
         f"Recent trades: {trade_block}\nRecent AI proposals: {prop_block}\n"
-        f"Strategy: SMA{cfg.sma_fast}/{cfg.sma_slow} crossover on {', '.join(cfg.symbols)}, "
-        f"shadow mode = AI proposes, never executes on the real account."
+        f"Shadow mode = AI proposes, never executes on a real account."
     )
     try:
         from bot.shadow import ShadowAccount
-        shadow = ShadowAccount(cfg, broker, journal=journal)
+        shadow = ShadowAccount(cfg, market_data, journal=journal)
         acct_line = shadow.status_line()
         pos = shadow._positions()
         if pos:
@@ -294,13 +261,6 @@ def _system_context(broker, cfg, journal):
     except Exception as e:
         context += f"\nTier 3 open bets: unavailable ({e})"
     try:
-        from bot.futures import FuturesLedger
-        fut = FuturesLedger(cfg, journal=journal)
-        context += (f"\nTier 5 futures canary (virtual ${fut.start_cash:.0f}, "
-                    f"{fut.leverage:.0f}x leverage): {fut.status_line()}")
-    except Exception as e:
-        context += f"\nTier 5 futures canary: unavailable ({e})"
-    try:
         from bot.memecoin import MemecoinLedger
         meme = MemecoinLedger(cfg, journal=journal)
         context += (f"\nTier 4 memecoin canary (virtual ${meme.start_cash:.0f}): "
@@ -310,7 +270,7 @@ def _system_context(broker, cfg, journal):
     return context
 
 
-def run_chat_cycle(cfg, broker, journal=None, model=None):
+def run_chat_cycle(cfg, market_data, journal=None, model=None):
     """One chat cycle: read new messages, answer new human ones, mark seen."""
     journal = journal or TradeJournal()
     channel_id = extract_channel_id(journal=journal)
@@ -386,7 +346,7 @@ def run_chat_cycle(cfg, broker, journal=None, model=None):
             continue  # leave unseen; answered next cycle (per-message checkpoint)
         author = msg.get("author", {}).get("username", "user")
         try:
-            context = _system_context(broker, cfg, journal)
+            context = _system_context(market_data, cfg, journal)
             raw = model.generate_text(
                 _answer_prompt(question, context), max_tokens=600, temperature=0.5
             )

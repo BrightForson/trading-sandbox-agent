@@ -9,27 +9,18 @@ it only reports. Decisions stay with the human (kill switch, epoch resets,
 semi-auto enablement are all manual ops commands).
 
 Verdicts implemented (criteria from PROJECT_SUMMARY "Kill/keep criteria"):
-  - Tier 1: net P&L, peak-to-trough drawdown (from wallet_snapshots with
-    tier='tier1', taken by the trading cycle), losing-week streak,
-    backtest-divergence note. Requires >= 4 weeks of signals.
   - Tier 2: agent alpha (semi-auto readiness).
   - Tier 3: settled-bet win rate + net P&L at >= 10 settled bets; double
     bust within 8 weeks.
   - Tier 4: net P&L over >= 4 weeks + kill history.
-  - Any tier: execution-without-journal detector (broker position has no
-    matching journal fill) — an infrastructure-failure red flag.
 """
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from bot.journal import TradeJournal
 
 GATE_META_KEY = "agent_gate_history"
 GATE_HISTORY_KEY = "gate_verdict_history"
-
-# wallet_snapshots is shared by every tier; only epoch 0 is the Tier 1
-# paper account (trader.py). Tier 3's wallet uses epoch >= 1.
-TIER1_EPOCH = 0
 
 
 class GateResult:
@@ -56,170 +47,6 @@ def _weeks_since_day_zero(journal):
     if dz is None:
         return 0.0
     return (datetime.now(timezone.utc) - dz).total_seconds() / 604800.0
-
-
-def _tier1_pnl(journal):
-    """Net Tier 1 P&L from journaled fills (fees included, non-fills and
-    other tiers' tags excluded) — mirrors report.compute_pnl_and_winrate."""
-    try:
-        from bot.report import compute_pnl_and_winrate
-        stats = compute_pnl_and_winrate(journal.get_trades())
-        return float(stats.get("total_pnl", 0.0))
-    except Exception:
-        return 0.0
-
-
-def _tier1_drawdown_pct(journal):
-    """Peak-to-trough equity drawdown from tier1 wallet snapshots.
-
-    The trading cycle snapshots equity (cash + positions) after every
-    heartbeat hour; the worst peak-to-trough move across those marks is
-    the account drawdown. Returns 0.0 when no snapshots exist.
-
-    Only epoch 0 is Tier 1. Tier 3's betting wallet writes into the same
-    table with its own epoch, and mixing the two walks a peak across
-    unrelated bankrolls of different size -- a flat $100 Tier 1 account
-    read 40% drawdown purely because a separate $60 wallet existed.
-    """
-    try:
-        snaps = journal.get_wallet_snapshots(epoch=TIER1_EPOCH)
-    except Exception:
-        return 0.0
-    peak = None
-    worst_dd = 0.0
-    for row in snaps:
-        # rows: (id, timestamp, epoch, cash, locked, equity)
-        eq = float(row[5] or 0)
-        if eq <= 0:
-            continue
-        if peak is None or eq > peak:
-            peak = eq
-        if peak:
-            dd = (peak - eq) / peak * 100
-            worst_dd = max(worst_dd, dd)
-    return worst_dd
-
-
-def _week_key(ts):
-    iso = ts.isocalendar()
-    return f"{iso[0]}-W{iso[1]:02d}"
-
-
-def _tier1_weekly_realized_pnl(trades):
-    """Realized P&L per ISO week, credited to the week a round trip CLOSED.
-
-    The old proxy summed weekly cash impact (BUY negative, SELL positive),
-    which measures capital deployed rather than money lost: a week that
-    opened positions scored as a full "losing week" even with nothing
-    realized. Attributing each FIFO-closed round trip to its closing SELL
-    is what the criterion's docstring actually describes.
-    """
-    by_symbol = {}
-    for t in trades:
-        try:
-            ts = datetime.fromisoformat(str(t[1]).replace(" ", "T"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            continue
-        by_symbol.setdefault(t[2], []).append((ts, t))
-
-    weekly = {}
-    for rows in by_symbol.values():
-        rows.sort(key=lambda r: r[0])
-        # (remaining_qty, price, remaining_fee, accumulated_pnl)
-        buy_queue = []
-        for ts, t in rows:
-            action = str(t[3]).upper()
-            try:
-                qty, price = float(t[4]), float(t[5])
-            except (TypeError, ValueError):
-                continue
-            fee = float(t[7] or 0.0) if len(t) > 7 else 0.0
-            if action == "BUY":
-                buy_queue.append((qty, price, fee, 0.0))
-                continue
-            if action != "SELL":
-                continue
-            remaining = qty
-            while remaining > 0 and buy_queue:
-                buy_qty, buy_price, buy_fee, buy_pnl = buy_queue[0]
-                matched = min(buy_qty, remaining)
-                buy_fee_part = buy_fee * (matched / buy_qty) if buy_qty else 0.0
-                sell_fee_part = fee * (matched / qty) if qty else 0.0
-                pnl = (price - buy_price) * matched - buy_fee_part - sell_fee_part
-                if buy_qty <= remaining:
-                    key = _week_key(ts)
-                    weekly[key] = weekly.get(key, 0.0) + buy_pnl + pnl
-                    remaining -= matched
-                    buy_queue.pop(0)
-                else:
-                    buy_queue[0] = (buy_qty - matched, buy_price,
-                                    buy_fee - buy_fee_part, buy_pnl + pnl)
-                    remaining = 0
-    return weekly
-
-
-def _tier1_losing_week_streak(journal):
-    """Consecutive ISO weeks with negative realized P&L, current week back."""
-    try:
-        # trades columns: 0 id, 1 timestamp, 2 symbol, 3 action, 4 qty,
-        # 5 price, 6 reasoning, 7 fee, 8 order_id, 9 status
-        trades = [t for t in journal.get_trades()
-                  if t[1] and "[shadow-account]" not in (t[6] or "")
-                  and "[tier4-memecoin]" not in (t[6] or "")
-                  and "[tier5-futures]" not in (t[6] or "")
-                  and (str(t[9]) if len(t) > 9 and t[9] is not None else "filled") == "filled"]
-    except Exception:
-        return 0
-    weekly = _tier1_weekly_realized_pnl(trades)
-    if not weekly:
-        return 0
-    streak = 0
-    # walk weeks backward from the most recent seen
-    for key in sorted(weekly.keys(), reverse=True):
-        if weekly[key] < 0:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def tier1_gate(journal=None):
-    """Tier 1 KEEP/KILL criteria. Requires >= 4 weeks of history before a
-    verdict is meaningful; before that the gate reports PENDING."""
-    journal = journal or TradeJournal()
-    weeks = _weeks_since_day_zero(journal)
-    pnl = _tier1_pnl(journal)
-    dd = _tier1_drawdown_pct(journal)
-    streak = _tier1_losing_week_streak(journal)
-
-    start_cash = 100.0
-    try:
-        v = journal.get_meta("paper_epoch_start_cash")
-        if v:
-            start_cash = float(v)
-    except Exception:
-        pass
-    pnl_pct = (pnl / start_cash * 100) if start_cash else 0.0
-
-    reasons = []
-    if weeks >= 4 and pnl_pct < -20:
-        reasons.append(f"net P&L {pnl_pct:+.1f}% < -20% after >= 4 weeks")
-    if dd > 25:
-        reasons.append(f"drawdown {dd:.1f}% > 25%")
-    if streak >= 2:
-        reasons.append(f"{streak} consecutive losing weeks")
-    details = (f"P&L ${pnl:+.2f} ({pnl_pct:+.1f}% of ${start_cash:.0f}) | "
-               f"drawdown {dd:.1f}% | losing-week streak {streak} | "
-               f"{weeks:.1f} weeks since day-zero")
-    if reasons:
-        return GateResult("Tier 1 (SMA bot)", False, "; ".join(reasons), details)
-    if weeks < 4:
-        return GateResult("Tier 1 (SMA bot)", True,
-                          f"PENDING (only {weeks:.1f}/4 weeks; no kill criterion hit)", details)
-    return GateResult("Tier 1 (SMA bot)", True,
-                      "no kill criterion hit after >= 4 weeks", details)
 
 
 def tier3_gate(journal=None):
@@ -306,60 +133,6 @@ def tier4_gate(journal=None):
     return GateResult("Tier 4 (memecoin)", True, "no kill criterion hit after >= 4 weeks", details)
 
 
-def tier5_gate(journal=None):
-    """Tier 5 KEEP/KILL: net P&L floor + kill/liquidation discipline history."""
-    journal = journal or TradeJournal()
-    start_cash = 50.0
-    pnl = 0.0
-    TIER5_TAG = "[tier5-futures]"
-    try:
-        from bot.config import config
-        from bot.futures import FuturesLedger
-        led = FuturesLedger(config, journal=journal)
-        v = led.valuation()
-        start_cash = led.start_cash
-        pnl = v["equity"] - start_cash
-    except Exception:
-        try:
-            total = 0.0
-            for t in journal.get_trades():
-                if TIER5_TAG in (t[6] or ""):
-                    total += float(t[4]) * float(t[5])
-            pnl = total
-        except Exception:
-            pnl = 0.0
-    kills = 0
-    try:
-        kills = int(journal.get_meta("t5_kill_count") or 0)
-    except Exception:
-        pass
-    liquidations = 0
-    try:
-        for t in journal.get_trades():
-            if TIER5_TAG in (t[6] or "") and "liquidation" in (t[6] or ""):
-                liquidations += 1
-    except Exception:
-        pass
-    weeks = _weeks_since_day_zero(journal)
-    pnl_pct = (pnl / start_cash * 100) if start_cash else 0.0
-
-    reasons = []
-    if weeks >= 4 and pnl_pct < -50:
-        reasons.append(f"net P&L {pnl_pct:+.1f}% < -50% over >= 4 weeks")
-    if kills >= 2:
-        reasons.append(f"{kills} drawdown kills (second kill = failed edge, manual reset required)")
-    if liquidations >= 3:
-        reasons.append(f"{liquidations} liquidations (stop discipline failed repeatedly)")
-    details = (f"P&L ${pnl:+.2f} ({pnl_pct:+.1f}% of ${start_cash:.0f}) | "
-               f"kills {kills} | liquidations {liquidations} | {weeks:.1f} weeks since day-zero")
-    if reasons:
-        return GateResult("Tier 5 (futures)", False, "; ".join(reasons), details)
-    if weeks < 4:
-        return GateResult("Tier 5 (futures)", True,
-                          f"PENDING (only {weeks:.1f}/4 weeks; no kill criterion hit)", details)
-    return GateResult("Tier 5 (futures)", True, "no kill criterion hit after >= 4 weeks", details)
-
-
 def agent_alpha_gate(journal=None):
     """Tier 2 semi-auto readiness: is the AI agent actually adding alpha?
 
@@ -377,9 +150,9 @@ def agent_alpha_gate(journal=None):
     avg_return_pct = score.get("avg_return_pct", 0.0)
     try:
         from bot.config import config
-        from bot.broker import make_broker
+        from bot.binance_data import BinanceDataClient
         from bot.shadow import ShadowAccount
-        shadow_pnl = ShadowAccount(config, make_broker(config),
+        shadow_pnl = ShadowAccount(config, BinanceDataClient(config),
                                    journal=journal).realized_pnl()
     except Exception:
         shadow_pnl = None
@@ -407,36 +180,6 @@ def agent_alpha_gate(journal=None):
                       details)
 
 
-def reconciliation_gate(journal=None):
-    """Any-tier criterion: execution without a journal record = infrastructure
-    failure. Compares broker-held positions against journaled Tier 1 fills."""
-    journal = journal or TradeJournal()
-    try:
-        from bot.config import config
-        from bot.broker import make_broker
-        broker = make_broker(config)
-        held = {p.symbol for p in broker.get_all_positions()}
-    except Exception:
-        return GateResult("Reconciliation", True,
-                          "broker unavailable (offline report run) — skipped",
-                          "no check possible; not a failure")
-    unjournaled = []
-    for sym in held:
-        slash_map = {s.replace("/", ""): s for s in config.symbols}
-        ours = slash_map.get(sym, sym)
-        filled = any(t[2] == ours and str(t[3]).upper() == "BUY"
-                     for t in journal.get_trades())
-        if not filled:
-            unjournaled.append(ours)
-    if unjournaled:
-        return GateResult("Reconciliation", False,
-                           f"broker position without journal fill: {', '.join(sorted(unjournaled))}",
-                           "execution-without-record is an any-tier kill criterion")
-    return GateResult("Reconciliation", True,
-                      "all broker positions reconcile with journal fills",
-                      f"{len(held)} held position(s) checked")
-
-
 def _record_verdict_history(journal, results):
     """Persist a compact verdict series so multi-week conditions ('red 4
     consecutive weeks') are evaluable later."""
@@ -457,9 +200,8 @@ def _record_verdict_history(journal, results):
 def evaluate_gates(journal=None):
     """All gates, for the daily report. Recommend-only by design."""
     journal = journal or TradeJournal()
-    results = [tier1_gate(journal), agent_alpha_gate(journal),
-               tier3_gate(journal), tier4_gate(journal),
-               tier5_gate(journal), reconciliation_gate(journal)]
+    results = [agent_alpha_gate(journal), tier3_gate(journal),
+               tier4_gate(journal)]
     lines = ["Graduation Gates (recommend-only, never auto-promote):"]
     for r in results:
         verdict = "GREEN" if r.passed else "RED"

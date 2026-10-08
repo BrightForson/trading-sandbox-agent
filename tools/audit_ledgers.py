@@ -15,9 +15,8 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
-T1_TAG = "tier4-memecoin"  # excluded from Tier 1
 T2_TAG = "shadow-account"
-T5_TAG = "tier5-futures"
+T4_TAG = "tier4-memecoin"
 
 
 def parse_args():
@@ -47,16 +46,11 @@ def main():
         return tag in (row["reasoning"] or "")
 
     tiers = {
-        "tier1": {"cash_key": "paper_cash", "pos_key": "paper_positions",
-                  "start": 100.0, "rows": [t for t in trades
-                                           if not any(is_tag(t, tag) for tag in
-                                                      (T1_TAG, T2_TAG, T5_TAG))],
-                  "fee_pct": 0.1},
         "tier2": {"cash_key": "shadow_cash", "pos_key": "shadow_positions",
                   "start": 80.0, "rows": [t for t in trades if is_tag(t, T2_TAG)],
                   "fee_pct": 0.0},
         "tier4": {"cash_key": "t4_cash", "pos_key": "t4_positions",
-                  "start": 40.0, "rows": [t for t in trades if is_tag(t, T1_TAG)],
+                  "start": 40.0, "rows": [t for t in trades if is_tag(t, T4_TAG)],
                   "fee_pct": 1.0},
     }
 
@@ -136,18 +130,6 @@ def main():
     print(f"\ntier3: {len(bets)} bets since reset ({len(open_bets)} open, {len(settled)} settled)")
     for b in open_bets:
         print(f"  OPEN: {b['side']} ${b['stake']:.0f} on {b['market'][:60]}")
-
-    # tier5 futures: cash moves by margin+pnl-fee-funding, which is not
-    # reconstructable from qty*price alone — report it as an informational
-    # balance check (cash+open margins vs start_cash) instead of a full recon
-    t5_rows = [t for t in trades if is_tag(t, T5_TAG)]
-    t5_cash = float(meta.get("t5_cash") or 50.0)
-    t5_pos = json.loads(meta.get("t5_positions") or "{}")
-    t5_open_margin = sum(float(p.get("margin") or 0) for p in t5_pos.values())
-    print(f"\ntier5: {len(t5_rows)} fills, cash ${t5_cash:.2f} + open margins "
-          f"${t5_open_margin:.2f} = ${t5_cash + t5_open_margin:.2f} of $50.00 start")
-    kill = meta.get("t5_kill") or "off"
-    print(f"  kill switch: {kill}, open positions: {len(t5_pos)}")
 
     print(f"\n{'='*50}")
     print("AUDIT RESULT:", "PROBLEMS FOUND" if problems else "CLEAN — ledgers reconcile with fills")

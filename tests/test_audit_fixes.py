@@ -53,148 +53,6 @@ from bot.journal import TradeJournal
 from bot.notify import send_notification as _real_send_notification
 
 
-# ---------------- commit 1: Tier 1 drawdown must not mix ledgers ----------------
-
-def test_tier1_drawdown_ignores_other_epochs(tmp_path):
-    """Tier 3's separate $60 bankroll must not count as a Tier 1 drawdown.
-
-    Both ledgers share wallet_snapshots; only epoch 0 is Tier 1. Before the
-    fix the peak walked across a $100 account and a $60 one, reporting a
-    40% drawdown on an account that never lost a cent -- a false KILL.
-    """
-    from bot.gates import _tier1_drawdown_pct
-    j = TradeJournal(db_path=str(tmp_path / "d.db"))
-    base = datetime.now(timezone.utc) - timedelta(hours=6)
-    # Tier 1 (epoch 0): completely flat at $100
-    for i in range(4):
-        j.log_wallet_snapshot(
-            timestamp=(base + timedelta(hours=i)).isoformat(),
-            epoch=0, cash=100.0, locked=0, equity=100.0)
-    # Tier 3 (epoch 1): a wholly separate $60 virtual wallet
-    for i in range(4):
-        j.log_wallet_snapshot(
-            timestamp=(base + timedelta(hours=i)).isoformat(),
-            epoch=1, cash=60.0, locked=0, equity=60.0)
-
-    assert _tier1_drawdown_pct(j) == 0.0
-
-
-def test_tier1_drawdown_still_sees_its_own_trough(tmp_path):
-    """The epoch filter must not blind Tier 1 to its own real drawdown."""
-    from bot.gates import _tier1_drawdown_pct
-    j = TradeJournal(db_path=str(tmp_path / "d.db"))
-    base = datetime.now(timezone.utc) - timedelta(hours=6)
-    for i, eq in enumerate([100, 120, 90, 95]):
-        j.log_wallet_snapshot(
-            timestamp=(base + timedelta(hours=i)).isoformat(),
-            epoch=0, cash=eq, locked=0, equity=eq)
-    # peak 120 -> trough 90 = 25%
-    assert abs(_tier1_drawdown_pct(j) - 25.0) < 0.01
-
-
-# ---------------- commit 1: losing-week streak column indices ----------------
-
-def test_tier1_losing_week_streak_counts_real_losing_weeks(tmp_path):
-    """Three consecutive losing weeks must read as a streak of >= 2.
-
-    The filter tested t[7] (the REAL column) for the string "filled", so
-    every trade was dropped and the streak was permanently 0 -- a documented
-    Tier 1 KILL criterion that could never fire. The P&L proxy also read
-    t[8] (order_id, TEXT) as a float, which raised and was swallowed.
-    """
-    from bot.gates import _tier1_losing_week_streak
-    j = TradeJournal(db_path=str(tmp_path / "s.db"))
-
-    # three separate ISO weeks, each a losing round trip
-    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
-    for w, exit_price in enumerate([80.0, 70.0, 60.0]):
-        day = monday + timedelta(weeks=w)
-        j.log_trade(day.isoformat(), "BTC/USD", "BUY", 1.0, 100.0,
-                    "golden cross", fee=0.1, order_id=f"buy-{w}", status="filled")
-        j.log_trade((day + timedelta(hours=1)).isoformat(), "BTC/USD", "SELL",
-                    1.0, exit_price, "death cross", fee=0.1,
-                    order_id=f"sell-{w}", status="filled")
-
-    assert _tier1_losing_week_streak(j) >= 2
-
-
-def test_tier1_losing_week_streak_ignores_non_filled(tmp_path):
-    """A cancelled fill must not count toward a losing week."""
-    from bot.gates import _tier1_losing_week_streak
-    j = TradeJournal(db_path=str(tmp_path / "s.db"))
-    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
-    j.log_trade(monday.isoformat(), "BTC/USD", "BUY", 1.0, 100.0,
-                "cancelled entry", fee=0.0, order_id="x", status="canceled")
-    assert _tier1_losing_week_streak(j) == 0
-
-
-def test_tier1_losing_week_streak_breaks_on_a_winning_week(tmp_path):
-    """A profitable week must terminate the streak."""
-    from bot.gates import _tier1_losing_week_streak
-    j = TradeJournal(db_path=str(tmp_path / "s.db"))
-    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
-    for w, (entry, exit_) in enumerate([(100.0, 80.0), (100.0, 150.0)]):
-        day = monday + timedelta(weeks=w)
-        j.log_trade(day.isoformat(), "BTC/USD", "BUY", 1.0, entry, "buy",
-                    fee=0.0, order_id="b", status="filled")
-        j.log_trade((day + timedelta(hours=1)).isoformat(), "BTC/USD", "SELL",
-                    1.0, exit_, "sell", fee=0.0, order_id="s", status="filled")
-    # most recent week is the winner -> streak of 0
-    assert _tier1_losing_week_streak(j) == 0
-
-
-def test_deploying_capital_is_not_a_losing_week(tmp_path):
-    """A week that only OPENED positions has realized nothing, so it is not a
-    losing week.
-
-    The old proxy netted BUY cash against SELL cash per week, which measured
-    capital deployed rather than money lost. Once the column-index bug was
-    fixed that proxy began firing the 2-losing-weeks KILL on a strategy that
-    had merely bought a position and left it open.
-    """
-    from bot.gates import _tier1_losing_week_streak
-    j = TradeJournal(db_path=str(tmp_path / "s.db"))
-    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
-    # week 1: buy and hold, never sold -> nothing realized
-    j.log_trade(monday.isoformat(), "BTC/USD", "BUY", 1.0, 100.0,
-                "golden cross", fee=0.0, order_id="b", status="filled")
-    # week 2: a small winning round trip -> realized positive
-    day2 = monday + timedelta(weeks=1)
-    j.log_trade(day2.isoformat(), "ETH/USD", "BUY", 1.0, 100.0,
-                "golden cross", fee=0.0, order_id="b2", status="filled")
-    j.log_trade((day2 + timedelta(hours=1)).isoformat(), "ETH/USD", "SELL",
-                1.0, 120.0, "death cross", fee=0.0, order_id="s2", status="filled")
-
-    assert _tier1_losing_week_streak(j) == 0
-
-
-def test_week_with_only_an_open_buy_is_not_counted_at_all(tmp_path):
-    """A buy that never closes must not appear in the weekly ledger."""
-    from bot.gates import _tier1_weekly_realized_pnl
-    j = TradeJournal(db_path=str(tmp_path / "s.db"))
-    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
-    j.log_trade(monday.isoformat(), "BTC/USD", "BUY", 1.0, 100.0,
-                "golden cross", fee=0.0, order_id="b", status="filled")
-    assert _tier1_weekly_realized_pnl(j.get_trades()) == {}
-
-
-def test_round_trip_credited_to_its_closing_week(tmp_path):
-    """A position opened in one week and closed in the next is credited to
-    the week it closed, not the week the cash went out."""
-    from bot.gates import _tier1_weekly_realized_pnl
-    j = TradeJournal(db_path=str(tmp_path / "s.db"))
-    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
-    j.log_trade(monday.isoformat(), "BTC/USD", "BUY", 1.0, 100.0,
-                "golden cross", fee=0.0, order_id="b", status="filled")
-    close_day = monday + timedelta(weeks=1)
-    j.log_trade(close_day.isoformat(), "BTC/USD", "SELL", 1.0, 150.0,
-                "death cross", fee=0.0, order_id="s", status="filled")
-
-    weekly = _tier1_weekly_realized_pnl(j.get_trades())
-    close_key = f"{close_day.isocalendar()[0]}-W{close_day.isocalendar()[1]:02d}"
-    assert weekly == {close_key: 50.0}
-
-
 # ---------------- commit 1: Tier 3 gate win rate ----------------
 
 def test_tier3_gate_reports_real_win_rate(tmp_path):
@@ -224,243 +82,9 @@ def test_tier3_gate_reports_real_win_rate(tmp_path):
     assert "67%" in gate.details or "66." in gate.details
 
 
-# ---------------- commit 1: split round trips scored once ----------------
-
-def test_split_round_trip_counted_once():
-    """One buy sold in two sells is ONE economic round trip.
-
-    Both FIFO branches incremented round_trips/wins, so a position exited in
-    two tranches was scored twice -- inflating the reported win rate and
-    trade count without any extra economics.
-    """
-    from bot.report import compute_pnl_and_winrate
-    trades = [
-        (1, "2026-01-01T00:00:00", "BTC/USD", "BUY", 2.0, 100.0, "r", 0.0, "o1", "filled"),
-        (2, "2026-01-02T00:00:00", "BTC/USD", "SELL", 1.0, 120.0, "r", 0.0, "o2", "filled"),
-        (3, "2026-01-03T00:00:00", "BTC/USD", "SELL", 1.0, 110.0, "r", 0.0, "o3", "filled"),
-    ]
-    stats = compute_pnl_and_winrate(trades)
-    # cash math is already correct: bought 2 @ 100 = 200, sold 120 + 110 = 230
-    assert stats["total_pnl"] == 30.0
-    assert stats["round_trips"] == 1
-    assert stats["num_trades"] == 1
-    assert stats["winning_trades"] == 1
-
-
-def test_fully_closed_round_trip_still_counts():
-    """The single-fill case must keep counting exactly one round trip."""
-    from bot.report import compute_pnl_and_winrate
-    trades = [
-        (1, "2026-01-01T00:00:00", "BTC/USD", "BUY", 1.0, 100.0, "r", 0.0, "o1", "filled"),
-        (2, "2026-01-02T00:00:00", "BTC/USD", "SELL", 1.0, 120.0, "r", 0.0, "o2", "filled"),
-    ]
-    stats = compute_pnl_and_winrate(trades)
-    assert stats["total_pnl"] == 20.0
-    assert stats["round_trips"] == 1
-    assert stats["winning_trades"] == 1
-
-
-def test_break_even_round_trip_is_not_a_loss():
-    """A flat round trip is breakeven, not a loss."""
-    from bot.report import compute_pnl_and_winrate
-    trades = [
-        (1, "2026-01-01T00:00:00", "ETH/USD", "BUY", 1.0, 100.0, "r", 0.0, "o1", "filled"),
-        (2, "2026-01-02T00:00:00", "ETH/USD", "SELL", 1.0, 100.0, "r", 0.0, "o2", "filled"),
-    ]
-    stats = compute_pnl_and_winrate(trades)
-    assert stats["total_pnl"] == 0.0
-    assert stats["losing_trades"] == 0
-    assert stats["winning_trades"] == 0
-    assert stats["round_trips"] == 1
-
-
 # ================= commit 2: critical =================
 
 import pandas as pd
-
-
-class _T5Cfg:
-    futures = {
-        "start_cash": 50, "leverage": 10, "max_margin": 15, "base_margin": 8,
-        "stop_atr_mult": 1.5, "tp_atr_mult": 2.25, "max_hold_hours": 12,
-        "max_drawdown_pct": 25, "taker_fee_pct": 0.05, "slippage_bps": 5,
-        "funding_rate_pct_8h": 0.0, "universe": ["BTC/USD"],
-        "auto_entry": True, "auto_cooldown_hours": 24, "min_llm_confidence": 0.70,
-        "max_open_positions": 2, "cooldown_hours": 24, "min_cash_fraction": 0.15,
-        "trailing_atr_mult": 1.0, "trailing_activate_r": 1.0,
-    }
-
-
-def _t5_ledger(tmp_path, prices=None, bars=None):
-    from bot.futures import FuturesLedger
-    j = TradeJournal(db_path=str(tmp_path / "t5.db"))
-    led = FuturesLedger(_T5Cfg, journal=j)
-    if prices is not None:
-        led.price_for = lambda s: prices.get(str(s).upper())
-    if bars is not None:
-        led._bars_for = lambda s: bars.get(str(s).upper())
-    return led, j
-
-
-def _rising_bars(n=60, start=100.0, step=0.1, end=None):
-    """Strictly rising 15m bars whose lows never revisit earlier levels."""
-    end = end or datetime.now(timezone.utc)
-    idx = pd.date_range(end=end, periods=n, freq="15min", tz="UTC")
-    closes = [start + step * i for i in range(n)]
-    return pd.DataFrame(
-        {"open": closes, "high": [c + 0.05 for c in closes],
-         "low": [c - 0.05 for c in closes], "close": closes,
-         "volume": [1.0] * n}, index=idx)
-
-
-def _seed_long(led, j, **over):
-    """Write a LONG position directly, bypassing signal discovery."""
-    pos = {"side": "LONG", "entry": 100.05, "qty": 0.10, "notional": 10.0,
-           "margin": 10.0, "stop": 95.0, "take_profit": 110.0,
-           "entry_atr": 1.0, "r_distance": 5.0, "liquidation": 50.0,
-           "trailing_stop": None, "funding_marks_paid": 0,
-           "opened": (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()}
-    pos.update(over)
-    import json as _json
-    j.set_meta("t5_cash", "50.0")
-    j.set_meta("t5_positions", _json.dumps({"BTC/USD": pos}))
-    return pos
-
-
-# ---------------- trailing stop window ----------------
-
-def test_trailing_stop_ignores_history_predating_the_trail(tmp_path):
-    """A trail must be tested only against bars since its CURRENT level was set.
-
-    The window used the position's open time, so a trail armed on a healthy
-    uptrend was immediately tested against lows from hours earlier and
-    closed the position on the same sweep that armed it. The ratchet-and-ride
-    design never functioned.
-    """
-    led, j = _t5_ledger(tmp_path)
-    bars = _rising_bars(n=60)
-    led._bars_for = lambda s: (bars, bars)
-    # market at 101.50 and climbing; trail armed 10 minutes ago at 100.85
-    led.price_for = lambda s: 101.50
-    _seed_long(led, j, trailing_stop=100.85,
-               trailing_stop_armed_at=(datetime.now(timezone.utc)
-                                       - timedelta(minutes=10)).isoformat())
-
-    events = led.sweep()
-
-    assert not [e for e in events if e["type"] == "trailing_stop"]
-    assert "BTC/USD" in led._positions(), "healthy uptrend must not be stopped out"
-
-
-def test_trailing_stop_fires_on_a_dip_after_arming(tmp_path):
-    """A genuine pullback below an established trail must still close it."""
-    led, j = _t5_ledger(tmp_path)
-    bars = _rising_bars(n=60)
-    # a dip below the trail, but only in the most recent bars
-    armed = datetime.now(timezone.utc) - timedelta(minutes=45)
-    dip = bars.copy()
-    dip.iloc[-1, dip.columns.get_loc("low")] = 100.0
-    dip.iloc[-2, dip.columns.get_loc("low")] = 100.2
-    led._bars_for = lambda s: (dip, dip)
-    led.price_for = lambda s: 100.5
-    _seed_long(led, j, trailing_stop=100.85, trailing_stop_armed_at=armed.isoformat())
-
-    events = led.sweep()
-
-    assert any(e["type"] == "trailing_stop" for e in events)
-    assert "BTC/USD" not in led._positions()
-
-
-def test_trail_without_arm_time_uses_current_mark_only(tmp_path):
-    """A trail with no recorded arm time is judged on the mark, not on
-    unverifiable history -- the conservative direction."""
-    led, j = _t5_ledger(tmp_path)
-    bars = _rising_bars(n=60)
-    led._bars_for = lambda s: (bars, bars)
-    led.price_for = lambda s: 101.50
-    _seed_long(led, j, trailing_stop=100.85)  # no trailing_stop_armed_at
-
-    events = led.sweep()
-
-    assert not [e for e in events if e["type"] == "trailing_stop"]
-    assert "BTC/USD" in led._positions()
-
-
-def test_ratcheting_a_trail_resets_its_window(tmp_path):
-    """Ratcheting to a new level must restart the window at that level.
-
-    Otherwise a dip under the older, looser trail is read as a touch of the
-    newer, tighter one that did not exist at the time.
-    """
-    led, j = _t5_ledger(tmp_path)
-    bars = _rising_bars(n=60)
-    led._bars_for = lambda s: (bars, bars)
-    led.price_for = lambda s: 110.0
-    _seed_long(led, j, trailing_stop=None)
-
-    led.sweep()
-
-    pos = led._positions().get("BTC/USD")
-    if pos is not None and pos.get("trailing_stop") is not None:
-        assert pos.get("trailing_stop_armed_at") is not None
-
-
-# ---------------- kill switch must not disable exits ----------------
-
-def test_sweep_still_enforces_exits_while_the_kill_is_on(tmp_path):
-    """An open position must keep its stop after the kill switch engages.
-
-    sweep() returned immediately on kill_active(), but _trigger_kill
-    swallows per-symbol flatten failures and continues, so survivors are
-    real. A surviving 10x LONG was then left with no SL, TP, trailing, funding
-    or time-stop enforcement for the whole 24h cooldown -- indefinitely on the
-    second kill, which latches MANUAL_RESET.
-    """
-    led, j = _t5_ledger(tmp_path)
-    bars = _rising_bars(n=30, start=100.0, step=0.0)
-    led._bars_for = lambda s: (bars, bars)
-    # market fell through the stop (99.15) but is nowhere near liquidation
-    led.price_for = lambda s: 95.0
-    _seed_long(led, j, stop=99.15, take_profit=120.0, r_distance=0.85)
-    j.set_meta("t5_kill", "on")
-
-    events = led.sweep()
-
-    assert "BTC/USD" not in led._positions(), (
-        "a breached stop must be enforced even with the kill switch on")
-
-
-def test_stop_enforced_when_kill_flatten_fails(tmp_path):
-    """The real shape of the bug: a flatten that raises, leaving a survivor
-    with a breached stop and no enforcement at all."""
-    led, j = _t5_ledger(tmp_path)
-    # bars whose lows genuinely trade through the 99.15 stop
-    bars = _rising_bars(n=30, start=100.0, step=0.0)
-    bars.iloc[-1, bars.columns.get_loc("low")] = 94.0
-    led._bars_for = lambda s: (bars, bars)
-    # mark above liquidation (50) but below the stop
-    led.price_for = lambda s: 95.0
-    _seed_long(led, j, stop=99.15, take_profit=120.0, r_distance=0.85)
-    j.set_meta("t5_kill", "on")
-
-    # kill flatten raises, exactly as _trigger_kill's per-symbol try/except
-    # tolerates; the survivor is then governed only by the normal sweep
-    calls = {"n": 0}
-    real_close = led._close_position
-
-    def flaky_close(symbol, note="", mark=None, **kw):
-        if calls["n"] == 0:
-            calls["n"] += 1
-            raise RuntimeError("transient broker failure during flatten")
-        return real_close(symbol, note=note, mark=mark, **kw)
-
-    led._close_position = flaky_close
-
-    events = led.sweep()
-
-    assert "BTC/USD" not in led._positions(), (
-        "surviving position kept a breached stop with the kill switch on")
-    assert any(e["type"] == "stop_loss" for e in events)
 
 
 # ---------------- volatility must be annualized ----------------
@@ -655,18 +279,22 @@ def test_interval_for_is_idempotent(spec, expected):
     assert _interval_for(_interval_for(once)) == once
 
 
-def test_alpaca_timeframe_object_maps_to_its_real_interval():
-    """Alpine TimeFrame objects previously always resolved to 15m.
+def test_amount_unit_timeframe_object_maps_to_its_real_interval():
+    """amount+unit timeframe objects previously always resolved to 15m.
 
     The old branch read a value_count attribute alpaca-py 0.44 no longer
     has and imported TimeFrameUnit from a module that does not exist, so the
     whole block was dead and it fell through to `return "15m"`.
     """
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from types import SimpleNamespace
     from bot.binance_data import _interval_for
-    assert _interval_for(TimeFrame(1, TimeFrameUnit.Hour)) == "1h"
-    assert _interval_for(TimeFrame(1, TimeFrameUnit.Day)) == "1d"
-    assert _interval_for(TimeFrame(15, TimeFrameUnit.Minute)) == "15m"
+
+    def tf(amount, unit):
+        return SimpleNamespace(amount=amount, unit=SimpleNamespace(name=unit))
+
+    assert _interval_for(tf(1, "Hour")) == "1h"
+    assert _interval_for(tf(1, "Day")) == "1d"
+    assert _interval_for(tf(15, "Minute")) == "15m"
 
 
 def test_bot_timeframe_objects_still_map():
@@ -721,70 +349,7 @@ class _J:
         self.m[k] = v
 
 
-def _risk(**over):
-    from bot.risk import RiskEngine
-    r = RiskEngine(_J(), broker=None)
-    r.risk = {"catastrophic_atr_multiple": 3.0, "fallback_stop_pct": 5.0}
-    r.risk.update(over)
-    return r
-
-
-def test_zero_mark_is_not_a_total_loss():
-    """A missing price must not read as 'the price collapsed to zero' and
-    liquidate the position. It is an absent mark, not a 100% loss."""
-    r = _risk()
-    r.record_stop("BTC/USD", 60000.0, 57000.0)
-    triggered, reason = r.stop_triggered("BTC/USD", 0.0)
-    assert triggered is False
-    assert "no usable mark" in reason
-
-
-def test_stop_still_fires_on_a_genuine_collapse():
-    """The guard is on implausible-HIGH marks only. A real crash must stop
-    out: for a loss limiter a false exit costs the position while a missed
-    one is unbounded."""
-    r = _risk()
-    r.record_stop("BTC/USD", 60000.0, 57000.0)
-    assert r.stop_triggered("BTC/USD", 40000.0)[0] is True
-    assert r.stop_triggered("BTC/USD", 2000.0)[0] is True
-
-
-def test_implausible_high_mark_multiple_is_configurable():
-    r = _risk(implausible_mark_multiple=2.0)
-    r.record_stop("TINY", 0.01, 0.0095)
-    triggered, reason = r.stop_triggered("TINY", 0.05)
-    assert triggered is False
-    assert "suspect mark" in reason
-    # and it names the multiple, so a skipped check is not silent
-    assert "2x" in reason
-
-
-def test_stop_message_is_readable_for_sub_dollar_assets():
-    """$0.01 and $0.0095 both rendered as '$0.01' under a 2dp format."""
-    r = _risk()
-    r.record_stop("TINY", 0.01, 0.0095)
-    _, reason = r.stop_triggered("TINY", 0.0095)
-    assert "$0.01" in reason and "$0.0095" in reason
-
-
 # ---------------- report must survive a model that returns nothing ----------------
-
-def test_report_survives_a_model_returning_none(monkeypatch):
-    """A None narrative used to escape as TypeError; run_report.py calls
-    create_daily_report() outside its try, so the whole daily report was
-    lost with a traceback instead of degrading to the template."""
-    from bot import report
-    stats = {"total_pnl": 1.0, "win_rate": 50.0, "round_trips": 2,
-             "winning_trades": 1, "losing_trades": 1}
-
-    class _NoneModel:
-        def generate_text(self, *a, **k):
-            return None
-
-    monkeypatch.setattr(report, "ModelClient", _NoneModel)
-    out = report.generate_report("narrative", stats)
-    assert out and "Total P&L" in out
-
 
 def test_model_parsers_reject_none_with_modelerror():
     """None content from a reasoning model must be a ModelError, not an
@@ -828,7 +393,7 @@ class _NoModel:
 def _agent(tmp_path):
     from bot.agent import TradingAgent
     j = TradeJournal(db_path=str(tmp_path / "a.db"))
-    return TradingAgent(_AgentCfg(), broker=None, journal=j, model=_NoModel())
+    return TradingAgent(_AgentCfg(), market_data=None, journal=j, model=_NoModel())
 
 
 def test_nan_notional_is_rejected(tmp_path):
@@ -1083,124 +648,6 @@ def test_open_proposals_query_is_bounded_and_indexed(tmp_path):
         conn.close()
 
 
-# ---------------- commit 4: Tier 5 ATR / fees / funding ----------------
-
-def test_atr_returns_none_rather_than_nan(tmp_path):
-    """A NaN ATR is silent: `not nan` is False and `nan <= 0` is False, so every
-    `if not atr or atr <= 0` guard let it through. It reached the position dict
-    (json.dumps writes a bare NaN), where a NaN stop compares False against
-    every bar low -- the position could never be stopped out or take profit,
-    and the SL-before-liquidation check was silently skipped too."""
-    from bot.futures import _atr
-    import math
-    good = _atr(_rising_bars(n=60))
-    assert good is not None and math.isfinite(good) and good > 0
-    # too few bars for the rolling window -> NaN before the fix
-    assert _atr(_rising_bars(n=5)) is None
-    # a fully-null bar (binance_data does not dropna) poisons the rolling mean,
-    # but only if it falls inside the window the caller reads
-    bars = _rising_bars(n=60)
-    for col in ("open", "high", "low", "close"):
-        bars.iloc[55, bars.columns.get_loc(col)] = float("nan")
-    assert _atr(bars) is None
-
-
-def test_tier5_refuses_an_entry_when_atr_is_nan(tmp_path):
-    """open() persisted stop=NaN, take_profit=NaN and entry_atr=NaN, leaving an
-    unprotected 10x position that only liquidation or the 12h time stop could
-    ever exit."""
-    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
-                        bars={"BTC/USD": (_rising_bars(n=60), None)})
-    # force the NaN the short-frame path produces
-    led._bars_for = lambda s: (_rising_bars(n=5), None)
-    ok, msg = led.open("BTC/USD", "LONG", margin=10)
-    assert not ok
-    assert "ATR" in msg
-    assert led._positions() == {}
-
-
-def test_tier5_exit_fee_is_charged_on_the_exit_notional(tmp_path):
-    """The exit fee used to be pos["notional"], the ENTRY notional, so the fee
-    was wrong in proportion to the move: a 2x winner paid half of what it owed.
-    The journal row, the booked pnl and the cash credit were all wrong
-    together, in the same direction."""
-    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
-                        bars={"BTC/USD": (_rising_bars(n=60), None)})
-    assert led.open("BTC/USD", "LONG", margin=10)[0]
-    pos = led._positions()["BTC/USD"]
-    r = led._close_position("BTC/USD", mark=200.0, note="2x")
-    close_row = next(t for t in j.get_trades() if t[3] == "CLOSE-LONG")
-    expected = r["exit_price"] * pos["qty"] * 0.05 / 100
-    assert close_row[7] == pytest.approx(expected, abs=1e-12)
-    # a 2x winner must pay roughly twice the entry-notional fee, not half
-    assert close_row[7] > pos["notional"] * 0.05 / 100
-
-
-def test_tier5_entry_reserves_the_fee_and_the_cash_floor(tmp_path):
-    """min_cash_fraction was already enforced, but the check ran before the
-    debit and the entry fee was never reserved -- so a margin sized exactly to
-    the free cash left the ledger negative by the fee after the fill. Tier 1 and
-    Tier 4 both size against cost+fee; Tier 5 alone did not."""
-    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
-                        bars={"BTC/USD": (_rising_bars(n=60), None)})
-    # drain cash to just under the 15% floor of a 50 account
-    j.set_meta("t5_cash", "7.5")
-    ok, msg = led.open("BTC/USD", "LONG", margin=10)
-    if ok:
-        assert led._cash() >= 0, f"entry fee pushed cash negative: {led._cash()}"
-        assert led._cash() >= led.valuation()["equity"] * led.min_cash_fraction * 0.999
-    else:
-        assert "cash floor" in msg
-
-
-def test_tier5_funding_cursor_persists_at_zero_net_delta(tmp_path):
-    """The cursor lives inside the positions JSON, so gating the save on
-    cash_delta != 0.0 discarded it whenever the net charge was exactly zero --
-    which a hedged pair of equal-size opposite positions produces, since a LONG
-    and a SHORT at the same notional cancel. Skipped marks then re-priced at
-    the current rate in one lump, funding_accrued stayed 0.0 for the reporting
-    scorecard, and no funding event fired so the notification never appeared.
-    The total was conserved; the bookkeeping was not."""
-    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
-                        bars={"BTC/USD": (_rising_bars(n=60), None)})
-    import json as _json
-    old = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
-    # identical notionals, opposite sides -> funding cancels exactly
-    j.set_meta("t5_positions", _json.dumps({
-        "BTC/USD": {"side": "LONG", "qty": 1.0, "entry": 100.0, "margin": 10.0,
-                    "notional": 100.0, "stop": 95.0, "take_profit": 110.0,
-                    "liquidation": 50.0, "opened": old},
-        "ETH/USD": {"side": "SHORT", "qty": 1.0, "entry": 100.0, "margin": 10.0,
-                    "notional": 100.0, "stop": 105.0, "take_profit": 90.0,
-                    "liquidation": 150.0, "opened": old},
-    }))
-    led.funding_rate_pct_8h = 0.01
-    events = led._accrue_funding(marks={"BTC/USD": 100.0, "ETH/USD": 100.0})
-    assert events == [] or all(e["amount"] == 0 for e in events)
-    for sym in ("BTC/USD", "ETH/USD"):
-        assert led._positions()[sym]["funding_marks_paid"] == 1, (
-            f"{sym} cursor was dropped at zero net delta")
-        assert led._positions()[sym]["funding_accrued"] != 0.0
-
-
-def test_tier5_funding_accrues_on_the_mark_notional(tmp_path):
-    """Funding is a rate on the position's value, so a 3x move over 12h was
-    being charged 3x the truth (or credited 3x, for a short)."""
-    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0},
-                        bars={"BTC/USD": (_rising_bars(n=60), None)})
-    import json as _json
-    j.set_meta("t5_positions", _json.dumps({
-        "BTC/USD": {"side": "LONG", "qty": 1.0, "entry": 100.0, "margin": 10.0,
-                    "notional": 100.0, "stop": 95.0, "take_profit": 110.0,
-                    "liquidation": 50.0,
-                    "opened": (datetime.now(timezone.utc)
-                               - timedelta(hours=9)).isoformat()},
-    }))
-    led.funding_rate_pct_8h = 0.01
-    ev = led._accrue_funding(marks={"BTC/USD": 300.0})
-    assert ev[0]["amount"] == pytest.approx(-300.0 * 0.01 / 100, abs=1e-8)
-
-
 # ---------------- commit 4: Tier 4 P&L, exit ordering, fill price ----------------
 
 def test_tier4_booked_pnl_charges_the_entry_fee(tmp_path):
@@ -1333,7 +780,7 @@ def test_change_24h_spans_the_right_number_of_intervals(tmp_path):
 
     a = TradingAgent.__new__(TradingAgent)
     a.cfg = _Cfg()
-    a.broker = _Broker()
+    a.market_data = _Broker()
     ctx = a._price_context("BTC/USD")
     # the last bar is dropped as still-forming, so measure on the same series
     closed = closes[:-1]
@@ -1365,7 +812,7 @@ def test_bar_counts_follow_the_configured_interval(tmp_path):
 
     a = TradingAgent.__new__(TradingAgent)
     a.cfg = _Cfg()
-    a.broker = _Broker()
+    a.market_data = _Broker()
     ctx = a._price_context("BTC/USD")
     assert len(ctx["recent_24_bars"]) == 6, "6h at 1h bars is 6 bars, not 24"
     # 24h at 1h = 24 intervals -> 25 bars inclusive
@@ -1397,7 +844,7 @@ def test_sma_gap_is_none_when_the_window_is_degenerate(tmp_path):
 
     a = TradingAgent.__new__(TradingAgent)
     a.cfg = _Cfg()
-    a.broker = _Broker()
+    a.market_data = _Broker()
     ctx = a._price_context("BTC/USD")
     assert ctx["sma_gap_pct"] is None
     # and the context must still be JSON-serialisable under allow_nan=False
@@ -1680,32 +1127,22 @@ def test_shadow_fills_at_the_last_closed_bar(tmp_path):
 # ---------------- corrupt cash/peak meta must not become buying power ----------------
 
 class _CashCfg:
-    """One config satisfying all four ledgers, so _cash() is testable uniformly."""
+    """One config satisfying both ledgers, so _cash() is testable uniformly."""
 
     symbols = ["BTC/USD"]
     timeframe = "1Hour"
     lookback_bars = 60
     agent = _ShadowCfg.agent
-    execution = {"taker_fee_pct": 0.1, "slippage_bps": 8}
-    broker = {"name": "binance_paper", "paper": {"start_cash": 20},
-              "taker_fee_pct": 0.1, "slippage_bps": 8}
-    futures = _T5Cfg.futures
     memecoin = _T4Cfg.memecoin
 
 
 def _cash_ledgers(tmp_path):
     """(label, ledger, cash meta key) for every tier that keeps cash in meta."""
-    from bot.binance_paper import BinancePaperBroker
-    from bot.futures import FuturesLedger
     from bot.memecoin import MemecoinLedger
     from bot.shadow import ShadowAccount
     j = TradeJournal(db_path=str(tmp_path / "cash.db"))
-    paper = BinancePaperBroker(_CashCfg, journal=j)
-    paper.data = _FormingBarBroker()
     return [
         ("shadow", ShadowAccount(_CashCfg, _FormingBarBroker(), journal=j), "shadow_cash"),
-        ("paper", paper, "paper_cash"),
-        ("tier5", FuturesLedger(_CashCfg, journal=j), "t5_cash"),
         ("tier4", MemecoinLedger(_CashCfg, journal=j), "t4_cash"),
     ]
 
@@ -1732,173 +1169,6 @@ def test_corrupt_cash_meta_is_refused_instead_of_becoming_buying_power(tmp_path,
         with pytest.raises(JournalError) as ei:
             led._cash()
         assert key in str(ei.value), label
-
-
-def test_corrupt_peak_meta_does_not_silently_disable_the_drawdown_kill(tmp_path):
-    """A NaN peak read as "no drawdown", disarming Tier 5's 25% kill.
-
-    _drawdown_hit returns False when peak is None or <= 0, and a NaN peak
-    satisfies neither branch -- then `(nan - equity) / nan * 100 >= pct` is
-    False too, so the kill could never fire.
-    """
-    from bot.errors import JournalError
-    led, j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0})
-    j.set_meta("t5_cash", "5.0")
-    j.set_meta("t5_peak_equity", "nan")
-
-    with pytest.raises(JournalError) as ei:
-        led._drawdown_hit(1.0)
-    assert "t5_peak_equity" in str(ei.value)
-
-
-# ---------------- the paper broker must not write a non-finite cash ----------------
-
-def test_paper_broker_refuses_a_non_finite_quantity(tmp_path):
-    """A NaN quantity poisoned paper_cash permanently.
-
-    `qty <= 0` and `cost + fee > cash` are both False for NaN, so both guards
-    passed, and _save persisted str(round(nan, 8)) == "nan" as the balance.
-    Every later read of that ledger returned NaN cash, which reads as free
-    money to every guard downstream.
-    """
-    from bot.binance_paper import BinancePaperBroker
-    from bot.errors import BrokerError
-    j = TradeJournal(db_path=str(tmp_path / "paper.db"))
-    b = BinancePaperBroker(_CashCfg, journal=j)
-    b.data = _FormingBarBroker()
-
-    for side in ("BUY", "SELL"):
-        with pytest.raises(BrokerError):
-            b.place_order("BTC/USD", float("nan"), side)
-    assert b._cash() == pytest.approx(20.0, abs=1e-9)
-    assert j.get_meta("paper_cash") is None
-
-
-def test_paper_broker_clips_an_oversized_sell_to_the_held_qty(tmp_path):
-    """Coverage for the clipping the audit flagged: it was already correct.
-
-    Recorded so the behaviour is pinned rather than "fixed" -- an audit pass
-    that re-reports this will find a test asserting the good behaviour.
-    """
-    from bot.binance_paper import BinancePaperBroker
-    j = TradeJournal(db_path=str(tmp_path / "paper.db"))
-    b = BinancePaperBroker(_CashCfg, journal=j)
-    b.data = _FormingBarBroker()
-    b.place_order("BTC/USD", 0.10, "BUY")
-
-    order = b.place_order("BTC/USD", 5.0, "SELL")
-
-    assert float(order.filled_qty) == pytest.approx(0.10, abs=1e-12)
-    assert b._positions() == {}
-
-
-# ---------------- the strategy contract must be checked, not assumed ----------------
-
-def test_unknown_crossover_signal_is_a_no_op_not_a_sell(monkeypatch):
-    """sma_cross fell through to SELL for anything that was not "golden".
-
-    A renamed or misspelt signal string therefore sold the position instead of
-    doing nothing -- the worst possible default for a fail-to-parse input.
-    """
-    from bot import strategies
-    cfg = type("C", (), {"sma_fast": 20, "sma_slow": 50})()
-    df = pd.DataFrame({"close": [1.0] * 60})
-
-    monkeypatch.setattr(strategies, "check_crossover",
-                        lambda *a, **k: ("goldan", 1.0, 2.0, 3.0, 4.0))
-    assert strategies.sma_cross("BTC/USD", df, cfg) == []
-
-    monkeypatch.setattr(strategies, "check_crossover",
-                        lambda *a, **k: ("death", 1.0, 2.0, 3.0, 4.0))
-    assert strategies.sma_cross("BTC/USD", df, cfg)[0]["action"] == "SELL"
-
-
-def test_signal_shape_is_validated_where_it_is_produced():
-    """The signal contract was stringly typed and never checked.
-
-    The consumer matched action by equality and fell through to "no action
-    needed", so a signal naming an action the executor did not implement was
-    reported as a decision rather than as the silent no-op it was.
-    """
-    from bot.strategies import _signal
-
-    with pytest.raises(ValueError) as ei:
-        _signal("HOLD", "BTC/USD", "notional", "reason")
-    assert "HOLD" in str(ei.value)
-
-    with pytest.raises(ValueError) as ei:
-        _signal("BUY", "BTC/USD", "half_position", "reason")
-    assert "half_position" in str(ei.value)
-
-    assert _signal("BUY", "BTC/USD", "notional", "reason")["action"] == "BUY"
-
-
-def test_unknown_strategy_name_raises_instead_of_trading_nothing():
-    """A typo in active_strategies used to produce a green, trade-free cycle.
-
-    get_strategies printed a warning and skipped, leaving an empty list; the
-    trader then printed "No strategies registered" and the cycle exited 0, so
-    a dead configuration looked exactly like a quiet market.
-    """
-    from bot.strategies import get_strategies
-
-    with pytest.raises(ValueError) as ei:
-        get_strategies(["sma_cross", "sma_cros"])
-
-    assert "sma_cros" in str(ei.value)
-    assert "sma_cross" in str(ei.value)
-
-
-# ---------------- the Tier 5 trend guard must partition by symbol ----------------
-
-def test_trend_guard_partitions_signals_by_symbol(tmp_path):
-    """Eligible-vs-skipped was decided by dict equality, at O(n*m).
-
-    `s not in eligible` compares signal dicts by value, so two signals with
-    equal contents would both be judged eligible and the skip would go
-    unprinted -- the only reason it cannot happen today is that each signal
-    carries a distinct symbol. Keying on the symbol makes the partition exact
-    and costs one pass.
-    """
-    led, _j = _t5_ledger(tmp_path, prices={"BTC/USD": 100.0})
-    held = {"ETH/USD": {"qty": 1.0, "entry": 100.0, "side": "LONG"}}
-
-    a = {"symbol": "BTC/USD", "side": "LONG", "atr": 1.0}
-    b = {"symbol": "SOL/USD", "side": "LONG", "atr": 1.0}
-    c = {"symbol": "ETH/USD", "side": "LONG", "atr": 1.0}
-
-    eligible, skipped = led._partition_eligible([a, b, c], held)
-
-    assert [s["symbol"] for s in eligible] == ["BTC/USD", "SOL/USD"]
-    assert [s["symbol"] for s in skipped] == ["ETH/USD"]
-
-    twin = dict(a)
-    eligible, skipped = led._partition_eligible([a, twin], {"BTC/USD": held["ETH/USD"]})
-    assert eligible == []
-    assert len(skipped) == 2
-
-
-# ---------------- a dead local must not shadow the real argument ----------------
-
-def test_fetch_history_forwards_the_requested_interval_verbatim(monkeypatch):
-    """A dead local held a millisecond width under the name `iv`.
-
-    Nothing read it -- the paging loop passes `interval` through -- but `iv`
-    conventionally means implied volatility, so the line invited a future
-    "fix" that handed 900000 to the Binance interval parameter. Pin the
-    argument that is real.
-    """
-    import bot.binance_data as bd
-    seen = []
-
-    def _fake_get_klines(symbol, interval="15m", limit=1000, end_time=None):
-        seen.append(interval)
-        return None
-
-    monkeypatch.setattr(bd, "get_klines", _fake_get_klines)
-    bd.BinanceDataClient().fetch_history("BTCUSD", days=1, interval="1h")
-
-    assert seen == ["1h"]
 
 
 # ---------------- timestamps must not be local time ----------------
@@ -1953,7 +1223,6 @@ def test_daily_report_header_stamp_is_utc(monkeypatch):
 
     monkeypatch.setattr(report, "datetime", _ThreeHoursBehind)
     monkeypatch.setattr(report, "TradeJournal", lambda *a, **k: _NoTrades())
-    monkeypatch.setattr(report, "account_snapshot", lambda: "acct")
     monkeypatch.setattr(report, "shadow_snapshot", lambda: "shadow")
 
     out = report.create_daily_report()

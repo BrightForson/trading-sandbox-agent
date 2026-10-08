@@ -488,15 +488,15 @@ class TradeJournal:
     def get_meta_float(self, key, default=None):
         """Read a meta key as a finite float, or `default` when it is unset.
 
-        Every tier keeps its cash balance (and Tier 5 its equity peak) in meta
-        and reads it back with a bare float(). That accepts two things it
-        should not. Unparseable text raises a ValueError from an unrelated
-        frame, so the cycle dies somewhere far from the key that broke. And
-        "nan" parses: NaN cash then passes every sizing guard, because
-        `nan > cap` and `nan <= 0` are both False, so a corrupt ledger reads as
-        unlimited buying power -- and a NaN equity peak silently disarms the
-        drawdown kill for the same reason. Corrupt numeric state is state we
-        cannot reason about, so name the key and refuse.
+        Every tier keeps its cash balance in meta and reads it back with a
+        bare float(). That accepts two things it should not. Unparseable
+        text raises a ValueError from an unrelated frame, so the cycle dies
+        somewhere far from the key that broke. And "nan" parses: NaN cash
+        then passes every sizing guard, because `nan > cap` and `nan <= 0`
+        are both False, so a corrupt ledger reads as unlimited buying power
+        -- and a NaN equity peak silently disarms the drawdown kill for the
+        same reason. Corrupt numeric state is state we cannot reason about,
+        so name the key and refuse.
         """
         raw = self.get_meta(key)
         if raw is None:

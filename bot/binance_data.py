@@ -1,13 +1,11 @@
 """Binance market data: keyless public klines via data-api.binance.vision.
 
-The market-data half of the broker seam. No API keys, no signing, no
-geo-restricted endpoints — the same free data Binance publishes for
-backtesting. Provides get_crypto_bars() with the Alpaca call shape
-(symbol like "BTC/USD", timeframe objects, limit), returning a DataFrame
-with the columns the strategies already expect.
+No API keys, no signing, no geo-restricted endpoints — the same free
+data Binance publishes for backtesting. Provides get_crypto_bars()
+(symbol like "BTC/USD", timeframe objects, limit), returning an OHLCV
+DataFrame.
 """
 import time
-from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -94,7 +92,7 @@ def _interval_for(timeframe):
             return _interval_for(f"{int(value_count)}m")
         except (TypeError, ValueError):
             raise ValueError(f"unrecognized timeframe: {timeframe!r}")
-    # Alpaca TimeFrame and friends expose amount + unit
+    # other timeframe objects expose amount + unit
     raw_amount = getattr(timeframe, "amount", None)
     unit = getattr(timeframe, "unit", None)
     unit_name = getattr(unit, "name", None) or str(unit or "")
@@ -172,12 +170,11 @@ def get_klines(symbol, interval="15m", limit=500, end_time=None):
 
 
 class BinanceDataClient:
-    """Drop-in market-data adapter shaped like the Alpaca broker's data half.
+    """Market-data client for the agent, shadow account, gates and chat.
 
     get_crypto_bars(symbol, timeframe, limit) -> DataFrame indexed by
-    UTC timestamp with open/high/low/close/volume, newest last — exactly
-    what get_strategies()/simulate() consume. Binance also includes the
-    still-forming candle as the last row (like Alpaca), and callers
+    UTC timestamp with open/high/low/close/volume, newest last. Binance
+    also includes the still-forming candle as the last row, and callers
     already drop it.
     """
 
@@ -197,35 +194,3 @@ class BinanceDataClient:
         if df is None or df.empty:
             return None
         return float(df["close"].iloc[-2])
-
-    def fetch_history(self, symbol, days, interval="15m"):
-        """Deep history for backtests: page backward until `days` covered.
-
-        Binance serves 1000 klines/request ending at endTime; we walk the
-        endTime back until the requested window is filled.
-        """
-        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        start_ms = end_ms - int(days) * 86_400_000
-        frames = []
-        cursor = end_ms
-        for _ in range(200):
-            if cursor <= start_ms:
-                break
-            df = get_klines(symbol, interval=interval, limit=1000, end_time=cursor)
-            if df is None or df.empty:
-                break
-            first_ms = int(df.index[0].timestamp() * 1000)
-            frames.append(df)
-            if first_ms >= cursor:
-                break
-            cursor = first_ms
-        if not frames:
-            return None
-        out = pd.concat(frames)
-        out = out[~out.index.duplicated(keep="last")].sort_index()
-        out = out[(out.index >= pd.Timestamp(start_ms, unit="ms", tz="UTC"))
-                  & (out.index < pd.Timestamp(end_ms, unit="ms", tz="UTC"))]
-        # drop the still-forming bar
-        if not out.empty:
-            out = out.iloc[:-1]
-        return out

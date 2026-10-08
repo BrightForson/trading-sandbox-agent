@@ -1,10 +1,8 @@
 """Tests for the 2026-09-08 P1/P2 deep-dive fixes.
 
-Covers: exit-intent persistence (F12), exit idempotency nonce (F13),
-actual-fee journaling (F16), UTC timestamps (F15), fail-closed risk
-enumeration (F18), scout validation/cooldown (F20/F21), scanner liquidity
-floor + event dedupe + bust latch (F24), Tier 4 ticker resolution +
-stale marks + kill escalation (F8/F9/F11), gates verdicts (F26).
+Covers: scout validation/cooldown (F20/F21), scanner liquidity floor +
+event dedupe + bust latch (F24), Tier 4 ticker resolution + stale marks +
+kill escalation (F8/F9/F11), gates verdicts (F26).
 """
 import json
 import os
@@ -17,159 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot.journal import TradeJournal
 from bot.memecoin import MemecoinLedger
-from bot.trader import (_client_order_id, _pending_exits, _add_pending_exit,
-                        _clear_pending_exit, _bump_exit_attempt,
-                        _exit_attempts, journal_ref)
 from tests.test_tier4 import _T4Cfg, _ledger
-
-
-# ---------------- F13: exit idempotency nonce ----------------
-
-def test_exit_keys_differ_across_attempts(tmp_path):
-    j = TradeJournal(db_path=str(tmp_path / "t.db"))
-    journal_ref.set(j)
-    k1 = _client_order_id("ETH/USD", "SELL", "daily loss flatten", 0.5)
-    _bump_exit_attempt(j, "ETH/USD")
-    k2 = _client_order_id("ETH/USD", "SELL", "daily loss flatten", 0.5)
-    assert k1 != k2  # retried exit is NOT suppressed as a duplicate
-    journal_ref.set(None)
-
-
-def test_buy_keys_stable_without_nonce(tmp_path):
-    j = TradeJournal(db_path=str(tmp_path / "t.db"))
-    journal_ref.set(j)
-    k1 = _client_order_id("ETH/USD", "BUY", "golden cross", 0.5)
-    k2 = _client_order_id("ETH/USD", "BUY", "golden cross", 0.5)
-    assert k1 == k2  # same BUY intent stays idempotent
-    journal_ref.set(None)
-
-
-# ---------------- F12: pending exit persistence ----------------
-
-def test_pending_exit_lifecycle(tmp_path):
-    j = TradeJournal(db_path=str(tmp_path / "t.db"))
-    assert _pending_exits(j) == set()
-    _add_pending_exit(j, "BTC/USD")
-    _add_pending_exit(j, "ETH/USD")
-    assert _pending_exits(j) == {"BTC/USD", "ETH/USD"}
-    _clear_pending_exit(j, "BTC/USD")
-    assert _pending_exits(j) == {"ETH/USD"}
-
-
-def test_exit_attempt_counter_bounded(tmp_path):
-    j = TradeJournal(db_path=str(tmp_path / "t.db"))
-    for i in range(150):
-        _bump_exit_attempt(j, f"SYM{i}")
-    raw = j.get_meta("exit_attempt_counters")
-    assert len(json.loads(raw)) <= 100
-
-
-# ---------------- F16: actual fee journaled ----------------
-
-class _FakeBroker:
-    """Broker surface stub used by _execute_signal."""
-    def __init__(self, fee):
-        self._fee = fee
-        self.orders = []
-
-    class _P:
-        symbol = "ETH/USD"
-        qty = "0"
-        avg_entry_price = "0"
-        current_price = "0"
-        market_value = "0"
-        unrealized_pl = "0"
-        unrealized_plpc = "0"
-
-    def get_position(self, s):
-        return None
-
-    def get_all_positions(self):
-        return []
-
-    def get_account(self):
-        class A:
-            cash = "100"
-            equity = "100"
-        return A()
-
-    def place_order(self, symbol, qty, side):
-        o = self._P()
-        o.id, o.symbol, o.qty, o.side = "1", symbol, str(qty), side
-        o.status, o.filled_qty = "filled", str(qty)
-        o.filled_avg_price = "100.0"
-        o.fee = self._fee
-        self.orders.append(o)
-        return o
-
-    def await_terminal_order(self, oid):
-        return self.orders[-1]
-
-
-def test_execute_signal_journals_actual_fee(tmp_path, monkeypatch):
-    import bot.trader as trader
-    j = TradeJournal(db_path=str(tmp_path / "t.db"))
-    journal_ref.set(j)
-
-    class _Risk:
-        def size_for_atr(self, *a, **k):
-            return 0.5
-
-        def check(self, *a, **k):
-            return True, "ok"
-
-        def entry_fixed_stop(self, *a, **k):
-            return 95.0
-
-        def record_stop(self, *a, **k):
-            pass
-
-    broker = _FakeBroker(fee=0.05)
-    import pandas as pd
-    df = pd.DataFrame({"close": [100.0, 100.5]})
-    sig = {"action": "BUY", "reasoning": "test buy"}
-    monkeypatch.setattr(trader, "config", type("C", (), {
-        "notional": 50, "symbols": ["ETH/USD"],
-        "risk": {"atr_period": 14}, "execution": {"taker_fee_pct": 0.25},
-    })())
-    ok = trader._execute_signal(broker, j, _Risk(), "ETH/USD", df, sig)
-    assert ok is True
-    trades = j.get_trades()
-    assert len(trades) == 1
-    # the journaled fee is the BROKER's actual fee, not the 0.25% estimate
-    # (columns: id, timestamp, symbol, action, qty, price, reasoning, fee, ...)
-    assert abs(float(trades[0][7]) - 0.05) < 1e-9
-
-
-def test_trades_use_utc_timestamps(tmp_path, monkeypatch):
-    import bot.trader as trader
-    j = TradeJournal(db_path=str(tmp_path / "t.db"))
-    journal_ref.set(j)
-
-    class _Risk:
-        def size_for_atr(self, *a, **k):
-            return 0.5
-
-        def check(self, *a, **k):
-            return True, "ok"
-
-        def entry_fixed_stop(self, *a, **k):
-            return 95.0
-
-        def record_stop(self, *a, **k):
-            pass
-
-    broker = _FakeBroker(fee=0.05)
-    import pandas as pd
-    df = pd.DataFrame({"close": [100.0, 100.5]})
-    monkeypatch.setattr(trader, "config", type("C", (), {
-        "notional": 50, "symbols": ["ETH/USD"],
-        "risk": {"atr_period": 14}, "execution": {"taker_fee_pct": 0.25},
-    })())
-    trader._execute_signal(broker, j, _Risk(), "ETH/USD", df,
-                           {"action": "BUY", "reasoning": "utc test"})
-    ts = j.get_trades()[0][1]
-    assert "+" in ts or ts.endswith("Z")  # timezone-aware ISO
 
 
 # ---------------- F20/F21: scout validation + cooldown ----------------
@@ -403,22 +249,13 @@ def test_gates_all_tiers_report(tmp_path, monkeypatch):
                         lambda journal=None: gates.GateResult(
                             "Tier 2 (agent alpha)", False, "stub", "stub"))
     out = gates.evaluate_gates(journal=j)
-    assert "Tier 1 (SMA bot)" in out
+    assert "Tier 2 (agent alpha)" in out
     assert "Tier 3 (Polymarket)" in out
     assert "Tier 4 (memecoin)" in out
-    assert "Reconciliation" in out
+    assert "Tier 1" not in out and "Tier 5" not in out
+    assert "Reconciliation" not in out
     # verdict history recorded
     raw = j.get_meta("gate_verdict_history")
     assert raw and "verdicts" in raw
 
 
-def test_tier1_drawdown_from_snapshots(tmp_path):
-    from bot.gates import _tier1_drawdown_pct
-    j = TradeJournal(db_path=str(tmp_path / "d.db"))
-    base = datetime.now(timezone.utc) - timedelta(hours=3)
-    for i, eq in enumerate([100, 120, 90, 95]):
-        j.log_wallet_snapshot(
-            timestamp=(base + timedelta(hours=i)).isoformat(),
-            epoch=0, cash=eq, locked=0, equity=eq)
-    # peak 120 -> trough 90 = 25% drawdown
-    assert abs(_tier1_drawdown_pct(j) - 25.0) < 0.01

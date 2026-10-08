@@ -1,8 +1,8 @@
-"""Timeframe abstraction shared across broker adapters.
+"""Timeframe abstraction for market-data clients.
 
-Consumers pass opaque timeframe objects to broker.get_crypto_bars() and
-stay import-clean of any vendor SDK. AlpacaBroker converts to its
-TimeFrame; BinanceDataClient converts to a Binance interval string.
+Consumers pass opaque timeframe objects to get_crypto_bars() and stay
+import-clean of any vendor SDK. BinanceDataClient converts them to a
+Binance interval string.
 """
 
 

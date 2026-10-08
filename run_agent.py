@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the AI agent cycle (babysitter + scout), shadow mode.
+"""Run the AI agent (scout) cycle, shadow mode.
 
 Modes:
 - default: continuous loop (local/laptop use)

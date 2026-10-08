@@ -1,97 +1,78 @@
 # Trading Sandbox Agent
 
-Five-tier paper-trading system (NO real money anywhere):
+Three paper-trading tiers (NO real money anywhere). Tier 1 (SMA crossover bot) and Tier 5 (leveraged futures canary) were removed on 2026-10-07: their history stays in `data/trades.db` and their code in git history. The remaining tiers keep their numbers.
 
-1. **Tier 1 — SMA crossover bot (paper only)**: deterministic SMA20/50 golden/death cross on BTC/USD, ETH/USD, SOL/USD, 15-min closed bars, with ATR-based catastrophic exits and account-level paper-risk controls.
-2. **Tier 2 — AI agent (SHADOW MODE)**: babysits open positions (proposes early exits when thesis breaks) + scouts for high-conviction entries using news/whale/trend research. It never executes. Scout BUY ideas receive a fixed-horizon, BTC-benchmarked scorecard.
-3. **Tier 3 — Polymarket scanner (paper only)**: near-resolution favorites are a watchlist, not automatic bets. LLM candidates must clear an expected-value-after-friction threshold, duplicate and total-exposure checks, then are paper-logged and settled automatically. A virtual betting wallet (real deployment size) mirrors every logged bet at a flat stake, tracks cash/locked equity per epoch, snapshots the trend each cycle, and halts new bets on bust — the tier's go/no-go scoreboard.
-4. **Tier 4 — Memecoin canary (automated, virtual $40)**: owner opt-in 2026-09-08 (no real money; automation like the other tiers). Hourly pipeline: deterministic research cards (CoinGecko trending + DexScreener volume spikes) -> per-coin dossier (market data, ATH distance, 30d history, DEX pair profile: liquidity/age) -> fail-closed rug-guard screen (min liquidity $250k, min 24h volume $500k, min pair age 7d, mcap rank <= 300, meme-category screen via `meme_category_keywords`) -> LLM conviction gate (>= 0.75 confidence, memecoin-risk rubric; model failure = no entry) -> conviction-sized entry ($6-$12). Exits, deterministic always: entry-fixed stop-loss (25%), take-profit (50%), partial take-profit (bank half at +80%, runner rides a ratcheting 20% trailing stop armed at +25%), 72h time stop, 7-day per-symbol entry cooldown, and a hard 25% max-drawdown kill that flattens all and auto re-arms after a 24h cooldown. Every auto entry is journaled as a proposal (source=tier4) for the scorecard; virtual fills carry a `[tier4-memecoin]` tag (excluded from Tier 1 P&L) and cards live in their own `tier4_cards` table. `tools/tier4.py` remains the manual override surface (buy/sell/status/reset-kill).
-5. **Tier 5 — Leveraged futures canary (automated, virtual $50, owner opt-in 2026-09-09)**: simulated perp futures, 10x leverage, LONG/SHORT on BTC/ETH/SOL/DOGE/XRP. "Mildly extreme risk" by design — 20-50% of the virtual stake may be lost on a bad trade; thorough research + mandatory SL/TP before every entry. Hourly pipeline (15m candles + 1h trend confirmation): deterministic signal (1h EMA50 trend + 15m 3-bar momentum >= 0.5% + volume surge >= 1.5x + ATR band 0.15-3%) -> fail-closed guards (kill/cooldown/position caps/cash floor/SL-before-liquidation) -> LLM conviction gate (>= 0.70) -> conviction-sized margin ($8 base -> $15 max). Exits fully deterministic: liquidation simulation (loss clamped at margin), SL/TP checked against FULL candle ranges since open (a stop touched intra-bar always fills; missed cycles can't skip it), 0.01%/8h funding accrual (longs pay), 12h time stop, and a 25% max-drawdown kill deliberately under the ~29.9% worst-case single-liquidation floor (one bad trade can never kill the ledger; two always can) — second kill requires manual `tools/tier5.py reset-kill`. State isolated in `t5_*` journal meta keys; fills carry a `[tier5-futures]` tag (excluded from Tier 1 P&L); proposals are source=tier5. `tools/tier5.py` is the ops CLI (status/cycle/open/close/reset-kill).
+- **Tier 2 — AI agent (SHADOW MODE)**: scouts for high-conviction entries using news/whale/trend research. It never executes. Scout BUY ideas receive a fixed-horizon, BTC-benchmarked scorecard and are filled on a virtual shadow account ($80). The shadow account has no exit path since the babysitter (which only reviewed Tier 1 positions) was removed, so its realized P&L stays at zero until an exit rule is added.
+- **Tier 3 — Polymarket scanner (paper only)**: near-resolution favorites are a watchlist, not automatic bets. LLM candidates must clear an expected-value-after-friction threshold, duplicate and total-exposure checks, then are paper-logged and settled automatically. A virtual betting wallet (real deployment size) mirrors every logged bet at a flat stake, tracks cash/locked equity per epoch, snapshots the trend each cycle, and halts new bets on bust — the tier's go/no-go scoreboard.
+- **Tier 4 — Memecoin canary (automated, virtual $40)**: owner opt-in 2026-09-08 (no real money; automation like the other tiers). Hourly pipeline: deterministic research cards (CoinGecko trending + DexScreener volume spikes) -> per-coin dossier (market data, ATH distance, 30d history, DEX pair profile: liquidity/age) -> fail-closed rug-guard screen (min liquidity $250k, min 24h volume $500k, min pair age 7d, mcap rank <= 300, meme-category screen via `meme_category_keywords`) -> LLM conviction gate (>= 0.75 confidence, memecoin-risk rubric; model failure = no entry) -> conviction-sized entry ($6-$12). Exits, deterministic always: entry-fixed stop-loss (25%), take-profit (50%), partial take-profit (bank half at +80%, runner rides a ratcheting 20% trailing stop armed at +25%), 72h time stop, 7-day per-symbol entry cooldown, and a hard 25% max-drawdown kill that flattens all and auto re-arms after a 24h cooldown. Every auto entry is journaled as a proposal (source=tier4) for the scorecard; virtual fills carry a `[tier4-memecoin]` tag and cards live in their own `tier4_cards` table. `tools/tier4.py` remains the manual override surface (buy/sell/status/reset-kill).
 
-All trade/bet/proposal events, heartbeats (hourly, with equity + SMA gaps), model switches, and a daily 18:00 UTC report go to Discord. Two-way Discord chat (Bright Bot) answers questions with live account data — read-only, can never trigger trades.
+All trade/bet/proposal events, an hourly heartbeat (one money line per tier, sent after every agent cycle even when the model is down), model switches, and a daily 18:00 UTC report go to Discord. Two-way Discord chat (Bright Bot) answers questions with live account data — read-only, can never trigger trades.
 
 ## Layout
 
 ```
-run_bot.py            # Tier 1: trading cycle (--once for serverless)
-run_agent.py          # Tier 2: agent cycle (shadow mode)
+run_agent.py          # Tier 2: agent cycle (shadow mode) + hourly heartbeat
 run_scanner.py        # Tier 3: Polymarket scanner (paper bets)
 run_chat.py           # two-way Discord chat cycle
 run_report.py         # daily report
-backtest.py           # SMA strategy backtest (--days N, --timeframe 1Day)
 validation.py         # end-to-end stack sanity check (no orders placed)
-tests/                # pytest suite (222 tests)
-config.yaml           # symbols, strategy params, risk caps, agent/scanner/memecoin settings
+tests/                # pytest suite
+config.yaml           # agent universe, agent/research/scanner/memecoin settings
 bot/
   config.py           # yaml + env config (lazy credential checks)
-  broker.py           # make_broker factory + Alpaca adapter (bars/orders/positions)
   binance_data.py     # keyless Binance public klines (data-api.binance.vision)
-  binance_paper.py    # local simulated broker priced by real Binance data
   timeframe.py        # vendor-neutral timeframe objects (15Min / 1Day ...)
-  strategy.py         # compute_sma + check_crossover (pure)
-  strategies.py       # strategy registry (pluggable, active list in config)
-  risk.py             # RiskEngine: notional/exposure caps, daily loss limit, kill switch
-  trader.py           # trading loop (strategy-agnostic), agent/scanner entry fns
-  agent.py            # TradingAgent: babysitter + scout (shadow mode)
+  indicators.py       # pure indicator helpers (RSI, realized volatility)
+  trader.py           # agent/scanner entry fns + hourly heartbeat
+  agent.py            # TradingAgent: scout (shadow mode)
+  shadow.py           # Tier 2 virtual shadow account
   models.py           # ModelManager: health probe, auto-failover chain, JSON repair
   research.py         # free research tools: RSS, CoinGecko, Tavily (budget-guarded)
   polymarket.py       # Gamma API scanner + paper bet settlement
   wallet.py           # Tier 3 virtual betting wallet (derived from bets, epoch-aware)
   memecoin.py         # Tier 4 canary: research + dossier + rug-guard + LLM gate + auto entries + exit sweep
-  futures.py          # Tier 5 futures: signals + LLM gate + SL/TP/liquidation sim + funding + kill
+  gates.py            # graduation gates (recommend-only verdicts per tier)
+  brief.py            # shared money-first Discord formatting
   chat.py             # two-way Discord chat (bot reads channel, agent replies)
   journal.py          # SQLite: trades, proposals, bets, tier4_cards, meta (state)
-  report.py           # P&L/win-rate + LLM narrative
+  report.py           # daily report: tier snapshots, scorecards, Actions health, gates
   notify.py           # Discord webhook (chunked) with file fallback
   errors.py           # custom exceptions
 tools/
   tier4.py            # Tier 4 ops CLI (manual overrides): buy/sell/status/reset-kill/cycle
-  tier5.py            # Tier 5 ops CLI (manual overrides): status/cycle/open/close/reset-kill
+  tier3_review.py     # Tier 3 advisory: LLM review of open paper bets (read-only)
+  audit_ledgers.py    # read-only ledger audit: rebuild each tier from fills, compare to meta
   reset_day_zero.py   # day-zero reset: archive + clear + new timestamp
+  reset_all_but_tier3.py  # one-off reset that kept Tier 3 history (2026-09)
   merge_db.py         # lossless SQLite merge for CI push conflicts
+  safe_commit.sh      # CI commit + push of data/trades.db, merging on conflict
 data/trades.db        # committed to repo: cross-run state for GitHub Actions
 ```
 
-## Broker backends (config.yaml `broker:`)
+## Market data
 
-- `binance_paper` (active): local simulated account priced by keyless Binance
-  public data (data-api.binance.vision — no API keys, geo-safe). Ledger state
-  (cash, positions, fills) persists in journal meta keys `paper_*`, so it
-  survives CI runs exactly like every other counter. Fills at the latest
-  closed kline ±slippage, minus 0.1% Binance spot taker fee.
-- `alpaca` (switchable): the original Alpaca paper account; set
-  `broker.name: alpaca` and provide ALPACA keys. All consumers go through
-  the same adapter surface, so nothing else changes.
-- Live Binance, when you graduate to real money: slots behind the same
-  interface, but the runner must move off GitHub Actions (US geo) to your
-  machine or a non-US VPS.
+`BinanceDataClient` reads keyless Binance public klines (data-api.binance.vision — no API keys, geo-safe). The agent's price context, the shadow account's marks and fills, the gates, the report and the chat all use it. Tier 4 prices a coin from the same data when Binance lists it, else from CoinGecko.
 
 ## Config (config.yaml)
 
-- `symbols`, `sma_fast/slow`, `notional` — Tier 1
-- `broker:` — backend selection (`binance_paper` active, `alpaca` switchable) + paper start cash (100) / taker fee / slippage
-- `active_strategies` — which registry entries the loop runs
-- `execution:` — conservative taker-fee and slippage assumptions for backtests
-- `risk:` — max_notional_per_trade (100), max_open_positions (3), daily-loss flattening, volatility-based sizing, entry-fixed stops (entry − 3×ATR, or 5% fallback; level locked at entry, mirrored in the backtester), allocation cap + kill switch (meta key `kill_switch=on`)
-- `agent:` — shadow (true), min_confidence (0.7), max_proposed_notional (50), shadow_start_cash (80), fixed evaluation horizon, babysitter/scout toggles, cycle interval
+- `symbols`, `sma_fast/slow`, `timeframe`, `lookback_bars` — Tier 2's core universe and its price context
+- `agent:` — shadow (true), min_confidence (0.7), max_proposed_notional (50), shadow_start_cash (80), fixed evaluation horizon, scout toggle + `scout_extra_universe`, cycle interval
 - `research:` — headlines per symbol, Tavily daily (30) / monthly (1000) caps
 - `scanner:` — stake (20), near-resolution watchlist, min_market_volume, mispricing threshold, minimum expected value, total-open-exposure cap, and the betting wallet (`wallet_start_cash: 60`, `wallet_stake: 12`; epoch reset via `bot.wallet.BettingWallet.start_new_epoch()`)
 - `memecoin:` — Tier 4 canary: start_cash (40), max_stake (12), entry-fixed stop_loss_pct (25) / take_profit_pct (50) / time_stop_hours (72), trailing stop (20% trail armed at +25%), partial TP (half at +80%), max_drawdown_pct (25) hard kill w/ 24h auto re-arm, DEX-style fee/slippage (1% / 100bps), research-card TTL + spike filters, meme-category screen (`meme_category_keywords`, empty list disables); automation block: auto_entry, min_llm_confidence (0.75), base_stake (6), max_open_positions (3), rug-guard floors (liquidity 250k / volume 500k / age 7d / mcap rank 300), entry_cooldown_hours (168)
-- `futures:` — Tier 5 futures canary: start_cash (50), leverage (10), base_margin (8) / max_margin (15), stop_atr_mult (1.5) / tp_atr_mult (2.25), trailing_atr_mult (1.0) / trailing_activate_r (1.0) profit-protection trail, max_hold_hours (12), max_drawdown_pct (25) kill w/ manual-only second re-arm, taker_fee_pct (0.05) / slippage_bps (5) / funding_rate_pct_8h (0.01), universe (BTC/ETH/SOL/BNB/XRP/DOGE/ADA/AVAX/LINK USDT perps); signal knobs: trend_ema_period (50), momentum_bars (3), momentum_pct (0.5), volume_surge_mult (1.5), ATR band 0.15-3%; automation: auto_entry, min_llm_confidence (0.70), best_pick (true — one batch LLM call ranks every signal and enters the single highest-potential, not list order), max_open_positions (2), cooldown_hours (24), min_cash_fraction (0.15)
 
 ## Hosting (GitHub Actions, free)
 
-Workflow `.github/workflows/trading-bot.yml`:
+One workflow per job in `.github/workflows/`:
 
-- `*/15 * * * *` — trading cycle (Tier 1)
-- `5 * * * *` — agent cycle (Tier 2, hourly; whale Tavily searches cached 1/day/symbol)
-- `2-59/15 * * * *` — Discord chat reader (offset so it never collides with trading)
-- `15 */6 * * *` — Polymarket scanner + bet settlement
-- `4 * * * *` — Tier 4 memecoin canary cycle (hourly)
-- `23 * * * *` — Tier 5 futures canary cycle (hourly)
-- `0 18 * * *` — daily report
+- `agent.yml` — `11 * * * *`: Tier 2 agent cycle, then the hourly heartbeat
+- `chat.yml` — `9,24,39,54 * * * *`: Discord chat reader (the local pinger also dispatches it every 15 min, see PINGER_SETUP.md)
+- `scanner.yml` — `19 */6 * * *`: Polymarket scanner + bet settlement
+- `memecoin.yml` — `37 * * * *`: Tier 4 memecoin canary cycle
+- `report.yml` — `1 18 * * *`: daily report
+- `tests.yml` — pytest on every push to main and on pull requests
 
-All jobs commit `data/trades.db` back to the repo (state persistence). Secrets: ALPACA keys, NVIDIA_API_KEY, DISCORD_WEBHOOK_URL, DISCORD_BOT_TOKEN, TAVILY_API_KEY.
+The agent, chat, scanner and memecoin jobs commit `data/trades.db` back to the repo through `tools/safe_commit.sh` (state persistence). Secrets: NVIDIA_API_KEY, DISCORD_WEBHOOK_URL, DISCORD_BOT_TOKEN, TAVILY_API_KEY.
 
 ## Model chain (auto-maintained)
 
@@ -104,25 +85,12 @@ All jobs commit `data/trades.db` back to the repo (state persistence). Secrets: 
 - Tavily: general web + whale-activity searches, hard-guarded to 30/day and 1000/month (free tier 1500/mo), counters persisted in journal meta; whale queries cached once/day/symbol
 - On budget exhaustion: automatic fallback to RSS/DuckDuckGo — never billed
 
-## Backtest
-
-The backtester generates signals on closed candles and fills them on the next bar,
-with configurable adverse slippage and fees. Sizing and stops mirror the live loop:
-each BUY is capped at `risk.max_notional_per_trade` and never deploys more than
-the configured per-trade notional (no all-in compounding by default), and every
-entry records a stop fixed at entry (entry − 3×ATR, 5% fallback) that only ever
-exits on the next bar's open. It reports return, drawdown, exposure, turnover,
-costs, stop exits, and a buy-and-hold comparison. Historical results
-remain hypotheses until evaluated across long, untouched periods and then
-confirmed by paper execution.
-
 ## Graduation gates (experiment phase → any real money)
 
-1. Tier 1: live paper performance consistent with backtest
-2. Tier 2: ≥4 weeks of shadow proposals with positive hypothetical P&L after fees → then semi-auto (high-confidence only, tight caps) → separate gate before wider autonomy
-3. Tier 3: multi-week paper-bet record positive after settlement
-4. Tier 4/5: canaries survive their 8-week windows with positive net P&L after all costs (gates.py tracks verdicts per tier)
-5. Chat is permanently read-only for trading decisions during experiment phase
+1. Tier 2: ≥4 weeks of shadow proposals with positive hypothetical P&L after fees → then semi-auto (high-confidence only, tight caps) → separate gate before wider autonomy
+2. Tier 3: multi-week paper-bet record positive after settlement
+3. Tier 4: canary survives its 8-week window with positive net P&L after all costs (gates.py tracks verdicts per tier)
+4. Chat is permanently read-only for trading decisions during experiment phase
 
 ## Kill/keep criteria (per tier)
 
@@ -132,13 +100,6 @@ archived in `data/archive/` and does not count. "Drawdown" = account equity
 peak-to-trough on the relevant ledger. Verdicts are checked when the daily
 report runs; any KILL verdict must be acted on manually within a week.
 
-- **Tier 1 (SMA bot, $20 paper ledger)**
-  - KILL if net P&L < −20% of starting equity after ≥4 weeks of signals
-  - KILL if drawdown > 25% at any point, or > 2 consecutive losing weeks
-  - KILL if live paper results diverge from the 30-day backtest by > 2×
-    the backtest's own drawdown (strategy not doing what was modeled)
-  - KEEP if net P&L ≥ 0 after 4 weeks with all risk gates intact (no
-    bypassed blocks, every exit either stop- or signal-driven)
 - **Tier 2 (AI shadow agent, $20 virtual ledger)**
   - KILL if < 10 proposals evaluated in 4 weeks (agent not producing) or
     the agent-alpha gate stays red for 4 consecutive weeks
@@ -163,19 +124,6 @@ report runs; any KILL verdict must be acted on manually within a week.
     infrastructure)
   - KEEP if the canary survives 8 weeks with positive net P&L after all
     costs; then consider whether the signal justifies a paper test
-- **Tier 5 (futures canary, $50 at 10x, automated since 2026-09-09)**
-  - Owner risk contract: "mildly extreme" — 20-50% of the virtual stake
-    may be lost on a bad trade; best possible trades because it's paper.
-    Mandatory SL/TP research-gated entries, no exceptions
-  - KILL on the 25% max-drawdown trigger (deliberately under the ~29.9%
-    single-liquidation floor — one bad trade can never kill the ledger);
-    first kill auto re-arms after 24h, a second kill requires manual
-    `tools/tier5.py reset-kill` (double-kill = failed edge)
-  - KILL if any SL/TP/liquidation/funding/time-stop mechanics are found
-    not to have fired on schedule, or if a stop was ever skipped by a
-    missed cycle (discipline failure = infrastructure)
-  - KEEP if the canary survives 8 weeks with positive net P&L after
-    fees, funding, and slippage
 - **Any tier**: kill immediately on unreconcilable ledger corruption,
   silent risk-gate bypass, or execution without a journal record — those
   are infrastructure failures, not strategy ones, and stop everything
@@ -186,24 +134,15 @@ report runs; any KILL verdict must be acted on manually within a week.
 ```bash
 ./venv/bin/python -m pytest tests/ -q      # tests
 ./venv/bin/python validation.py            # full-stack sanity (no orders)
-./venv/bin/python backtest.py --days 30    # Tier 1 backtest
 ./venv/bin/python run_agent.py --once      # agent cycle
 ./venv/bin/python run_scanner.py           # scanner cycle
 ./venv/bin/python tools/tier4.py status    # Tier 4 canary status + cards
 ./venv/bin/python tools/tier4.py cycle       # one full auto cycle now
 ./venv/bin/python tools/tier4.py buy DOGE 12   # manual entry override
 ./venv/bin/python tools/tier4.py reset-kill   # force re-arm after a kill
-./venv/bin/python tools/tier5.py status     # Tier 5 futures status
-./venv/bin/python tools/tier5.py cycle        # one full futures cycle now
-./venv/bin/python tools/tier5.py open BTC LONG 10  # manual entry override ($ margin)
-./venv/bin/python tools/tier5.py close BTC          # manual exit override
-./venv/bin/python tools/tier5.py reset-kill   # force re-arm after a kill
+./venv/bin/python tools/audit_ledgers.py   # read-only ledger audit
 ./venv/bin/python tools/reset_day_zero.py --dry-run  # preview a day-zero reset
 ```
-
-Kill switch: `sqlite3 data/trades.db "INSERT OR REPLACE INTO meta VALUES ('kill_switch','on');"` (blocks all BUYs; SELLs still allowed; set to 'off' to resume).
-
-Switch broker back to Alpaca paper: set `broker.name: alpaca` in config.yaml and ensure ALPACA keys are in .env. The Binance paper ledger (meta keys `paper_cash`, `paper_positions`, `paper_trades`) is untouched by the Alpaca backend, so you can switch back and forth without losing either account's state.
 
 ## Bug log (fixed 2026-09-05)
 
