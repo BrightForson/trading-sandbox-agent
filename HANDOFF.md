@@ -1,6 +1,6 @@
 # Handoff — trading-sandbox-agent
 
-Updated: 2026-10-08 (Tier 1 + Tier 5 removed; audit commits 1-5 pushed; Tier 3 rebuild parked)
+Updated: 2026-10-09 (Tier 4 NaN peak fixed; Tier 1 + Tier 5 removed; audit commits 1-5 pushed; Tier 3 rebuild parked)
 
 Supersedes the 2026-09-28 handoff. Its detail below ("Done this session"
 onward) is kept for reference; where it mentions Tier 1, Tier 5, the paper
@@ -31,28 +31,35 @@ Owner decisions already made (do not re-litigate):
 
 ## Resume here
 
-1. **The NVIDIA key is dead** (`403 Authorization failed` since 2026-10-03).
-   Every LLM path (agent, chat, Tier 3 candidates, Tier 4 gate) is down until
-   the owner renews `NVIDIA_API_KEY` in the GitHub secret and the local `.env`.
-   `deepseek-v4-flash` in MODEL_CHAIN is end-of-life (410) and should go.
+1. **NVIDIA key renewed 2026-10-09 in local `.env`.** The owner sets the
+   GitHub secret with `gh secret set NVIDIA_API_KEY` (auto mode refused it). Probe of MODEL_CHAIN with the new key:
+   OK = nemotron-3-super-120b, nemotron-3-nano-omni-30b-reasoning,
+   nemotron-3.5-lightning-30b. kimi-k3 (primary) timed out at 60s; ultra-550b
+   returned 500; deepseek-v4-flash-0731 and minimax-m3 are 410 Gone;
+   llama-3.1-nemotron-70b is 404. Those three were removed from the chain
+   (local commit). CI agent runs still fail with "No working model in
+   chain" until the secret is renewed.
 2. **Tier 2's shadow account cannot close a position.** Its only SELL path
    was the babysitter, and the scout may not SELL, so realized P&L stays 0 and
    the agent-alpha gate stays RED. It needs an exit rule (time stop, or an exit
    reviewer over shadow positions); the owner has not chosen one.
 3. **Tier 4 is starved, not crashing**: candidate filters plus CoinGecko 429s.
-4. **Tier 4 NaN peak**: `MemecoinLedger._peak_equity_meta` reads
-   `t4_peak_equity` with a bare `float()`, so a NaN peak disarms the drawdown
-   kill, the defect commit 5 fixed for Tier 5. Route it through
-   `get_meta_float`.
+4. ~~**Tier 4 NaN peak**~~ — **DONE, `1b4246b`**:
+   `_peak_equity_meta` now uses `get_meta_float`; 7 regression tests.
 5. Commits 7 (data repair) and 8 (pinger hardening) are still open; see
    "Remaining commits".
-6. Pushing the removal needs the local pinger edited in the same step:
-   `~/.config/trading-pinger/pinger.sh` must stop dispatching `trade` and
-   stop checking `futures` (both workflow files are gone).
-7. Tests: `./venv/bin/python -m pytest tests/ -q -p no:cacheprovider`, expect
-   **207 passed** in about 2.5 min. The suite still writes gate history into
-   the real `data/trades.db`; run `git checkout -- data/trades.db` after it and
-   never stage the journal.
+6. **Removal pushed 2026-10-09.** The local pinger still needs the owner's
+   edit (auto mode refused to touch a cron script): in
+   `~/.config/trading-pinger/pinger.sh` change `for wf in chat trade` to
+   `for wf in chat` and `for WF in agent futures` to `for WF in agent`.
+   Until then it logs a harmless 404 for `trade` every 15 min.
+7. Tests: `venv/` was rebuilt on Python 3.14 (system 3.12 is gone; CI still
+   pins 3.12). `./venv/bin/python -m pytest tests/ -q -p no:cacheprovider`,
+   expect **214 passed** in about 3 min. The suite still writes gate history
+   into the real `data/trades.db`; run `git checkout -- data/trades.db` after
+   it and never stage the journal.
+8. kimi-k3 (chain head) timed out on 2026-10-09; a fresh model selection
+   took 69s because `_probe` uses the OpenAI client's default 2 retries.
 
 ## Done this session
 
