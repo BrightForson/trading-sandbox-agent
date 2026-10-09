@@ -27,11 +27,8 @@ load_dotenv()
 MODEL_CHAIN = [
     "moonshotai/kimi-k3",                  # current primary
     "nvidia/nemotron-3-super-120b-a12b",
-    "deepseek-ai/deepseek-v4-flash-0731",
-    "minimaxai/minimax-m3",
     "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-    "nvidia/llama-3.1-nemotron-70b-instruct",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
 ]
 META_KEY = "active_llm_model"
