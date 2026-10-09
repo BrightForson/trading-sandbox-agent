@@ -1171,6 +1171,33 @@ def test_corrupt_cash_meta_is_refused_instead_of_becoming_buying_power(tmp_path,
         assert key in str(ei.value), label
 
 
+@pytest.mark.parametrize("bad", ["", "None", "1,000", "nan", "inf", "-inf"])
+def test_corrupt_tier4_peak_is_refused_instead_of_disarming_the_kill(tmp_path, bad):
+    """A NaN equity peak must fail loudly, not read as "no drawdown".
+
+    _peak_equity_meta took a bare float(), so "nan" parsed and every check
+    downstream went False: `equity > nan` never refreshed the peak and
+    `(nan - equity) / nan * 100 >= pct` never fired, leaving the 25% drawdown
+    kill silently disarmed for good. Tier 5's _peak() had the same hole and
+    was fixed in commit 5; this is its Tier 4 twin.
+    """
+    from bot.errors import JournalError
+    led, j = _t4_ledger(tmp_path)
+    j.set_meta("t4_peak_equity", bad)
+    for check in (led._update_peak, led._drawdown_hit):
+        with pytest.raises(JournalError) as ei:
+            check(10.0)
+        assert "t4_peak_equity" in str(ei.value), check.__name__
+
+
+def test_missing_tier4_peak_still_seeds_from_equity(tmp_path):
+    """No peak row yet is a fresh ledger: seed it, and report no drawdown."""
+    led, j = _t4_ledger(tmp_path)
+    assert led._drawdown_hit(10.0) is False
+    assert led._update_peak(10.0) == pytest.approx(10.0)
+    assert j.get_meta_float("t4_peak_equity") == pytest.approx(10.0)
+
+
 # ---------------- timestamps must not be local time ----------------
 
 def test_no_module_calls_a_naive_clock():

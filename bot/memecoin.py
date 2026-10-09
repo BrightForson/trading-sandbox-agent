@@ -232,8 +232,7 @@ class MemecoinLedger:
         )
 
     def _peak_equity_meta(self):
-        v = self.journal.get_meta("t4_peak_equity")
-        return float(v) if v is not None else None
+        return self.journal.get_meta_float("t4_peak_equity")
 
     def _cooldowns(self):
         raw = self.journal.get_meta(COOLDOWN_META)
